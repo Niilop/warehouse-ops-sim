@@ -1,0 +1,6 @@
+numpy
+rich
+matplotlib
+pandas
+fastapi
+uvicorn[standard]
