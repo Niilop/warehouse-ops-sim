@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from warehouse.grid import WarehouseGrid
 from warehouse.inventory import Item, Inventory, Order
+from warehouse.batcher import BatchedOrder
 
 
 class AgentState(Enum):
@@ -24,6 +25,7 @@ class PickAgent:
         self._path: list[tuple[int, int]] = []
         self._task_queue: list[tuple[tuple[int, int], str]] = []  # (stand_pos, item_id)
         self._pack_pos: tuple[int, int] = start_pos
+        self._batch: BatchedOrder | None = None
 
     # ------------------------------------------------------------------
     # Pathfinding
@@ -79,12 +81,12 @@ class PickAgent:
     # Order execution
     # ------------------------------------------------------------------
 
-    def assign_order(self, order: Order, inventory: Inventory, pack_pos: tuple[int, int]) -> None:
+    def assign_batch(self, batch: BatchedOrder, inventory: Inventory, pack_pos: tuple[int, int]) -> None:
         self._pack_pos = pack_pos
+        self._batch = batch
 
-        # Build list of (stand_pos, item_id) for all items in the order
         targets: list[tuple[tuple[int, int], str]] = []
-        for item_id in order.item_ids:
+        for item_id in batch.unified_item_ids:
             slot = inventory.get_slot(item_id)
             targets.append((slot.stand_pos, item_id))
 
@@ -100,6 +102,18 @@ class PickAgent:
 
         self._task_queue = ordered
         self._advance_to_next_task()
+
+    def assign_order(self, order: Order, inventory: Inventory, pack_pos: tuple[int, int]) -> None:
+        self.assign_batch(
+            BatchedOrder(
+                batch_id=order.order_id,
+                orders=[order],
+                unified_item_ids=list(order.item_ids),
+                item_to_order={iid: order.order_id for iid in order.item_ids},
+            ),
+            inventory,
+            pack_pos,
+        )
 
     def _advance_to_next_task(self) -> None:
         if self._task_queue:
@@ -120,9 +134,15 @@ class PickAgent:
         self._advance_to_next_task()
         return item
 
-    def execute_deposit(self) -> list[Item]:
-        """Called when agent arrives at pack station. Clears carried items."""
+    def execute_deposit(self) -> tuple[list[Item], dict[str, list[str]]]:
+        """Called when agent arrives at pack station. Returns (items, order_id -> [item_ids])."""
         deposited = list(self.carried_items)
         self.carried_items = []
         self.state = AgentState.IDLE
-        return deposited
+        order_breakdown: dict[str, list[str]] = {}
+        if self._batch is not None:
+            for item in deposited:
+                oid = self._batch.item_to_order.get(item.item_id, "unknown")
+                order_breakdown.setdefault(oid, []).append(item.item_id)
+        self._batch = None
+        return deposited, order_breakdown

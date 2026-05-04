@@ -5,6 +5,7 @@ from warehouse.grid import WarehouseGrid
 from warehouse.inventory import Inventory, Item, Order
 from warehouse.agent import PickAgent
 from warehouse.simulation import Simulation, OrderMetrics
+from warehouse.batcher import FIFOBatcher, ZoneBatcher, GreedyTSPBatcher
 from warehouse.data_gen import generate_catalog, generate_orders
 from warehouse.optimizer import slot_distances, random_placement, demand_placement, affinity_placement
 
@@ -196,3 +197,80 @@ def _print_summary_table(results: list[ScenarioResult]) -> None:
             )
 
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Batch analysis
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BatchScenarioConfig:
+    base: ScenarioConfig
+    batch_strategy: str = "fifo"   # "fifo" | "zone" | "tsp"
+    max_batch_size: int = 1
+    min_zone_overlap: int = 2
+
+
+def run_batch_analysis(
+    configs: list[ScenarioConfig],
+    batch_sizes: list[int] | range = range(1, 7),
+    grid: WarehouseGrid | None = None,
+) -> dict[tuple[str, int], list[ScenarioResult]]:
+    """
+    For each config, runs FIFO / Zone / TSP strategies across each batch size.
+    Returns a dict keyed by (strategy, batch_size) -> list[ScenarioResult].
+    Uses demand placement for all scenarios (controls for slot-assignment variance).
+    """
+    if grid is None:
+        grid = WarehouseGrid.build_default()
+
+    results: dict[tuple[str, int], list[ScenarioResult]] = {}
+
+    for cfg in configs:
+        print(f"  Batch analysis config: {cfg.label or cfg}")
+        items = generate_catalog(
+            n_items=cfg.n_items, n_families=cfg.n_families,
+            demand_skew=cfg.demand_skew, seed=cfg.seed,
+        )
+        orders = generate_orders(
+            items=items, n_orders=cfg.n_orders, items_per_order=cfg.items_per_order,
+            family_affinity=cfg.family_affinity, seed=cfg.seed,
+        )
+        sorted_slots = slot_distances(grid, Inventory(grid))
+        sorted_slot_indices = [idx for idx, _ in sorted_slots]
+        placement = demand_placement(items)
+
+        for batch_size in batch_sizes:
+            for strategy_name in ("fifo", "zone", "tsp"):
+                inventory = Inventory(grid)
+                n = min(len(placement), len(sorted_slot_indices))
+                inventory.seed(placement[:n], slot_order=sorted_slot_indices[:n])
+
+                if strategy_name == "fifo":
+                    batcher: FIFOBatcher | ZoneBatcher | GreedyTSPBatcher = FIFOBatcher()
+                elif strategy_name == "zone":
+                    batcher = ZoneBatcher(grid, inventory, max_batch_size=batch_size)
+                else:
+                    batcher = GreedyTSPBatcher(inventory, grid, max_batch_size=batch_size)
+
+                batches = batcher.batch(orders)
+                agent = PickAgent("A1", grid.pack_station_pos, grid)
+                sim = Simulation(grid, inventory, agent)
+                for batch in batches:
+                    sim.enqueue_batch(batch)
+                metrics = sim.run()
+
+                total_dist = sum(m.distance_traveled for m in metrics)
+                total_ticks = sum(m.ticks_taken for m in metrics)
+                avg = total_dist / len(metrics) if metrics else 0.0
+                key = (strategy_name, batch_size)
+                results.setdefault(key, []).append(ScenarioResult(
+                    config=cfg,
+                    strategy=f"{strategy_name}_b{batch_size}",
+                    total_distance=total_dist,
+                    total_ticks=total_ticks,
+                    avg_distance_per_order=avg,
+                    metrics=metrics,
+                ))
+
+    return results
