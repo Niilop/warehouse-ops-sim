@@ -1,0 +1,4395 @@
+# Project Structure
+
+```
+├── __pycache__
+├── editor
+│   ├── editor.js
+│   ├── index.html
+│   └── styles.css
+├── tests
+│   ├── __pycache__
+│   └── test_sim.py
+├── warehouse
+│   ├── __pycache__
+│   ├── __init__.py
+│   ├── agent.py
+│   ├── analysis.py
+│   ├── batcher.py
+│   ├── data_gen.py
+│   ├── grid.py
+│   ├── inventory.py
+│   ├── optimizer.py
+│   ├── simulation.py
+│   └── visualizer.py
+├── analyze.py
+├── main.py
+├── requirements.txt
+└── server.py
+```
+
+# File Contents
+
+## editor\editor.js
+
+```javascript
+"use strict";
+
+const API_BASE = "http://localhost:8000"; // prefix all fetch calls — swap for Tauri sidecar later
+
+// CellType values (mirror warehouse/grid.py CellType enum)
+const CT = { EMPTY: 0, RACK: 1, AISLE: 2, PACK: 3 };
+const CELL_CLASS = { 0: "cell-empty", 1: "cell-rack", 2: "cell-aisle", 3: "cell-pack" };
+
+// ─────────────────────────────────────────────────────────────────
+// GridEditor — manages the drawable editor table
+// ─────────────────────────────────────────────────────────────────
+class GridEditor {
+  constructor(tableEl) {
+    this.tableEl = tableEl;
+    this.rows = 0;
+    this.cols = 0;
+    this.cells = [];      // 2D array of CellType int
+    this.brush = CT.RACK;
+    this.painting = false;
+    this.packPos = null;  // [row, col] of current PACK_STATION, enforces exactly one
+
+    document.addEventListener("mouseup", () => { this.painting = false; });
+  }
+
+  build(rows, cols) {
+    this.rows = rows;
+    this.cols = cols;
+    this.cells = Array.from({ length: rows }, () => new Array(cols).fill(CT.AISLE));
+    this.packPos = null;
+    this._render();
+  }
+
+  loadFromDict(dict) {
+    this.rows = dict.rows;
+    this.cols = dict.cols;
+    this.cells = dict.grid.map(row => [...row]);
+    this.packPos = dict.pack_station_pos ? [...dict.pack_station_pos] : null;
+    this._render();
+  }
+
+  toDict() {
+    return {
+      rows: this.rows,
+      cols: this.cols,
+      grid: this.cells.map(row => [...row]),
+      pack_station_pos: this.packPos ? [...this.packPos] : [0, 0],
+    };
+  }
+
+  setBrush(type) {
+    this.brush = type;
+  }
+
+  setCellType(row, col, type) {
+    if (row < 0 || row >= this.rows || col < 0 || col >= this.cols) return;
+
+    // Enforce single pack station
+    if (type === CT.PACK) {
+      if (this.packPos) {
+        const [pr, pc] = this.packPos;
+        this.cells[pr][pc] = CT.AISLE;
+        this._updateTd(pr, pc);
+      }
+      this.packPos = [row, col];
+    } else if (this.packPos && this.packPos[0] === row && this.packPos[1] === col) {
+      this.packPos = null;
+    }
+
+    this.cells[row][col] = type;
+    this._updateTd(row, col);
+  }
+
+  validateLocal() {
+    const errors = [];
+    if (!this.packPos) errors.push("Place exactly one Pack Station on the grid.");
+    const rackCount = this.cells.flat().filter(c => c === CT.RACK).length;
+    if (rackCount === 0) errors.push("Add at least one Rack cell.");
+    return errors.length ? errors : null;
+  }
+
+  _render() {
+    this.tableEl.innerHTML = "";
+    for (let r = 0; r < this.rows; r++) {
+      const tr = document.createElement("tr");
+      for (let c = 0; c < this.cols; c++) {
+        const td = document.createElement("td");
+        td.dataset.row = r;
+        td.dataset.col = c;
+        td.className = CELL_CLASS[this.cells[r][c]];
+        td.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          this.painting = true;
+          this.setCellType(r, c, this.brush);
+        });
+        td.addEventListener("mouseenter", () => {
+          if (this.painting) this.setCellType(r, c, this.brush);
+        });
+        tr.appendChild(td);
+      }
+      this.tableEl.appendChild(tr);
+    }
+  }
+
+  _updateTd(row, col) {
+    const td = this.tableEl.rows[row]?.cells[col];
+    if (td) td.className = CELL_CLASS[this.cells[row][col]];
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SimulationViewer — read-only grid with agent overlay
+// ─────────────────────────────────────────────────────────────────
+class SimulationViewer {
+  constructor(tableEl) {
+    this.tableEl = tableEl;
+    this.rows = 0;
+    this.cols = 0;
+    this.agentRow = -1;
+    this.agentCol = -1;
+  }
+
+  build(dict) {
+    this.rows = dict.rows;
+    this.cols = dict.cols;
+    this.agentRow = -1;
+    this.agentCol = -1;
+    this.tableEl.innerHTML = "";
+    for (let r = 0; r < this.rows; r++) {
+      const tr = document.createElement("tr");
+      for (let c = 0; c < this.cols; c++) {
+        const td = document.createElement("td");
+        td.className = CELL_CLASS[dict.grid[r][c]];
+        tr.appendChild(td);
+      }
+      this.tableEl.appendChild(tr);
+    }
+  }
+
+  applyTick(frame) {
+    const { row, col, state, carrying } = frame.agent;
+
+    // Clear previous agent cell
+    if (this.agentRow >= 0) {
+      const prev = this.tableEl.rows[this.agentRow]?.cells[this.agentCol];
+      if (prev) {
+        prev.classList.remove("cell-agent", "cell-agent-carry");
+      }
+    }
+
+    // Set new agent cell
+    const td = this.tableEl.rows[row]?.cells[col];
+    if (td) {
+      td.classList.add(carrying.length > 0 ? "cell-agent-carry" : "cell-agent");
+    }
+    this.agentRow = row;
+    this.agentCol = col;
+
+    // Update status bar
+    document.getElementById("status-tick").textContent = frame.tick;
+    document.getElementById("status-order").textContent = frame.active_order ?? "—";
+    document.getElementById("status-state").textContent = state.replace(/_/g, " ");
+    document.getElementById("status-carrying").textContent =
+      carrying.length ? carrying.join(", ") : "nothing";
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SimulationClient — WebSocket lifecycle
+// ─────────────────────────────────────────────────────────────────
+class SimulationClient {
+  constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner, orderList) {
+    this.viewer = viewer;
+    this.metricsTbody = metricsTbody;
+    this.metricsFooter = metricsFooter;
+    this.summaryBox = summaryBox;
+    this.errorBanner = errorBanner;
+    this.orderList = orderList;
+    this.ws = null;
+    this.orderRows = new Map();  // order_id -> { el, batchId }
+    this.activeBatchId = null;
+  }
+
+  sendSpeedUpdate(ms) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "set_speed", tick_delay_ms: ms }));
+    }
+  }
+
+  stop() {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "stop" }));
+    }
+    this.disconnect();
+  }
+
+  connect(config) {
+    this.errorBanner.style.display = "none";
+    this.summaryBox.style.display = "none";
+
+    const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws/simulate";
+    this.ws = new WebSocket(wsUrl);
+
+    this.ws.onopen = () => {
+      this.ws.send(JSON.stringify(config));
+    };
+
+    this.ws.onmessage = (event) => {
+      const frame = JSON.parse(event.data);
+      switch (frame.type) {
+        case "orders_ready":   this._onOrdersReady(frame); break;
+        case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.active_batch); break;
+        case "order_complete": this._appendMetricsRow(frame); this._markOrderDone(frame.order_id); break;
+        case "complete":       this._onComplete(frame); break;
+        case "error":          this._showError(frame.message); break;
+      }
+    };
+
+    this.ws.onerror = () => this._showError("WebSocket connection error.");
+    this.ws.onclose = () => {
+      const btn = document.getElementById("btn-run");
+      btn.dataset.running = "0";
+      btn.textContent = "▶ Run Simulation";
+    };
+  }
+
+  disconnect() {
+    if (this.ws) { this.ws.close(); this.ws = null; }
+  }
+
+  _onOrdersReady(frame) {
+    this.orderList.innerHTML = "";
+    this.orderRows.clear();
+    this.activeBatchId = null;
+
+    for (const o of frame.orders) {
+      const row = document.createElement("div");
+      row.className = "order-row";
+
+      const status = document.createElement("span");
+      status.className = "order-status";
+      status.textContent = "·";
+
+      const id = document.createElement("span");
+      id.textContent = o.order_id;
+
+      const items = document.createElement("span");
+      items.style.color = "#444";
+      items.textContent = o.n_items + "×";
+
+      const batch = document.createElement("span");
+      batch.className = "order-batch-tag";
+      if (o.batch_id && o.batch_id !== o.order_id) batch.textContent = o.batch_id;
+
+      row.append(status, id, items, batch);
+      this.orderList.appendChild(row);
+      this.orderRows.set(o.order_id, { el: row, batchId: o.batch_id });
+    }
+  }
+
+  _updateActiveOrders(batchId) {
+    if (batchId === this.activeBatchId) return;
+
+    for (const [, info] of this.orderRows) {
+      if (info.el.classList.contains("active")) {
+        info.el.classList.remove("active");
+        info.el.querySelector(".order-status").textContent = "·";
+      }
+    }
+    if (batchId) {
+      for (const [, info] of this.orderRows) {
+        if (info.batchId === batchId && !info.el.classList.contains("done")) {
+          info.el.classList.add("active");
+          info.el.querySelector(".order-status").textContent = "●";
+          info.el.scrollIntoView({ block: "nearest" });
+        }
+      }
+    }
+    this.activeBatchId = batchId;
+  }
+
+  _markOrderDone(orderId) {
+    const info = this.orderRows.get(orderId);
+    if (!info) return;
+    info.el.classList.remove("active");
+    info.el.classList.add("done");
+    info.el.querySelector(".order-status").textContent = "✓";
+  }
+
+  _appendMetricsRow(frame) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${frame.order_id}</td>
+      <td class="text-right">${frame.items_picked}</td>
+      <td class="text-right">${frame.distance_traveled}</td>
+      <td class="text-right">${frame.ticks_taken}</td>
+    `;
+    this.metricsTbody.appendChild(tr);
+    tr.scrollIntoView({ block: "nearest" });
+  }
+
+  _onComplete(frame) {
+    const s = frame.summary;
+    document.getElementById("footer-items").textContent = s.total_items_picked;
+    document.getElementById("footer-dist").textContent = s.total_distance;
+    document.getElementById("footer-ticks").textContent = frame.total_ticks;
+    this.metricsFooter.style.display = "";
+
+    this.summaryBox.style.display = "block";
+    this.summaryBox.innerHTML =
+      `✓ Done — ${frame.total_orders} orders completed in ${frame.total_ticks} ticks &nbsp;|&nbsp; ` +
+      `avg ${s.avg_ticks_per_order} ticks/order &nbsp;|&nbsp; ` +
+      `total distance ${s.total_distance}`;
+  }
+
+  _showError(message) {
+    this.errorBanner.textContent = "Error: " + message;
+    this.errorBanner.style.display = "block";
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Module wiring
+// ─────────────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", () => {
+  const editor = new GridEditor(document.getElementById("editor-grid"));
+  const viewer = new SimulationViewer(document.getElementById("sim-grid"));
+  let client = null;
+
+  // Load default layout on startup
+  fetch(API_BASE + "/api/default-layout")
+    .then(r => r.json())
+    .then(dict => {
+      editor.loadFromDict(dict);
+      viewer.build(dict);
+    });
+
+  // ── Mode toggle ──────────────────────────────
+  const modeButtons = ["mode-default", "mode-quad", "mode-custom"];
+
+  function setActiveMode(activeId) {
+    modeButtons.forEach(id => document.getElementById(id).classList.toggle("active", id === activeId));
+    document.getElementById("custom-controls").style.display = activeId === "mode-custom" ? "" : "none";
+  }
+
+  document.getElementById("mode-default").addEventListener("click", () => {
+    fetch(API_BASE + "/api/default-layout")
+      .then(r => r.json())
+      .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
+    setActiveMode("mode-default");
+  });
+
+  document.getElementById("mode-quad").addEventListener("click", () => {
+    fetch(API_BASE + "/api/quad-layout")
+      .then(r => r.json())
+      .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
+    setActiveMode("mode-quad");
+  });
+
+  document.getElementById("mode-custom").addEventListener("click", () => {
+    setActiveMode("mode-custom");
+  });
+
+  // ── Custom size ──────────────────────────────
+  document.getElementById("btn-apply-size").addEventListener("click", () => {
+    const rows = parseInt(document.getElementById("input-rows").value);
+    const cols = parseInt(document.getElementById("input-cols").value);
+    editor.build(rows, cols);
+    viewer.build({ rows, cols, grid: Array.from({ length: rows }, () => new Array(cols).fill(2)) });
+  });
+
+  // ── Brushes ──────────────────────────────────
+  const brushMap = {
+    "brush-rack":  CT.RACK,
+    "brush-aisle": CT.AISLE,
+    "brush-pack":  CT.PACK,
+    "brush-empty": CT.EMPTY,
+  };
+  Object.entries(brushMap).forEach(([id, type]) => {
+    document.getElementById(id).addEventListener("click", () => {
+      editor.setBrush(type);
+      document.querySelectorAll(".brush-btn").forEach(b => b.classList.remove("active"));
+      document.getElementById(id).classList.add("active");
+    });
+  });
+
+  // ── Save ─────────────────────────────────────
+  document.getElementById("btn-save").addEventListener("click", () => {
+    const dict = editor.toDict();
+    const blob = new Blob([JSON.stringify(dict, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "warehouse-layout.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  // ── Load ─────────────────────────────────────
+  document.getElementById("file-load-input").addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const dict = JSON.parse(ev.target.result);
+        editor.loadFromDict(dict);
+        viewer.build(dict);
+      } catch {
+        alert("Invalid JSON file.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  });
+
+  // ── Batch strategy — show/hide batch size ────────────
+  document.getElementById("input-batch-strategy").addEventListener("change", (e) => {
+    document.getElementById("batch-size-param").style.display =
+      e.target.value === "none" ? "none" : "";
+  });
+
+  // ── Speed slider — updates live if simulation is running ─────────
+  document.getElementById("speed-slider").addEventListener("input", (e) => {
+    document.getElementById("speed-label").textContent = e.target.value + " ms";
+    if (client) client.sendSpeedUpdate(parseInt(e.target.value));
+  });
+
+  // ── Run / Stop button ─────────────────────────
+  document.getElementById("btn-run").addEventListener("click", async () => {
+    const btn = document.getElementById("btn-run");
+
+    // If simulation is running, stop it
+    if (btn.dataset.running === "1") {
+      if (client) client.stop();
+      btn.dataset.running = "0";
+      btn.textContent = "▶ Run Simulation";
+      btn.classList.remove("stopping");
+      return;
+    }
+
+    const errorBanner = document.getElementById("error-banner");
+    errorBanner.style.display = "none";
+
+    // Local validation first
+    const localErrors = editor.validateLocal();
+    if (localErrors) {
+      errorBanner.textContent = localErrors.join(" ");
+      errorBanner.style.display = "block";
+      return;
+    }
+
+    const dict = editor.toDict();
+
+    // Server-side validation
+    const vRes = await fetch(API_BASE + "/api/validate-layout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dict),
+    });
+    const validation = await vRes.json();
+    if (!validation.valid) {
+      errorBanner.textContent = validation.errors.join(" | ");
+      errorBanner.style.display = "block";
+      return;
+    }
+
+    // Reset UI
+    document.getElementById("metrics-tbody").innerHTML = "";
+    document.getElementById("metrics-footer").style.display = "none";
+    document.getElementById("order-list").innerHTML = "";
+    viewer.build(dict);
+    btn.dataset.running = "1";
+    btn.textContent = "■ Stop";
+
+    if (client) client.disconnect();
+    client = new SimulationClient(
+      viewer,
+      document.getElementById("metrics-tbody"),
+      document.getElementById("metrics-footer"),
+      document.getElementById("summary-box"),
+      errorBanner,
+      document.getElementById("order-list"),
+    );
+
+    client.connect({
+      layout: dict,
+      n_orders: parseInt(document.getElementById("input-orders").value),
+      n_items: parseInt(document.getElementById("input-items").value),
+      items_per_order: parseInt(document.getElementById("input-per-order").value),
+      n_families: parseInt(document.getElementById("input-families").value),
+      demand_skew: parseFloat(document.getElementById("input-skew").value),
+      family_affinity: parseFloat(document.getElementById("input-affinity").value),
+      batch_strategy: document.getElementById("input-batch-strategy").value,
+      batch_size: parseInt(document.getElementById("input-batch-size").value),
+      seed: 42,
+      tick_delay_ms: parseInt(document.getElementById("speed-slider").value),
+    });
+  });
+});
+
+```
+
+## editor\index.html
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Warehouse Sim</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+
+<header>
+  <h1>Warehouse Sim</h1>
+  <span class="subtitle">Layout Editor &amp; Simulation Viewer</span>
+</header>
+
+<div id="content">
+
+  <!-- ══════════════ LEFT PANEL — EDITOR ══════════════ -->
+  <div id="left-panel">
+
+    <!-- Mode toggle -->
+    <div class="section">
+      <div class="section-title">Layout Mode</div>
+      <div class="mode-toggle">
+        <button id="mode-default" class="active">Default (12×19)</button>
+        <button id="mode-quad">Quad (24×38)</button>
+        <button id="mode-custom">Custom</button>
+      </div>
+    </div>
+
+    <!-- Custom size controls (hidden in default mode) -->
+    <div class="section" id="custom-controls" style="display:none">
+      <div class="section-title">Canvas Size</div>
+      <div class="input-row">
+        <label>Rows</label>
+        <input type="number" id="input-rows" value="10" min="3" max="40" />
+        <label>Cols</label>
+        <input type="number" id="input-cols" value="16" min="3" max="60" />
+        <button id="btn-apply-size">Apply</button>
+      </div>
+      <p style="color:#666;font-size:11px;margin-top:6px;">
+        All cells start as Aisle. Paint Rack cells and place one Pack Station.
+      </p>
+    </div>
+
+    <!-- Brush toolbar -->
+    <div class="section">
+      <div class="section-title">Brush</div>
+      <div class="toolbar">
+        <button class="brush-btn" id="brush-rack">
+          <span class="brush-swatch swatch-rack"></span>Rack
+        </button>
+        <button class="brush-btn" id="brush-aisle">
+          <span class="brush-swatch swatch-aisle"></span>Aisle
+        </button>
+        <button class="brush-btn active" id="brush-pack">
+          <span class="brush-swatch swatch-pack"></span>Pack Station
+        </button>
+        <button class="brush-btn" id="brush-empty">
+          <span class="brush-swatch swatch-empty"></span>Empty
+        </button>
+      </div>
+    </div>
+
+    <!-- Editor grid -->
+    <div class="section">
+      <div class="section-title">Editor</div>
+      <div class="grid-scroll">
+        <table class="warehouse-grid" id="editor-grid"></table>
+      </div>
+    </div>
+
+    <!-- Save / Load -->
+    <div class="section">
+      <div class="section-title">File</div>
+      <div style="display:flex;gap:8px;">
+        <button id="btn-save">Save JSON</button>
+        <label>
+          <button id="btn-load" onclick="document.getElementById('file-load-input').click()">
+            Load JSON
+          </button>
+          <input type="file" id="file-load-input" accept=".json" />
+        </label>
+      </div>
+    </div>
+
+  </div><!-- /left-panel -->
+
+  <!-- ══════════════ RIGHT PANEL — SIMULATION ══════════════ -->
+  <div id="right-panel">
+
+    <!-- Catalog parameters -->
+    <div class="section">
+      <div class="section-title">Item Catalog</div>
+      <div class="param-grid">
+        <div class="param">
+          <span class="param-label">Items in catalog</span>
+          <input type="number" id="input-items" value="30" min="1" max="200" />
+        </div>
+        <div class="param">
+          <span class="param-label">Product families</span>
+          <input type="number" id="input-families" value="4" min="1" max="20" />
+        </div>
+        <div class="param">
+          <span class="param-label">Demand skew</span>
+          <input type="number" id="input-skew" value="2.0" min="0.1" max="10" step="0.1" />
+        </div>
+        <div class="param">
+          <span class="param-label">Family affinity</span>
+          <input type="number" id="input-affinity" value="0.7" min="0" max="1" step="0.05" />
+        </div>
+      </div>
+      <div class="param-hints">
+        <span title="Higher = a few items dominate most orders (power-law distribution)">⚙ Demand skew: spread of item popularity</span>
+        <span title="Fraction of each order drawn from one product family (0 = random, 1 = all same family)">⚙ Affinity: how often items cluster by family</span>
+      </div>
+    </div>
+
+    <!-- Order parameters -->
+    <div class="section">
+      <div class="section-title">Orders</div>
+      <div class="param-grid">
+        <div class="param">
+          <span class="param-label">Number of orders</span>
+          <input type="number" id="input-orders" value="10" min="1" max="500" />
+        </div>
+        <div class="param">
+          <span class="param-label">Items per order</span>
+          <input type="number" id="input-per-order" value="4" min="1" max="20" />
+        </div>
+      </div>
+    </div>
+
+    <!-- Batching -->
+    <div class="section">
+      <div class="section-title">Batching</div>
+      <div class="param-grid">
+        <div class="param">
+          <span class="param-label">Strategy</span>
+          <select id="input-batch-strategy">
+            <option value="none">None (FIFO)</option>
+            <option value="zone">Zone overlap</option>
+            <option value="tsp">Nearest neighbor</option>
+          </select>
+        </div>
+        <div class="param" id="batch-size-param" style="display:none">
+          <span class="param-label">Batch size</span>
+          <input type="number" id="input-batch-size" value="2" min="2" max="6" title="Max 6 — larger batches cause heavy item overlap with small catalogs" />
+        </div>
+      </div>
+    </div>
+
+    <!-- Simulation controls -->
+    <div class="section">
+      <div class="section-title">Simulation</div>
+      <div class="input-row" style="margin-bottom:10px;">
+        <label>Speed</label>
+        <input type="range" id="speed-slider" min="10" max="500" value="80" />
+        <span class="speed-label" id="speed-label">80 ms</span>
+      </div>
+      <button class="primary" id="btn-run">▶ Run Simulation</button>
+      <div id="error-banner"></div>
+    </div>
+
+    <!-- Simulation grid -->
+    <div class="section">
+      <div class="section-title">Live View</div>
+      <div class="grid-scroll">
+        <table class="warehouse-grid" id="sim-grid"></table>
+      </div>
+    </div>
+
+    <!-- Status bar -->
+    <div class="section">
+      <div class="section-title">Agent Status</div>
+      <div id="status-bar">
+        <span class="label">Tick</span>
+        <span class="value" id="status-tick">—</span>
+        <span class="label">Order</span>
+        <span class="value" id="status-order">—</span>
+        <span class="label">State</span>
+        <span class="value" id="status-state">—</span>
+        <span class="label">Carrying</span>
+        <span class="value" id="status-carrying">—</span>
+      </div>
+    </div>
+
+    <!-- Order queue -->
+    <div class="section">
+      <div class="section-title">Order Queue</div>
+      <div class="order-list" id="order-list"></div>
+    </div>
+
+    <!-- Summary (shown on complete) -->
+    <div id="summary-box"></div>
+
+    <!-- Metrics table -->
+    <div class="section">
+      <div class="section-title">Order Metrics</div>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Order</th>
+            <th class="text-right">Items</th>
+            <th class="text-right">Distance</th>
+            <th class="text-right">Ticks</th>
+          </tr>
+        </thead>
+        <tbody id="metrics-tbody"></tbody>
+        <tfoot>
+          <tr id="metrics-footer" style="display:none">
+            <td>Total</td>
+            <td class="text-right" id="footer-items">—</td>
+            <td class="text-right" id="footer-dist">—</td>
+            <td class="text-right" id="footer-ticks">—</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+
+  </div><!-- /right-panel -->
+</div><!-- /content -->
+
+<script src="/static/editor.js"></script>
+</body>
+</html>
+
+```
+
+## editor\styles.css
+
+```css
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    background: #111;
+    color: #ddd;
+    font-family: monospace;
+    font-size: 13px;
+}
+
+/* ── Header ─────────────────────────────────────────── */
+header {
+    padding: 10px 16px;
+    background: #1a1a1a;
+    border-bottom: 1px solid #333;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+header h1 { font-size: 15px; color: #eee; letter-spacing: 1px; }
+header .subtitle { color: #666; font-size: 12px; }
+
+/* ── Two-panel content ───────────────────────────────── */
+#content {
+    display: grid;
+    grid-template-columns: 400px 1fr;
+    gap: 0;
+    flex: 1;
+    overflow: hidden;
+}
+
+#left-panel, #right-panel {
+    overflow-y: auto;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+#left-panel { border-right: 1px solid #2a2a2a; }
+
+/* ── Sections / cards ────────────────────────────────── */
+.section {
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    padding: 10px;
+}
+.section-title {
+    font-size: 11px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+}
+
+/* ── Buttons ─────────────────────────────────────────── */
+button {
+    background: #2a2a2a;
+    color: #ccc;
+    border: 1px solid #444;
+    padding: 5px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: monospace;
+    font-size: 12px;
+    transition: background 0.15s, border-color 0.15s;
+}
+button:hover { background: #333; border-color: #666; }
+button.active { background: #1a4a7a; border-color: #4a9fd4; color: #fff; }
+button.primary {
+    background: #1a4a1a;
+    border-color: #2d8a2d;
+    color: #aee8ae;
+    width: 100%;
+    padding: 8px;
+    font-size: 13px;
+}
+button.primary:hover { background: #245a24; }
+button.primary:disabled { background: #1a1a1a; color: #555; border-color: #333; cursor: default; }
+button.primary[data-running="1"] { background: #4a1010; border-color: #8a2020; color: #ffaaaa; }
+
+/* ── Mode toggle ─────────────────────────────────────── */
+.mode-toggle { display: flex; gap: 6px; }
+.mode-toggle button { flex: 1; }
+
+/* ── Toolbar ─────────────────────────────────────────── */
+.toolbar { display: flex; gap: 6px; flex-wrap: wrap; }
+.brush-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 8px;
+}
+.brush-swatch {
+    width: 14px; height: 14px;
+    border-radius: 2px;
+    border: 1px solid #555;
+    flex-shrink: 0;
+}
+.swatch-rack    { background: #c76b00; }
+.swatch-aisle   { background: #1c1c1c; border-color: #555; }
+.swatch-pack    { background: #2d6a2d; }
+.swatch-empty   { background: #3a3a3a; }
+
+/* ── Inputs ──────────────────────────────────────────── */
+.input-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.input-row label { color: #888; min-width: 40px; }
+input[type="number"], input[type="range"] {
+    background: #222;
+    color: #ccc;
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 4px 6px;
+    font-family: monospace;
+    font-size: 12px;
+    width: 60px;
+}
+input[type="range"] { width: 120px; padding: 2px; cursor: pointer; }
+.speed-label { color: #aaa; min-width: 36px; }
+
+/* ── Grid tables ─────────────────────────────────────── */
+.grid-scroll { overflow: auto; max-height: 420px; }
+.warehouse-grid {
+    border-collapse: collapse;
+    table-layout: fixed;
+    user-select: none;
+}
+.warehouse-grid td {
+    width: 24px; height: 24px;
+    border: 1px solid #0a0a0a;
+    cursor: pointer;
+    transition: filter 0.05s;
+}
+.warehouse-grid td:hover { filter: brightness(1.4); }
+#sim-grid td { cursor: default; }
+
+/* CellType colors */
+.cell-empty        { background: #3a3a3a; }
+.cell-rack         { background: #c76b00; }
+.cell-aisle        { background: #1c1c1c; }
+.cell-pack         { background: #2d6a2d; }
+.cell-agent        { background: #1a6fb5 !important; }
+.cell-agent-carry  { background: #4a9fd4 !important; }
+
+/* ── Status bar ──────────────────────────────────────── */
+#status-bar {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 12px;
+    font-size: 12px;
+}
+#status-bar span.label { color: #666; }
+#status-bar span.value { color: #ccc; }
+
+/* ── Metrics table ───────────────────────────────────── */
+.metrics-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+.metrics-table th {
+    color: #888;
+    text-align: left;
+    padding: 4px 8px;
+    border-bottom: 1px solid #333;
+    font-weight: normal;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+}
+.metrics-table td {
+    padding: 3px 8px;
+    border-bottom: 1px solid #1e1e1e;
+    color: #bbb;
+}
+.metrics-table tr:last-child td { border-bottom: none; }
+.metrics-table tfoot td {
+    color: #eee;
+    border-top: 1px solid #444;
+    padding-top: 5px;
+    font-weight: bold;
+}
+.text-right { text-align: right; }
+
+/* ── Error banner ────────────────────────────────────── */
+#error-banner {
+    background: #4a1010;
+    border: 1px solid #8a2020;
+    color: #ffaaaa;
+    padding: 8px 10px;
+    border-radius: 3px;
+    font-size: 12px;
+    display: none;
+}
+
+/* ── Data generation param grid ──────────────────────── */
+.param-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 12px;
+    margin-bottom: 8px;
+}
+.param {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+.param-label {
+    font-size: 11px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.param input,
+.param select {
+    width: 100%;
+    background: #222;
+    color: #ccc;
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 4px 6px;
+    font-family: monospace;
+    font-size: 12px;
+}
+.param select { cursor: pointer; }
+.param-hints {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding-top: 4px;
+    border-top: 1px solid #222;
+}
+.param-hints span {
+    font-size: 11px;
+    color: #555;
+    cursor: help;
+}
+.param-hints span:hover { color: #888; }
+
+/* ── Order queue list ────────────────────────────────── */
+.order-list {
+    max-height: 180px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+.order-row {
+    display: grid;
+    grid-template-columns: 14px 1fr auto auto;
+    gap: 0 8px;
+    align-items: center;
+    padding: 3px 4px;
+    border-radius: 2px;
+    font-size: 11px;
+    color: #555;
+    transition: background 0.1s, color 0.1s;
+}
+.order-status { text-align: center; font-size: 10px; }
+.order-row.active {
+    color: #4a9fd4;
+    background: rgba(26, 111, 181, 0.12);
+}
+.order-row.done { color: #333; }
+.order-row.done .order-status { color: #2d6a2d; }
+.order-batch-tag {
+    font-size: 10px;
+    color: #666;
+    background: #1e1e1e;
+    border: 1px solid #2a2a2a;
+    border-radius: 2px;
+    padding: 0 4px;
+}
+
+/* ── File load hidden input ──────────────────────────── */
+#file-load-input { display: none; }
+
+/* ── Summary box ─────────────────────────────────────── */
+#summary-box {
+    background: #0e2a0e;
+    border: 1px solid #2d6a2d;
+    border-radius: 3px;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: #aee8ae;
+    display: none;
+}
+
+```
+
+## editor\editor.js
+
+```javascript
+"use strict";
+
+const API_BASE = "http://localhost:8000"; // prefix all fetch calls — swap for Tauri sidecar later
+
+// CellType values (mirror warehouse/grid.py CellType enum)
+const CT = { EMPTY: 0, RACK: 1, AISLE: 2, PACK: 3 };
+const CELL_CLASS = { 0: "cell-empty", 1: "cell-rack", 2: "cell-aisle", 3: "cell-pack" };
+
+// ─────────────────────────────────────────────────────────────────
+// GridEditor — manages the drawable editor table
+// ─────────────────────────────────────────────────────────────────
+class GridEditor {
+  constructor(tableEl) {
+    this.tableEl = tableEl;
+    this.rows = 0;
+    this.cols = 0;
+    this.cells = [];      // 2D array of CellType int
+    this.brush = CT.RACK;
+    this.painting = false;
+    this.packPos = null;  // [row, col] of current PACK_STATION, enforces exactly one
+
+    document.addEventListener("mouseup", () => { this.painting = false; });
+  }
+
+  build(rows, cols) {
+    this.rows = rows;
+    this.cols = cols;
+    this.cells = Array.from({ length: rows }, () => new Array(cols).fill(CT.AISLE));
+    this.packPos = null;
+    this._render();
+  }
+
+  loadFromDict(dict) {
+    this.rows = dict.rows;
+    this.cols = dict.cols;
+    this.cells = dict.grid.map(row => [...row]);
+    this.packPos = dict.pack_station_pos ? [...dict.pack_station_pos] : null;
+    this._render();
+  }
+
+  toDict() {
+    return {
+      rows: this.rows,
+      cols: this.cols,
+      grid: this.cells.map(row => [...row]),
+      pack_station_pos: this.packPos ? [...this.packPos] : [0, 0],
+    };
+  }
+
+  setBrush(type) {
+    this.brush = type;
+  }
+
+  setCellType(row, col, type) {
+    if (row < 0 || row >= this.rows || col < 0 || col >= this.cols) return;
+
+    // Enforce single pack station
+    if (type === CT.PACK) {
+      if (this.packPos) {
+        const [pr, pc] = this.packPos;
+        this.cells[pr][pc] = CT.AISLE;
+        this._updateTd(pr, pc);
+      }
+      this.packPos = [row, col];
+    } else if (this.packPos && this.packPos[0] === row && this.packPos[1] === col) {
+      this.packPos = null;
+    }
+
+    this.cells[row][col] = type;
+    this._updateTd(row, col);
+  }
+
+  validateLocal() {
+    const errors = [];
+    if (!this.packPos) errors.push("Place exactly one Pack Station on the grid.");
+    const rackCount = this.cells.flat().filter(c => c === CT.RACK).length;
+    if (rackCount === 0) errors.push("Add at least one Rack cell.");
+    return errors.length ? errors : null;
+  }
+
+  _render() {
+    this.tableEl.innerHTML = "";
+    for (let r = 0; r < this.rows; r++) {
+      const tr = document.createElement("tr");
+      for (let c = 0; c < this.cols; c++) {
+        const td = document.createElement("td");
+        td.dataset.row = r;
+        td.dataset.col = c;
+        td.className = CELL_CLASS[this.cells[r][c]];
+        td.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          this.painting = true;
+          this.setCellType(r, c, this.brush);
+        });
+        td.addEventListener("mouseenter", () => {
+          if (this.painting) this.setCellType(r, c, this.brush);
+        });
+        tr.appendChild(td);
+      }
+      this.tableEl.appendChild(tr);
+    }
+  }
+
+  _updateTd(row, col) {
+    const td = this.tableEl.rows[row]?.cells[col];
+    if (td) td.className = CELL_CLASS[this.cells[row][col]];
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SimulationViewer — read-only grid with agent overlay
+// ─────────────────────────────────────────────────────────────────
+class SimulationViewer {
+  constructor(tableEl) {
+    this.tableEl = tableEl;
+    this.rows = 0;
+    this.cols = 0;
+    this.agentRow = -1;
+    this.agentCol = -1;
+  }
+
+  build(dict) {
+    this.rows = dict.rows;
+    this.cols = dict.cols;
+    this.agentRow = -1;
+    this.agentCol = -1;
+    this.tableEl.innerHTML = "";
+    for (let r = 0; r < this.rows; r++) {
+      const tr = document.createElement("tr");
+      for (let c = 0; c < this.cols; c++) {
+        const td = document.createElement("td");
+        td.className = CELL_CLASS[dict.grid[r][c]];
+        tr.appendChild(td);
+      }
+      this.tableEl.appendChild(tr);
+    }
+  }
+
+  applyTick(frame) {
+    const { row, col, state, carrying } = frame.agent;
+
+    // Clear previous agent cell
+    if (this.agentRow >= 0) {
+      const prev = this.tableEl.rows[this.agentRow]?.cells[this.agentCol];
+      if (prev) {
+        prev.classList.remove("cell-agent", "cell-agent-carry");
+      }
+    }
+
+    // Set new agent cell
+    const td = this.tableEl.rows[row]?.cells[col];
+    if (td) {
+      td.classList.add(carrying.length > 0 ? "cell-agent-carry" : "cell-agent");
+    }
+    this.agentRow = row;
+    this.agentCol = col;
+
+    // Update status bar
+    document.getElementById("status-tick").textContent = frame.tick;
+    document.getElementById("status-order").textContent = frame.active_order ?? "—";
+    document.getElementById("status-state").textContent = state.replace(/_/g, " ");
+    document.getElementById("status-carrying").textContent =
+      carrying.length ? carrying.join(", ") : "nothing";
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SimulationClient — WebSocket lifecycle
+// ─────────────────────────────────────────────────────────────────
+class SimulationClient {
+  constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner, orderList) {
+    this.viewer = viewer;
+    this.metricsTbody = metricsTbody;
+    this.metricsFooter = metricsFooter;
+    this.summaryBox = summaryBox;
+    this.errorBanner = errorBanner;
+    this.orderList = orderList;
+    this.ws = null;
+    this.orderRows = new Map();  // order_id -> { el, batchId }
+    this.activeBatchId = null;
+  }
+
+  sendSpeedUpdate(ms) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "set_speed", tick_delay_ms: ms }));
+    }
+  }
+
+  stop() {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "stop" }));
+    }
+    this.disconnect();
+  }
+
+  connect(config) {
+    this.errorBanner.style.display = "none";
+    this.summaryBox.style.display = "none";
+
+    const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws/simulate";
+    this.ws = new WebSocket(wsUrl);
+
+    this.ws.onopen = () => {
+      this.ws.send(JSON.stringify(config));
+    };
+
+    this.ws.onmessage = (event) => {
+      const frame = JSON.parse(event.data);
+      switch (frame.type) {
+        case "orders_ready":   this._onOrdersReady(frame); break;
+        case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.active_batch); break;
+        case "order_complete": this._appendMetricsRow(frame); this._markOrderDone(frame.order_id); break;
+        case "complete":       this._onComplete(frame); break;
+        case "error":          this._showError(frame.message); break;
+      }
+    };
+
+    this.ws.onerror = () => this._showError("WebSocket connection error.");
+    this.ws.onclose = () => {
+      const btn = document.getElementById("btn-run");
+      btn.dataset.running = "0";
+      btn.textContent = "▶ Run Simulation";
+    };
+  }
+
+  disconnect() {
+    if (this.ws) { this.ws.close(); this.ws = null; }
+  }
+
+  _onOrdersReady(frame) {
+    this.orderList.innerHTML = "";
+    this.orderRows.clear();
+    this.activeBatchId = null;
+
+    for (const o of frame.orders) {
+      const row = document.createElement("div");
+      row.className = "order-row";
+
+      const status = document.createElement("span");
+      status.className = "order-status";
+      status.textContent = "·";
+
+      const id = document.createElement("span");
+      id.textContent = o.order_id;
+
+      const items = document.createElement("span");
+      items.style.color = "#444";
+      items.textContent = o.n_items + "×";
+
+      const batch = document.createElement("span");
+      batch.className = "order-batch-tag";
+      if (o.batch_id && o.batch_id !== o.order_id) batch.textContent = o.batch_id;
+
+      row.append(status, id, items, batch);
+      this.orderList.appendChild(row);
+      this.orderRows.set(o.order_id, { el: row, batchId: o.batch_id });
+    }
+  }
+
+  _updateActiveOrders(batchId) {
+    if (batchId === this.activeBatchId) return;
+
+    for (const [, info] of this.orderRows) {
+      if (info.el.classList.contains("active")) {
+        info.el.classList.remove("active");
+        info.el.querySelector(".order-status").textContent = "·";
+      }
+    }
+    if (batchId) {
+      for (const [, info] of this.orderRows) {
+        if (info.batchId === batchId && !info.el.classList.contains("done")) {
+          info.el.classList.add("active");
+          info.el.querySelector(".order-status").textContent = "●";
+          info.el.scrollIntoView({ block: "nearest" });
+        }
+      }
+    }
+    this.activeBatchId = batchId;
+  }
+
+  _markOrderDone(orderId) {
+    const info = this.orderRows.get(orderId);
+    if (!info) return;
+    info.el.classList.remove("active");
+    info.el.classList.add("done");
+    info.el.querySelector(".order-status").textContent = "✓";
+  }
+
+  _appendMetricsRow(frame) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${frame.order_id}</td>
+      <td class="text-right">${frame.items_picked}</td>
+      <td class="text-right">${frame.distance_traveled}</td>
+      <td class="text-right">${frame.ticks_taken}</td>
+    `;
+    this.metricsTbody.appendChild(tr);
+    tr.scrollIntoView({ block: "nearest" });
+  }
+
+  _onComplete(frame) {
+    const s = frame.summary;
+    document.getElementById("footer-items").textContent = s.total_items_picked;
+    document.getElementById("footer-dist").textContent = s.total_distance;
+    document.getElementById("footer-ticks").textContent = frame.total_ticks;
+    this.metricsFooter.style.display = "";
+
+    this.summaryBox.style.display = "block";
+    this.summaryBox.innerHTML =
+      `✓ Done — ${frame.total_orders} orders completed in ${frame.total_ticks} ticks &nbsp;|&nbsp; ` +
+      `avg ${s.avg_ticks_per_order} ticks/order &nbsp;|&nbsp; ` +
+      `total distance ${s.total_distance}`;
+  }
+
+  _showError(message) {
+    this.errorBanner.textContent = "Error: " + message;
+    this.errorBanner.style.display = "block";
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Module wiring
+// ─────────────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", () => {
+  const editor = new GridEditor(document.getElementById("editor-grid"));
+  const viewer = new SimulationViewer(document.getElementById("sim-grid"));
+  let client = null;
+
+  // Load default layout on startup
+  fetch(API_BASE + "/api/default-layout")
+    .then(r => r.json())
+    .then(dict => {
+      editor.loadFromDict(dict);
+      viewer.build(dict);
+    });
+
+  // ── Mode toggle ──────────────────────────────
+  const modeButtons = ["mode-default", "mode-quad", "mode-custom"];
+
+  function setActiveMode(activeId) {
+    modeButtons.forEach(id => document.getElementById(id).classList.toggle("active", id === activeId));
+    document.getElementById("custom-controls").style.display = activeId === "mode-custom" ? "" : "none";
+  }
+
+  document.getElementById("mode-default").addEventListener("click", () => {
+    fetch(API_BASE + "/api/default-layout")
+      .then(r => r.json())
+      .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
+    setActiveMode("mode-default");
+  });
+
+  document.getElementById("mode-quad").addEventListener("click", () => {
+    fetch(API_BASE + "/api/quad-layout")
+      .then(r => r.json())
+      .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
+    setActiveMode("mode-quad");
+  });
+
+  document.getElementById("mode-custom").addEventListener("click", () => {
+    setActiveMode("mode-custom");
+  });
+
+  // ── Custom size ──────────────────────────────
+  document.getElementById("btn-apply-size").addEventListener("click", () => {
+    const rows = parseInt(document.getElementById("input-rows").value);
+    const cols = parseInt(document.getElementById("input-cols").value);
+    editor.build(rows, cols);
+    viewer.build({ rows, cols, grid: Array.from({ length: rows }, () => new Array(cols).fill(2)) });
+  });
+
+  // ── Brushes ──────────────────────────────────
+  const brushMap = {
+    "brush-rack":  CT.RACK,
+    "brush-aisle": CT.AISLE,
+    "brush-pack":  CT.PACK,
+    "brush-empty": CT.EMPTY,
+  };
+  Object.entries(brushMap).forEach(([id, type]) => {
+    document.getElementById(id).addEventListener("click", () => {
+      editor.setBrush(type);
+      document.querySelectorAll(".brush-btn").forEach(b => b.classList.remove("active"));
+      document.getElementById(id).classList.add("active");
+    });
+  });
+
+  // ── Save ─────────────────────────────────────
+  document.getElementById("btn-save").addEventListener("click", () => {
+    const dict = editor.toDict();
+    const blob = new Blob([JSON.stringify(dict, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "warehouse-layout.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  // ── Load ─────────────────────────────────────
+  document.getElementById("file-load-input").addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const dict = JSON.parse(ev.target.result);
+        editor.loadFromDict(dict);
+        viewer.build(dict);
+      } catch {
+        alert("Invalid JSON file.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  });
+
+  // ── Batch strategy — show/hide batch size ────────────
+  document.getElementById("input-batch-strategy").addEventListener("change", (e) => {
+    document.getElementById("batch-size-param").style.display =
+      e.target.value === "none" ? "none" : "";
+  });
+
+  // ── Speed slider — updates live if simulation is running ─────────
+  document.getElementById("speed-slider").addEventListener("input", (e) => {
+    document.getElementById("speed-label").textContent = e.target.value + " ms";
+    if (client) client.sendSpeedUpdate(parseInt(e.target.value));
+  });
+
+  // ── Run / Stop button ─────────────────────────
+  document.getElementById("btn-run").addEventListener("click", async () => {
+    const btn = document.getElementById("btn-run");
+
+    // If simulation is running, stop it
+    if (btn.dataset.running === "1") {
+      if (client) client.stop();
+      btn.dataset.running = "0";
+      btn.textContent = "▶ Run Simulation";
+      btn.classList.remove("stopping");
+      return;
+    }
+
+    const errorBanner = document.getElementById("error-banner");
+    errorBanner.style.display = "none";
+
+    // Local validation first
+    const localErrors = editor.validateLocal();
+    if (localErrors) {
+      errorBanner.textContent = localErrors.join(" ");
+      errorBanner.style.display = "block";
+      return;
+    }
+
+    const dict = editor.toDict();
+
+    // Server-side validation
+    const vRes = await fetch(API_BASE + "/api/validate-layout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dict),
+    });
+    const validation = await vRes.json();
+    if (!validation.valid) {
+      errorBanner.textContent = validation.errors.join(" | ");
+      errorBanner.style.display = "block";
+      return;
+    }
+
+    // Reset UI
+    document.getElementById("metrics-tbody").innerHTML = "";
+    document.getElementById("metrics-footer").style.display = "none";
+    document.getElementById("order-list").innerHTML = "";
+    viewer.build(dict);
+    btn.dataset.running = "1";
+    btn.textContent = "■ Stop";
+
+    if (client) client.disconnect();
+    client = new SimulationClient(
+      viewer,
+      document.getElementById("metrics-tbody"),
+      document.getElementById("metrics-footer"),
+      document.getElementById("summary-box"),
+      errorBanner,
+      document.getElementById("order-list"),
+    );
+
+    client.connect({
+      layout: dict,
+      n_orders: parseInt(document.getElementById("input-orders").value),
+      n_items: parseInt(document.getElementById("input-items").value),
+      items_per_order: parseInt(document.getElementById("input-per-order").value),
+      n_families: parseInt(document.getElementById("input-families").value),
+      demand_skew: parseFloat(document.getElementById("input-skew").value),
+      family_affinity: parseFloat(document.getElementById("input-affinity").value),
+      batch_strategy: document.getElementById("input-batch-strategy").value,
+      batch_size: parseInt(document.getElementById("input-batch-size").value),
+      seed: 42,
+      tick_delay_ms: parseInt(document.getElementById("speed-slider").value),
+    });
+  });
+});
+
+```
+
+## editor\index.html
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Warehouse Sim</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+
+<header>
+  <h1>Warehouse Sim</h1>
+  <span class="subtitle">Layout Editor &amp; Simulation Viewer</span>
+</header>
+
+<div id="content">
+
+  <!-- ══════════════ LEFT PANEL — EDITOR ══════════════ -->
+  <div id="left-panel">
+
+    <!-- Mode toggle -->
+    <div class="section">
+      <div class="section-title">Layout Mode</div>
+      <div class="mode-toggle">
+        <button id="mode-default" class="active">Default (12×19)</button>
+        <button id="mode-quad">Quad (24×38)</button>
+        <button id="mode-custom">Custom</button>
+      </div>
+    </div>
+
+    <!-- Custom size controls (hidden in default mode) -->
+    <div class="section" id="custom-controls" style="display:none">
+      <div class="section-title">Canvas Size</div>
+      <div class="input-row">
+        <label>Rows</label>
+        <input type="number" id="input-rows" value="10" min="3" max="40" />
+        <label>Cols</label>
+        <input type="number" id="input-cols" value="16" min="3" max="60" />
+        <button id="btn-apply-size">Apply</button>
+      </div>
+      <p style="color:#666;font-size:11px;margin-top:6px;">
+        All cells start as Aisle. Paint Rack cells and place one Pack Station.
+      </p>
+    </div>
+
+    <!-- Brush toolbar -->
+    <div class="section">
+      <div class="section-title">Brush</div>
+      <div class="toolbar">
+        <button class="brush-btn" id="brush-rack">
+          <span class="brush-swatch swatch-rack"></span>Rack
+        </button>
+        <button class="brush-btn" id="brush-aisle">
+          <span class="brush-swatch swatch-aisle"></span>Aisle
+        </button>
+        <button class="brush-btn active" id="brush-pack">
+          <span class="brush-swatch swatch-pack"></span>Pack Station
+        </button>
+        <button class="brush-btn" id="brush-empty">
+          <span class="brush-swatch swatch-empty"></span>Empty
+        </button>
+      </div>
+    </div>
+
+    <!-- Editor grid -->
+    <div class="section">
+      <div class="section-title">Editor</div>
+      <div class="grid-scroll">
+        <table class="warehouse-grid" id="editor-grid"></table>
+      </div>
+    </div>
+
+    <!-- Save / Load -->
+    <div class="section">
+      <div class="section-title">File</div>
+      <div style="display:flex;gap:8px;">
+        <button id="btn-save">Save JSON</button>
+        <label>
+          <button id="btn-load" onclick="document.getElementById('file-load-input').click()">
+            Load JSON
+          </button>
+          <input type="file" id="file-load-input" accept=".json" />
+        </label>
+      </div>
+    </div>
+
+  </div><!-- /left-panel -->
+
+  <!-- ══════════════ RIGHT PANEL — SIMULATION ══════════════ -->
+  <div id="right-panel">
+
+    <!-- Catalog parameters -->
+    <div class="section">
+      <div class="section-title">Item Catalog</div>
+      <div class="param-grid">
+        <div class="param">
+          <span class="param-label">Items in catalog</span>
+          <input type="number" id="input-items" value="30" min="1" max="200" />
+        </div>
+        <div class="param">
+          <span class="param-label">Product families</span>
+          <input type="number" id="input-families" value="4" min="1" max="20" />
+        </div>
+        <div class="param">
+          <span class="param-label">Demand skew</span>
+          <input type="number" id="input-skew" value="2.0" min="0.1" max="10" step="0.1" />
+        </div>
+        <div class="param">
+          <span class="param-label">Family affinity</span>
+          <input type="number" id="input-affinity" value="0.7" min="0" max="1" step="0.05" />
+        </div>
+      </div>
+      <div class="param-hints">
+        <span title="Higher = a few items dominate most orders (power-law distribution)">⚙ Demand skew: spread of item popularity</span>
+        <span title="Fraction of each order drawn from one product family (0 = random, 1 = all same family)">⚙ Affinity: how often items cluster by family</span>
+      </div>
+    </div>
+
+    <!-- Order parameters -->
+    <div class="section">
+      <div class="section-title">Orders</div>
+      <div class="param-grid">
+        <div class="param">
+          <span class="param-label">Number of orders</span>
+          <input type="number" id="input-orders" value="10" min="1" max="500" />
+        </div>
+        <div class="param">
+          <span class="param-label">Items per order</span>
+          <input type="number" id="input-per-order" value="4" min="1" max="20" />
+        </div>
+      </div>
+    </div>
+
+    <!-- Batching -->
+    <div class="section">
+      <div class="section-title">Batching</div>
+      <div class="param-grid">
+        <div class="param">
+          <span class="param-label">Strategy</span>
+          <select id="input-batch-strategy">
+            <option value="none">None (FIFO)</option>
+            <option value="zone">Zone overlap</option>
+            <option value="tsp">Nearest neighbor</option>
+          </select>
+        </div>
+        <div class="param" id="batch-size-param" style="display:none">
+          <span class="param-label">Batch size</span>
+          <input type="number" id="input-batch-size" value="2" min="2" max="6" title="Max 6 — larger batches cause heavy item overlap with small catalogs" />
+        </div>
+      </div>
+    </div>
+
+    <!-- Simulation controls -->
+    <div class="section">
+      <div class="section-title">Simulation</div>
+      <div class="input-row" style="margin-bottom:10px;">
+        <label>Speed</label>
+        <input type="range" id="speed-slider" min="10" max="500" value="80" />
+        <span class="speed-label" id="speed-label">80 ms</span>
+      </div>
+      <button class="primary" id="btn-run">▶ Run Simulation</button>
+      <div id="error-banner"></div>
+    </div>
+
+    <!-- Simulation grid -->
+    <div class="section">
+      <div class="section-title">Live View</div>
+      <div class="grid-scroll">
+        <table class="warehouse-grid" id="sim-grid"></table>
+      </div>
+    </div>
+
+    <!-- Status bar -->
+    <div class="section">
+      <div class="section-title">Agent Status</div>
+      <div id="status-bar">
+        <span class="label">Tick</span>
+        <span class="value" id="status-tick">—</span>
+        <span class="label">Order</span>
+        <span class="value" id="status-order">—</span>
+        <span class="label">State</span>
+        <span class="value" id="status-state">—</span>
+        <span class="label">Carrying</span>
+        <span class="value" id="status-carrying">—</span>
+      </div>
+    </div>
+
+    <!-- Order queue -->
+    <div class="section">
+      <div class="section-title">Order Queue</div>
+      <div class="order-list" id="order-list"></div>
+    </div>
+
+    <!-- Summary (shown on complete) -->
+    <div id="summary-box"></div>
+
+    <!-- Metrics table -->
+    <div class="section">
+      <div class="section-title">Order Metrics</div>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Order</th>
+            <th class="text-right">Items</th>
+            <th class="text-right">Distance</th>
+            <th class="text-right">Ticks</th>
+          </tr>
+        </thead>
+        <tbody id="metrics-tbody"></tbody>
+        <tfoot>
+          <tr id="metrics-footer" style="display:none">
+            <td>Total</td>
+            <td class="text-right" id="footer-items">—</td>
+            <td class="text-right" id="footer-dist">—</td>
+            <td class="text-right" id="footer-ticks">—</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+
+  </div><!-- /right-panel -->
+</div><!-- /content -->
+
+<script src="/static/editor.js"></script>
+</body>
+</html>
+
+```
+
+## editor\styles.css
+
+```css
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    background: #111;
+    color: #ddd;
+    font-family: monospace;
+    font-size: 13px;
+}
+
+/* ── Header ─────────────────────────────────────────── */
+header {
+    padding: 10px 16px;
+    background: #1a1a1a;
+    border-bottom: 1px solid #333;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+header h1 { font-size: 15px; color: #eee; letter-spacing: 1px; }
+header .subtitle { color: #666; font-size: 12px; }
+
+/* ── Two-panel content ───────────────────────────────── */
+#content {
+    display: grid;
+    grid-template-columns: 400px 1fr;
+    gap: 0;
+    flex: 1;
+    overflow: hidden;
+}
+
+#left-panel, #right-panel {
+    overflow-y: auto;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+#left-panel { border-right: 1px solid #2a2a2a; }
+
+/* ── Sections / cards ────────────────────────────────── */
+.section {
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    padding: 10px;
+}
+.section-title {
+    font-size: 11px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+}
+
+/* ── Buttons ─────────────────────────────────────────── */
+button {
+    background: #2a2a2a;
+    color: #ccc;
+    border: 1px solid #444;
+    padding: 5px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: monospace;
+    font-size: 12px;
+    transition: background 0.15s, border-color 0.15s;
+}
+button:hover { background: #333; border-color: #666; }
+button.active { background: #1a4a7a; border-color: #4a9fd4; color: #fff; }
+button.primary {
+    background: #1a4a1a;
+    border-color: #2d8a2d;
+    color: #aee8ae;
+    width: 100%;
+    padding: 8px;
+    font-size: 13px;
+}
+button.primary:hover { background: #245a24; }
+button.primary:disabled { background: #1a1a1a; color: #555; border-color: #333; cursor: default; }
+button.primary[data-running="1"] { background: #4a1010; border-color: #8a2020; color: #ffaaaa; }
+
+/* ── Mode toggle ─────────────────────────────────────── */
+.mode-toggle { display: flex; gap: 6px; }
+.mode-toggle button { flex: 1; }
+
+/* ── Toolbar ─────────────────────────────────────────── */
+.toolbar { display: flex; gap: 6px; flex-wrap: wrap; }
+.brush-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 8px;
+}
+.brush-swatch {
+    width: 14px; height: 14px;
+    border-radius: 2px;
+    border: 1px solid #555;
+    flex-shrink: 0;
+}
+.swatch-rack    { background: #c76b00; }
+.swatch-aisle   { background: #1c1c1c; border-color: #555; }
+.swatch-pack    { background: #2d6a2d; }
+.swatch-empty   { background: #3a3a3a; }
+
+/* ── Inputs ──────────────────────────────────────────── */
+.input-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.input-row label { color: #888; min-width: 40px; }
+input[type="number"], input[type="range"] {
+    background: #222;
+    color: #ccc;
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 4px 6px;
+    font-family: monospace;
+    font-size: 12px;
+    width: 60px;
+}
+input[type="range"] { width: 120px; padding: 2px; cursor: pointer; }
+.speed-label { color: #aaa; min-width: 36px; }
+
+/* ── Grid tables ─────────────────────────────────────── */
+.grid-scroll { overflow: auto; max-height: 420px; }
+.warehouse-grid {
+    border-collapse: collapse;
+    table-layout: fixed;
+    user-select: none;
+}
+.warehouse-grid td {
+    width: 24px; height: 24px;
+    border: 1px solid #0a0a0a;
+    cursor: pointer;
+    transition: filter 0.05s;
+}
+.warehouse-grid td:hover { filter: brightness(1.4); }
+#sim-grid td { cursor: default; }
+
+/* CellType colors */
+.cell-empty        { background: #3a3a3a; }
+.cell-rack         { background: #c76b00; }
+.cell-aisle        { background: #1c1c1c; }
+.cell-pack         { background: #2d6a2d; }
+.cell-agent        { background: #1a6fb5 !important; }
+.cell-agent-carry  { background: #4a9fd4 !important; }
+
+/* ── Status bar ──────────────────────────────────────── */
+#status-bar {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 12px;
+    font-size: 12px;
+}
+#status-bar span.label { color: #666; }
+#status-bar span.value { color: #ccc; }
+
+/* ── Metrics table ───────────────────────────────────── */
+.metrics-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+.metrics-table th {
+    color: #888;
+    text-align: left;
+    padding: 4px 8px;
+    border-bottom: 1px solid #333;
+    font-weight: normal;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+}
+.metrics-table td {
+    padding: 3px 8px;
+    border-bottom: 1px solid #1e1e1e;
+    color: #bbb;
+}
+.metrics-table tr:last-child td { border-bottom: none; }
+.metrics-table tfoot td {
+    color: #eee;
+    border-top: 1px solid #444;
+    padding-top: 5px;
+    font-weight: bold;
+}
+.text-right { text-align: right; }
+
+/* ── Error banner ────────────────────────────────────── */
+#error-banner {
+    background: #4a1010;
+    border: 1px solid #8a2020;
+    color: #ffaaaa;
+    padding: 8px 10px;
+    border-radius: 3px;
+    font-size: 12px;
+    display: none;
+}
+
+/* ── Data generation param grid ──────────────────────── */
+.param-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 12px;
+    margin-bottom: 8px;
+}
+.param {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+.param-label {
+    font-size: 11px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.param input,
+.param select {
+    width: 100%;
+    background: #222;
+    color: #ccc;
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 4px 6px;
+    font-family: monospace;
+    font-size: 12px;
+}
+.param select { cursor: pointer; }
+.param-hints {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding-top: 4px;
+    border-top: 1px solid #222;
+}
+.param-hints span {
+    font-size: 11px;
+    color: #555;
+    cursor: help;
+}
+.param-hints span:hover { color: #888; }
+
+/* ── Order queue list ────────────────────────────────── */
+.order-list {
+    max-height: 180px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+.order-row {
+    display: grid;
+    grid-template-columns: 14px 1fr auto auto;
+    gap: 0 8px;
+    align-items: center;
+    padding: 3px 4px;
+    border-radius: 2px;
+    font-size: 11px;
+    color: #555;
+    transition: background 0.1s, color 0.1s;
+}
+.order-status { text-align: center; font-size: 10px; }
+.order-row.active {
+    color: #4a9fd4;
+    background: rgba(26, 111, 181, 0.12);
+}
+.order-row.done { color: #333; }
+.order-row.done .order-status { color: #2d6a2d; }
+.order-batch-tag {
+    font-size: 10px;
+    color: #666;
+    background: #1e1e1e;
+    border: 1px solid #2a2a2a;
+    border-radius: 2px;
+    padding: 0 4px;
+}
+
+/* ── File load hidden input ──────────────────────────── */
+#file-load-input { display: none; }
+
+/* ── Summary box ─────────────────────────────────────── */
+#summary-box {
+    background: #0e2a0e;
+    border: 1px solid #2d6a2d;
+    border-radius: 3px;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: #aee8ae;
+    display: none;
+}
+
+```
+
+## tests\test_sim.py
+
+```python
+"""
+Quick smoke tests covering data generation, batchers, simulation completion,
+and the server WebSocket message flow.
+
+Run with:  pytest tests/test_sim.py -v
+"""
+import asyncio
+import json
+import pytest
+
+from warehouse.grid import WarehouseGrid
+from warehouse.inventory import Inventory
+from warehouse.agent import PickAgent
+from warehouse.simulation import Simulation
+from warehouse.batcher import FIFOBatcher, ZoneBatcher, GreedyTSPBatcher
+from warehouse.data_gen import generate_catalog, generate_orders
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+DEFAULT = WarehouseGrid.build_default()
+QUAD    = WarehouseGrid.build_quad()
+
+
+def catalog(n_items=30, n_families=4, seed=42):
+    return generate_catalog(n_items=n_items, n_families=n_families, seed=seed)
+
+
+def orders(items, n=8, per_order=4, seed=42):
+    return generate_orders(items, n_orders=n, items_per_order=per_order, seed=seed)
+
+
+def run_sim(grid, items, orders, strategy="none", batch_size=2, restock_delay=0):
+    inventory = Inventory(grid)
+    inventory.seed(items)
+    agent = PickAgent("A1", grid.pack_station_pos, grid)
+    sim = Simulation(grid, inventory, agent, restock_delay=restock_delay)
+
+    if strategy == "zone":
+        for b in ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders):
+            sim.enqueue_batch(b)
+    elif strategy == "tsp":
+        for b in GreedyTSPBatcher(inventory, grid, max_batch_size=batch_size).batch(orders):
+            sim.enqueue_batch(b)
+    else:
+        for o in orders:
+            sim.enqueue_order(o)
+
+    sim.run()
+    return sim
+
+
+class FakeWS:
+    def __init__(self): self.msgs = []
+    async def send_text(self, t): self.msgs.append(json.loads(t))
+
+
+def run_server(strategy="none", batch_size=2, n_orders=6, grid=None, seed=42):
+    from server import _run_simulation
+    grid = grid or DEFAULT
+
+    async def _run():
+        ws = FakeWS()
+        await _run_simulation(ws, {
+            "layout": grid.to_dict(),
+            "n_orders": n_orders, "n_items": 30, "items_per_order": 4,
+            "n_families": 4, "demand_skew": 2.0, "family_affinity": 0.7,
+            "batch_strategy": strategy, "batch_size": batch_size,
+            "seed": seed, "tick_delay_ms": 0,
+        })
+        return ws.msgs
+
+    return asyncio.run(_run())
+
+
+# ── data generation ───────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("n_items,n_families,per_order", [
+    (30, 4, 4),
+    (10, 6, 4),   # small families — old bug produced short orders
+    (20, 5, 3),
+    (50, 8, 5),
+])
+def test_orders_always_exact_size(n_items, n_families, per_order):
+    items = catalog(n_items=n_items, n_families=n_families)
+    result = orders(items, n=20, per_order=per_order)
+    bad = [o for o in result if len(o.item_ids) != per_order]
+    assert not bad, f"{len(bad)} orders have wrong size: {[(o.order_id, len(o.item_ids)) for o in bad]}"
+
+
+def test_orders_no_duplicates_within_order():
+    items = catalog()
+    result = orders(items)
+    for o in result:
+        assert len(o.item_ids) == len(set(o.item_ids)), f"Duplicate items in {o.order_id}"
+
+
+# ── batchers ──────────────────────────────────────────────────────────────────
+
+def test_fifo_one_batch_per_order():
+    items = catalog()
+    batches = FIFOBatcher().batch(orders(items))
+    assert all(len(b.orders) == 1 for b in batches)
+    assert len(batches) == 8
+
+
+@pytest.mark.parametrize("batch_size", [2, 3, 4])
+def test_zone_batcher_groups_orders(batch_size):
+    items = catalog()
+    os = orders(items, n=10)
+    inv = Inventory(DEFAULT); inv.seed(items)
+    batches = ZoneBatcher(DEFAULT, inv, max_batch_size=batch_size).batch(os)
+    assert len(batches) < len(os), "ZoneBatcher produced no grouping"
+    assert all(len(b.orders) <= batch_size for b in batches)
+
+
+@pytest.mark.parametrize("batch_size", [2, 3, 4])
+def test_tsp_batcher_reduces_distance(batch_size):
+    items = catalog()
+    os = orders(items, n=10)
+
+    # Compare agent.total_distance (actual steps walked), not the sum of per-order
+    # distance_traveled — batched runs attribute the full trip distance to every order
+    # in the batch, so the per-order sum is inflated vs FIFO.
+    sim_fifo = run_sim(DEFAULT, items, os, strategy="none")
+    sim_tsp  = run_sim(DEFAULT, items, os, strategy="tsp", batch_size=batch_size)
+
+    dist_fifo = sim_fifo.agent.total_distance
+    dist_tsp  = sim_tsp.agent.total_distance
+    assert dist_tsp <= dist_fifo, f"TSP ({dist_tsp}) > FIFO ({dist_fifo}) at batch_size={batch_size}"
+
+
+def test_zone_batcher_works_after_round_trip_serialisation():
+    """from_dict without zone_map_list must still produce a usable zone map."""
+    # Simulate what the browser client sends — no zone_map_list key
+    d = DEFAULT.to_dict()
+    del d["zone_map_list"]
+    grid = WarehouseGrid.from_dict(d)
+    assert grid.zone_map, "zone_map is empty after from_dict without zone_map_list"
+
+    items = catalog()
+    inv = Inventory(grid); inv.seed(items)
+    os = orders(items, n=10)
+    batches = ZoneBatcher(grid, inv, max_batch_size=2).batch(os)
+    assert len(batches) < len(os), "ZoneBatcher produced no grouping on round-tripped grid"
+
+
+def test_batched_order_unified_ids_no_duplicates():
+    items = catalog()
+    os = orders(items, n=6)
+    inv = Inventory(DEFAULT); inv.seed(items)
+    for b in GreedyTSPBatcher(inv, DEFAULT, max_batch_size=3).batch(os):
+        assert len(b.unified_item_ids) == len(set(b.unified_item_ids)), \
+            f"Batch {b.batch_id} has duplicate item IDs"
+
+
+# ── simulation completion ─────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("n_orders", [1, 5, 20])
+def test_all_orders_complete(n_orders):
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=n_orders))
+    assert len(sim.completed_metrics) == n_orders
+
+
+@pytest.mark.parametrize("n_orders", [1, 5, 20])
+def test_all_orders_complete_quad(n_orders):
+    items = catalog(n_items=60, n_families=6)
+    sim = run_sim(QUAD, items, orders(items, n=n_orders))
+    assert len(sim.completed_metrics) == n_orders
+
+
+def test_fifo_picks_full_orders_no_restock_delay():
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=10), restock_delay=0)
+    bad = [m for m in sim.completed_metrics if m.items_picked != 4]
+    assert not bad, f"Short picks with restock_delay=0: {[(m.order_id, m.items_picked) for m in bad]}"
+
+
+@pytest.mark.parametrize("strategy,batch_size", [
+    ("none", 1),
+    ("zone", 2),
+    ("tsp",  2),
+    ("tsp",  4),
+])
+def test_all_orders_get_metrics(strategy, batch_size):
+    items = catalog()
+    os = orders(items, n=8)
+    sim = run_sim(DEFAULT, items, os, strategy=strategy, batch_size=batch_size, restock_delay=0)
+    assert len(sim.completed_metrics) == len(os), \
+        f"strategy={strategy} bs={batch_size}: {len(sim.completed_metrics)} metrics for {len(os)} orders"
+
+
+def test_summary_totals_consistent():
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=10))
+    s = sim.get_summary()
+    assert s.total_orders == len(sim.completed_metrics)
+    assert s.total_items  == sum(m.items_picked for m in sim.completed_metrics)
+    assert s.total_distance == sum(m.distance_traveled for m in sim.completed_metrics)
+
+
+# ── server WebSocket messages ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize("strategy,batch_size", [
+    ("none", 1),
+    ("zone", 2),
+    ("tsp",  2),
+    ("tsp",  3),
+])
+def test_server_emits_one_complete_per_order(strategy, batch_size):
+    n = 6
+    msgs = run_server(strategy=strategy, batch_size=batch_size, n_orders=n)
+    completions = [m for m in msgs if m["type"] == "order_complete"]
+    assert len(completions) == n, \
+        f"strategy={strategy}: got {len(completions)} order_complete, expected {n}"
+
+
+def test_server_orders_ready_correct_n_items():
+    msgs = run_server(strategy="tsp", batch_size=2, n_orders=6)
+    ready = next(m for m in msgs if m["type"] == "orders_ready")
+    bad = [o for o in ready["orders"] if o["n_items"] != 4]
+    assert not bad, f"Wrong n_items in orders_ready: {bad}"
+
+
+def test_server_orders_ready_grouped_by_batch():
+    msgs = run_server(strategy="tsp", batch_size=2, n_orders=6)
+    ready = next(m for m in msgs if m["type"] == "orders_ready")
+    batch_ids = [o["batch_id"] for o in ready["orders"]]
+    last_seen: dict[str, int] = {}
+    for i, bid in enumerate(batch_ids):
+        if bid in last_seen and last_seen[bid] != i - 1:
+            pytest.fail(f"Batch {bid} not consecutive in orders_ready: {batch_ids}")
+        last_seen[bid] = i
+
+
+def test_server_complete_message_present():
+    msgs = run_server(n_orders=4)
+    assert any(m["type"] == "complete" for m in msgs)
+    complete = next(m for m in msgs if m["type"] == "complete")
+    assert complete["total_orders"] == 4
+    assert complete["total_ticks"] > 0
+
+
+@pytest.mark.parametrize("strategy", ["none", "zone", "tsp"])
+def test_server_tick_has_active_batch(strategy):
+    msgs = run_server(strategy=strategy, batch_size=2, n_orders=4)
+    ticks = [m for m in msgs if m["type"] == "tick"]
+    assert ticks, "No tick messages received"
+    assert all("active_batch" in t for t in ticks), "Some tick frames missing active_batch key"
+
+```
+
+## tests\test_sim.py
+
+```python
+"""
+Quick smoke tests covering data generation, batchers, simulation completion,
+and the server WebSocket message flow.
+
+Run with:  pytest tests/test_sim.py -v
+"""
+import asyncio
+import json
+import pytest
+
+from warehouse.grid import WarehouseGrid
+from warehouse.inventory import Inventory
+from warehouse.agent import PickAgent
+from warehouse.simulation import Simulation
+from warehouse.batcher import FIFOBatcher, ZoneBatcher, GreedyTSPBatcher
+from warehouse.data_gen import generate_catalog, generate_orders
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+DEFAULT = WarehouseGrid.build_default()
+QUAD    = WarehouseGrid.build_quad()
+
+
+def catalog(n_items=30, n_families=4, seed=42):
+    return generate_catalog(n_items=n_items, n_families=n_families, seed=seed)
+
+
+def orders(items, n=8, per_order=4, seed=42):
+    return generate_orders(items, n_orders=n, items_per_order=per_order, seed=seed)
+
+
+def run_sim(grid, items, orders, strategy="none", batch_size=2, restock_delay=0):
+    inventory = Inventory(grid)
+    inventory.seed(items)
+    agent = PickAgent("A1", grid.pack_station_pos, grid)
+    sim = Simulation(grid, inventory, agent, restock_delay=restock_delay)
+
+    if strategy == "zone":
+        for b in ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders):
+            sim.enqueue_batch(b)
+    elif strategy == "tsp":
+        for b in GreedyTSPBatcher(inventory, grid, max_batch_size=batch_size).batch(orders):
+            sim.enqueue_batch(b)
+    else:
+        for o in orders:
+            sim.enqueue_order(o)
+
+    sim.run()
+    return sim
+
+
+class FakeWS:
+    def __init__(self): self.msgs = []
+    async def send_text(self, t): self.msgs.append(json.loads(t))
+
+
+def run_server(strategy="none", batch_size=2, n_orders=6, grid=None, seed=42):
+    from server import _run_simulation
+    grid = grid or DEFAULT
+
+    async def _run():
+        ws = FakeWS()
+        await _run_simulation(ws, {
+            "layout": grid.to_dict(),
+            "n_orders": n_orders, "n_items": 30, "items_per_order": 4,
+            "n_families": 4, "demand_skew": 2.0, "family_affinity": 0.7,
+            "batch_strategy": strategy, "batch_size": batch_size,
+            "seed": seed, "tick_delay_ms": 0,
+        })
+        return ws.msgs
+
+    return asyncio.run(_run())
+
+
+# ── data generation ───────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("n_items,n_families,per_order", [
+    (30, 4, 4),
+    (10, 6, 4),   # small families — old bug produced short orders
+    (20, 5, 3),
+    (50, 8, 5),
+])
+def test_orders_always_exact_size(n_items, n_families, per_order):
+    items = catalog(n_items=n_items, n_families=n_families)
+    result = orders(items, n=20, per_order=per_order)
+    bad = [o for o in result if len(o.item_ids) != per_order]
+    assert not bad, f"{len(bad)} orders have wrong size: {[(o.order_id, len(o.item_ids)) for o in bad]}"
+
+
+def test_orders_no_duplicates_within_order():
+    items = catalog()
+    result = orders(items)
+    for o in result:
+        assert len(o.item_ids) == len(set(o.item_ids)), f"Duplicate items in {o.order_id}"
+
+
+# ── batchers ──────────────────────────────────────────────────────────────────
+
+def test_fifo_one_batch_per_order():
+    items = catalog()
+    batches = FIFOBatcher().batch(orders(items))
+    assert all(len(b.orders) == 1 for b in batches)
+    assert len(batches) == 8
+
+
+@pytest.mark.parametrize("batch_size", [2, 3, 4])
+def test_zone_batcher_groups_orders(batch_size):
+    items = catalog()
+    os = orders(items, n=10)
+    inv = Inventory(DEFAULT); inv.seed(items)
+    batches = ZoneBatcher(DEFAULT, inv, max_batch_size=batch_size).batch(os)
+    assert len(batches) < len(os), "ZoneBatcher produced no grouping"
+    assert all(len(b.orders) <= batch_size for b in batches)
+
+
+@pytest.mark.parametrize("batch_size", [2, 3, 4])
+def test_tsp_batcher_reduces_distance(batch_size):
+    items = catalog()
+    os = orders(items, n=10)
+
+    # Compare agent.total_distance (actual steps walked), not the sum of per-order
+    # distance_traveled — batched runs attribute the full trip distance to every order
+    # in the batch, so the per-order sum is inflated vs FIFO.
+    sim_fifo = run_sim(DEFAULT, items, os, strategy="none")
+    sim_tsp  = run_sim(DEFAULT, items, os, strategy="tsp", batch_size=batch_size)
+
+    dist_fifo = sim_fifo.agent.total_distance
+    dist_tsp  = sim_tsp.agent.total_distance
+    assert dist_tsp <= dist_fifo, f"TSP ({dist_tsp}) > FIFO ({dist_fifo}) at batch_size={batch_size}"
+
+
+def test_zone_batcher_works_after_round_trip_serialisation():
+    """from_dict without zone_map_list must still produce a usable zone map."""
+    # Simulate what the browser client sends — no zone_map_list key
+    d = DEFAULT.to_dict()
+    del d["zone_map_list"]
+    grid = WarehouseGrid.from_dict(d)
+    assert grid.zone_map, "zone_map is empty after from_dict without zone_map_list"
+
+    items = catalog()
+    inv = Inventory(grid); inv.seed(items)
+    os = orders(items, n=10)
+    batches = ZoneBatcher(grid, inv, max_batch_size=2).batch(os)
+    assert len(batches) < len(os), "ZoneBatcher produced no grouping on round-tripped grid"
+
+
+def test_batched_order_unified_ids_no_duplicates():
+    items = catalog()
+    os = orders(items, n=6)
+    inv = Inventory(DEFAULT); inv.seed(items)
+    for b in GreedyTSPBatcher(inv, DEFAULT, max_batch_size=3).batch(os):
+        assert len(b.unified_item_ids) == len(set(b.unified_item_ids)), \
+            f"Batch {b.batch_id} has duplicate item IDs"
+
+
+# ── simulation completion ─────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("n_orders", [1, 5, 20])
+def test_all_orders_complete(n_orders):
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=n_orders))
+    assert len(sim.completed_metrics) == n_orders
+
+
+@pytest.mark.parametrize("n_orders", [1, 5, 20])
+def test_all_orders_complete_quad(n_orders):
+    items = catalog(n_items=60, n_families=6)
+    sim = run_sim(QUAD, items, orders(items, n=n_orders))
+    assert len(sim.completed_metrics) == n_orders
+
+
+def test_fifo_picks_full_orders_no_restock_delay():
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=10), restock_delay=0)
+    bad = [m for m in sim.completed_metrics if m.items_picked != 4]
+    assert not bad, f"Short picks with restock_delay=0: {[(m.order_id, m.items_picked) for m in bad]}"
+
+
+@pytest.mark.parametrize("strategy,batch_size", [
+    ("none", 1),
+    ("zone", 2),
+    ("tsp",  2),
+    ("tsp",  4),
+])
+def test_all_orders_get_metrics(strategy, batch_size):
+    items = catalog()
+    os = orders(items, n=8)
+    sim = run_sim(DEFAULT, items, os, strategy=strategy, batch_size=batch_size, restock_delay=0)
+    assert len(sim.completed_metrics) == len(os), \
+        f"strategy={strategy} bs={batch_size}: {len(sim.completed_metrics)} metrics for {len(os)} orders"
+
+
+def test_summary_totals_consistent():
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=10))
+    s = sim.get_summary()
+    assert s.total_orders == len(sim.completed_metrics)
+    assert s.total_items  == sum(m.items_picked for m in sim.completed_metrics)
+    assert s.total_distance == sum(m.distance_traveled for m in sim.completed_metrics)
+
+
+# ── server WebSocket messages ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize("strategy,batch_size", [
+    ("none", 1),
+    ("zone", 2),
+    ("tsp",  2),
+    ("tsp",  3),
+])
+def test_server_emits_one_complete_per_order(strategy, batch_size):
+    n = 6
+    msgs = run_server(strategy=strategy, batch_size=batch_size, n_orders=n)
+    completions = [m for m in msgs if m["type"] == "order_complete"]
+    assert len(completions) == n, \
+        f"strategy={strategy}: got {len(completions)} order_complete, expected {n}"
+
+
+def test_server_orders_ready_correct_n_items():
+    msgs = run_server(strategy="tsp", batch_size=2, n_orders=6)
+    ready = next(m for m in msgs if m["type"] == "orders_ready")
+    bad = [o for o in ready["orders"] if o["n_items"] != 4]
+    assert not bad, f"Wrong n_items in orders_ready: {bad}"
+
+
+def test_server_orders_ready_grouped_by_batch():
+    msgs = run_server(strategy="tsp", batch_size=2, n_orders=6)
+    ready = next(m for m in msgs if m["type"] == "orders_ready")
+    batch_ids = [o["batch_id"] for o in ready["orders"]]
+    last_seen: dict[str, int] = {}
+    for i, bid in enumerate(batch_ids):
+        if bid in last_seen and last_seen[bid] != i - 1:
+            pytest.fail(f"Batch {bid} not consecutive in orders_ready: {batch_ids}")
+        last_seen[bid] = i
+
+
+def test_server_complete_message_present():
+    msgs = run_server(n_orders=4)
+    assert any(m["type"] == "complete" for m in msgs)
+    complete = next(m for m in msgs if m["type"] == "complete")
+    assert complete["total_orders"] == 4
+    assert complete["total_ticks"] > 0
+
+
+@pytest.mark.parametrize("strategy", ["none", "zone", "tsp"])
+def test_server_tick_has_active_batch(strategy):
+    msgs = run_server(strategy=strategy, batch_size=2, n_orders=4)
+    ticks = [m for m in msgs if m["type"] == "tick"]
+    assert ticks, "No tick messages received"
+    assert all("active_batch" in t for t in ticks), "Some tick frames missing active_batch key"
+
+```
+
+## warehouse\agent.py
+
+```python
+from __future__ import annotations
+import heapq
+from dataclasses import dataclass, field
+from enum import Enum
+from warehouse.grid import WarehouseGrid
+from warehouse.inventory import Item, Inventory, Order
+from warehouse.batcher import BatchedOrder
+
+
+class AgentState(Enum):
+    IDLE = "idle"
+    MOVING_TO_RACK = "moving_to_rack"
+    MOVING_TO_STATION = "moving_to_station"
+
+
+class PickAgent:
+    def __init__(self, agent_id: str, start_pos: tuple[int, int], grid: WarehouseGrid) -> None:
+        self.agent_id = agent_id
+        self.pos: tuple[int, int] = start_pos
+        self.grid = grid
+        self.carried_items: list[Item] = []
+        self.total_distance: int = 0
+        self.state = AgentState.IDLE
+
+        self._path: list[tuple[int, int]] = []
+        self._task_queue: list[tuple[tuple[int, int], str]] = []  # (stand_pos, item_id)
+        self._pack_pos: tuple[int, int] = start_pos
+        self._batch: BatchedOrder | None = None
+
+    # ------------------------------------------------------------------
+    # Pathfinding
+    # ------------------------------------------------------------------
+
+    def find_path(self, goal: tuple[int, int]) -> list[tuple[int, int]]:
+        """A* returning list of positions from current pos to goal (exclusive of start)."""
+        start = self.pos
+        if start == goal:
+            return []
+
+        # heap: (f, g, pos, path)
+        open_heap: list[tuple[int, int, tuple[int, int], list[tuple[int, int]]]] = []
+        heapq.heappush(open_heap, (self._h(start, goal), 0, start, []))
+        visited: set[tuple[int, int]] = set()
+
+        while open_heap:
+            f, g, pos, path = heapq.heappop(open_heap)
+            if pos in visited:
+                continue
+            visited.add(pos)
+            new_path = path + [pos]
+
+            if pos == goal:
+                return new_path[1:]  # exclude start position
+
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nr, nc = pos[0] + dr, pos[1] + dc
+                neighbor = (nr, nc)
+                if neighbor not in visited and self.grid.is_walkable(nr, nc):
+                    ng = g + 1
+                    heapq.heappush(open_heap, (ng + self._h(neighbor, goal), ng, neighbor, new_path))
+
+        return []  # no path found
+
+    @staticmethod
+    def _h(a: tuple[int, int], b: tuple[int, int]) -> int:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    # ------------------------------------------------------------------
+    # Movement
+    # ------------------------------------------------------------------
+
+    def step(self) -> bool:
+        """Advance one cell along _path. Returns True if moved, False if arrived."""
+        if not self._path:
+            return False
+        self.pos = self._path.pop(0)
+        self.total_distance += 1
+        return True
+
+    # ------------------------------------------------------------------
+    # Order execution
+    # ------------------------------------------------------------------
+
+    def assign_batch(self, batch: BatchedOrder, inventory: Inventory, pack_pos: tuple[int, int]) -> None:
+        self._pack_pos = pack_pos
+        self._batch = batch
+
+        targets: list[tuple[tuple[int, int], str]] = []
+        for item_id in batch.unified_item_ids:
+            slot = inventory.get_slot(item_id)
+            targets.append((slot.stand_pos, item_id))
+
+        # Greedy nearest-neighbor ordering
+        ordered: list[tuple[tuple[int, int], str]] = []
+        current = self.pos
+        remaining = list(targets)
+        while remaining:
+            remaining.sort(key=lambda t: self._h(current, t[0]))
+            chosen = remaining.pop(0)
+            ordered.append(chosen)
+            current = chosen[0]
+
+        self._task_queue = ordered
+        self._advance_to_next_task()
+
+    def assign_order(self, order: Order, inventory: Inventory, pack_pos: tuple[int, int]) -> None:
+        self.assign_batch(
+            BatchedOrder(
+                batch_id=order.order_id,
+                orders=[order],
+                unified_item_ids=list(order.item_ids),
+                item_to_order={iid: order.order_id for iid in order.item_ids},
+            ),
+            inventory,
+            pack_pos,
+        )
+
+    def _advance_to_next_task(self) -> None:
+        if self._task_queue:
+            next_stand, _ = self._task_queue[0]
+            self._path = self.find_path(next_stand)
+            self.state = AgentState.MOVING_TO_RACK
+        else:
+            self._path = self.find_path(self._pack_pos)
+            self.state = AgentState.MOVING_TO_STATION
+
+    def execute_pick(self, inventory: Inventory) -> Item | None:
+        """Called when agent arrives at a rack stand_pos. Picks item, advances queue."""
+        if not self._task_queue:
+            return None
+        _, item_id = self._task_queue.pop(0)
+        item = inventory.remove_item(item_id)
+        self.carried_items.append(item)
+        self._advance_to_next_task()
+        return item
+
+    def execute_deposit(self) -> tuple[list[Item], dict[str, list[str]]]:
+        """Called when agent arrives at pack station. Returns (items, order_id -> [item_ids])."""
+        deposited = list(self.carried_items)
+        self.carried_items = []
+        self.state = AgentState.IDLE
+        order_breakdown: dict[str, list[str]] = {}
+        if self._batch is not None:
+            for item in deposited:
+                oid = self._batch.item_to_order.get(item.item_id, "unknown")
+                order_breakdown.setdefault(oid, []).append(item.item_id)
+        self._batch = None
+        return deposited, order_breakdown
+
+```
+
+## warehouse\analysis.py
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass, field
+
+from warehouse.grid import WarehouseGrid
+from warehouse.inventory import Inventory, Item, Order
+from warehouse.agent import PickAgent
+from warehouse.simulation import Simulation, OrderMetrics
+from warehouse.batcher import FIFOBatcher, ZoneBatcher, GreedyTSPBatcher
+from warehouse.data_gen import generate_catalog, generate_orders
+from warehouse.optimizer import slot_distances, random_placement, demand_placement, affinity_placement
+
+
+@dataclass
+class ScenarioConfig:
+    n_items: int = 40
+    n_families: int = 5
+    demand_skew: float = 2.0
+    family_affinity: float = 0.7
+    n_orders: int = 100
+    items_per_order: int = 4
+    seed: int = 42
+    label: str = ""
+
+
+@dataclass
+class ScenarioResult:
+    config: ScenarioConfig
+    strategy: str
+    total_distance: int
+    total_ticks: int
+    avg_distance_per_order: float
+    metrics: list[OrderMetrics] = field(default_factory=list)
+
+
+def _run_scenario(
+    grid: WarehouseGrid,
+    placement: list[Item],
+    sorted_slot_indices: list[int],
+    orders: list[Order],
+    max_ticks: int = 200_000,
+) -> list[OrderMetrics]:
+    """Spin up a fresh inventory, seed with given placement, run all orders headlessly."""
+    inventory = Inventory(grid)
+    # Only seed as many items as there are sorted slot indices
+    n = min(len(placement), len(sorted_slot_indices))
+    inventory.seed(placement[:n], slot_order=sorted_slot_indices[:n])
+
+    agent = PickAgent("A1", grid.pack_station_pos, grid)
+    sim = Simulation(grid, inventory, agent)
+    for order in orders:
+        sim.enqueue_order(order)
+    return sim.run(max_ticks=max_ticks)
+
+
+def run_analysis(
+    configs: list[ScenarioConfig],
+    grid: WarehouseGrid | None = None,
+) -> list[ScenarioResult]:
+    """
+    For each config runs three strategies (random, demand, affinity) and collects results.
+    Returns a flat list of ScenarioResult — len = len(configs) * 3.
+    """
+    if grid is None:
+        grid = WarehouseGrid.build_default()
+
+    results: list[ScenarioResult] = []
+
+    for cfg in configs:
+        print(f"  Running config: {cfg.label or cfg}")
+        items = generate_catalog(
+            n_items=cfg.n_items,
+            n_families=cfg.n_families,
+            demand_skew=cfg.demand_skew,
+            seed=cfg.seed,
+        )
+        orders = generate_orders(
+            items=items,
+            n_orders=cfg.n_orders,
+            items_per_order=cfg.items_per_order,
+            family_affinity=cfg.family_affinity,
+            seed=cfg.seed,
+        )
+
+        # Precompute slot order (closest → farthest)
+        sorted_slots = slot_distances(grid, Inventory(grid))
+        sorted_slot_indices = [idx for idx, _ in sorted_slots]
+
+        strategies = {
+            "random":   random_placement(items, seed=cfg.seed),
+            "demand":   demand_placement(items),
+            "affinity": affinity_placement(items, orders),
+        }
+
+        for strategy_name, placement in strategies.items():
+            print(f"    strategy={strategy_name} ...", end=" ", flush=True)
+            metrics = _run_scenario(grid, placement, sorted_slot_indices, orders)
+            total_dist = sum(m.distance_traveled for m in metrics)
+            total_ticks = sum(m.ticks_taken for m in metrics)
+            avg = total_dist / len(metrics) if metrics else 0.0
+            results.append(ScenarioResult(
+                config=cfg,
+                strategy=strategy_name,
+                total_distance=total_dist,
+                total_ticks=total_ticks,
+                avg_distance_per_order=avg,
+                metrics=metrics,
+            ))
+            print(f"avg_dist={avg:.1f}")
+
+    return results
+
+
+def plot_analysis(results: list[ScenarioResult]) -> None:
+    """Grouped bar chart (one group per config, three bars per strategy) + rich summary table."""
+    _print_summary_table(results)
+
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("matplotlib not installed — skipping chart.")
+        return
+
+    configs = list(dict.fromkeys(r.config.label or str(i) for i, r in enumerate(results)))
+    strategies = ["random", "demand", "affinity"]
+    colors = {"random": "#888888", "demand": "#4c8fcc", "affinity": "#e87040"}
+
+    # Build data matrix: rows = strategies, cols = configs
+    data: dict[str, list[float]] = {s: [] for s in strategies}
+    for cfg_label in configs:
+        for strategy in strategies:
+            match = next(
+                (r for r in results if (r.config.label or "") == cfg_label and r.strategy == strategy),
+                None,
+            )
+            data[strategy].append(match.avg_distance_per_order if match else 0.0)
+
+    x = np.arange(len(configs))
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(max(8, len(configs) * 2), 5))
+
+    for i, strategy in enumerate(strategies):
+        offset = (i - 1) * width
+        bars = ax.bar(x + offset, data[strategy], width, label=strategy, color=colors[strategy])
+        ax.bar_label(bars, fmt="%.0f", padding=2, fontsize=8)
+
+    ax.set_xlabel("Scenario")
+    ax.set_ylabel("Avg distance per order (grid cells)")
+    ax.set_title("Warehouse Layout Optimization — Strategy Comparison")
+    ax.set_xticks(x)
+    ax.set_xticklabels(configs, rotation=20, ha="right")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def _print_summary_table(results: list[ScenarioResult]) -> None:
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich import box
+    except ImportError:
+        for r in results:
+            print(f"{r.config.label:20s} {r.strategy:10s} avg_dist={r.avg_distance_per_order:.1f}")
+        return
+
+    console = Console()
+    table = Table(title="Analysis Results", box=box.SIMPLE_HEAVY)
+    table.add_column("Scenario", style="cyan")
+    table.add_column("Strategy", style="bold")
+    table.add_column("Orders", justify="right")
+    table.add_column("Avg Dist", justify="right")
+    table.add_column("Total Dist", justify="right")
+    table.add_column("vs Random", justify="right")
+
+    # Group by config for relative comparison
+    config_labels = list(dict.fromkeys(r.config.label for r in results))
+    for label in config_labels:
+        group = [r for r in results if r.config.label == label]
+        random_dist = next((r.avg_distance_per_order for r in group if r.strategy == "random"), None)
+        for r in group:
+            if random_dist and random_dist > 0:
+                pct = (r.avg_distance_per_order - random_dist) / random_dist * 100
+                vs_random = f"{pct:+.1f}%"
+                color = "green" if pct < -1 else ("red" if pct > 1 else "")
+                vs_random_styled = f"[{color}]{vs_random}[/{color}]" if color else vs_random
+            else:
+                vs_random_styled = "–"
+            table.add_row(
+                r.config.label,
+                r.strategy,
+                str(len(r.metrics)),
+                f"{r.avg_distance_per_order:.1f}",
+                str(r.total_distance),
+                vs_random_styled,
+            )
+
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Batch analysis
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BatchScenarioConfig:
+    base: ScenarioConfig
+    batch_strategy: str = "fifo"   # "fifo" | "zone" | "tsp"
+    max_batch_size: int = 1
+    min_zone_overlap: int = 2
+
+
+def run_batch_analysis(
+    configs: list[ScenarioConfig],
+    batch_sizes: list[int] | range = range(1, 7),
+    grid: WarehouseGrid | None = None,
+) -> dict[tuple[str, int], list[ScenarioResult]]:
+    """
+    For each config, runs FIFO / Zone / TSP strategies across each batch size.
+    Returns a dict keyed by (strategy, batch_size) -> list[ScenarioResult].
+    Uses demand placement for all scenarios (controls for slot-assignment variance).
+    """
+    if grid is None:
+        grid = WarehouseGrid.build_default()
+
+    results: dict[tuple[str, int], list[ScenarioResult]] = {}
+
+    for cfg in configs:
+        print(f"  Batch analysis config: {cfg.label or cfg}")
+        items = generate_catalog(
+            n_items=cfg.n_items, n_families=cfg.n_families,
+            demand_skew=cfg.demand_skew, seed=cfg.seed,
+        )
+        orders = generate_orders(
+            items=items, n_orders=cfg.n_orders, items_per_order=cfg.items_per_order,
+            family_affinity=cfg.family_affinity, seed=cfg.seed,
+        )
+        sorted_slots = slot_distances(grid, Inventory(grid))
+        sorted_slot_indices = [idx for idx, _ in sorted_slots]
+        placement = demand_placement(items)
+
+        for batch_size in batch_sizes:
+            for strategy_name in ("fifo", "zone", "tsp"):
+                inventory = Inventory(grid)
+                n = min(len(placement), len(sorted_slot_indices))
+                inventory.seed(placement[:n], slot_order=sorted_slot_indices[:n])
+
+                if strategy_name == "fifo":
+                    batcher: FIFOBatcher | ZoneBatcher | GreedyTSPBatcher = FIFOBatcher()
+                elif strategy_name == "zone":
+                    batcher = ZoneBatcher(grid, inventory, max_batch_size=batch_size)
+                else:
+                    batcher = GreedyTSPBatcher(inventory, grid, max_batch_size=batch_size)
+
+                batches = batcher.batch(orders)
+                agent = PickAgent("A1", grid.pack_station_pos, grid)
+                sim = Simulation(grid, inventory, agent)
+                for batch in batches:
+                    sim.enqueue_batch(batch)
+                metrics = sim.run()
+
+                total_dist = sum(m.distance_traveled for m in metrics)
+                total_ticks = sum(m.ticks_taken for m in metrics)
+                avg = total_dist / len(metrics) if metrics else 0.0
+                key = (strategy_name, batch_size)
+                results.setdefault(key, []).append(ScenarioResult(
+                    config=cfg,
+                    strategy=f"{strategy_name}_b{batch_size}",
+                    total_distance=total_dist,
+                    total_ticks=total_ticks,
+                    avg_distance_per_order=avg,
+                    metrics=metrics,
+                ))
+
+    return results
+
+```
+
+## warehouse\batcher.py
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Protocol
+
+from warehouse.inventory import Order, Inventory
+from warehouse.grid import WarehouseGrid
+
+
+@dataclass
+class BatchedOrder:
+    batch_id: str
+    orders: list[Order]
+    unified_item_ids: list[str]    # pick list; duplicates preserved for multi-qty items
+    item_to_order: dict[str, str]  # item_id -> order_id
+
+
+class BatchStrategy(Protocol):
+    def batch(self, orders: list[Order]) -> list[BatchedOrder]: ...
+
+
+def _make_batch(orders: list[Order]) -> BatchedOrder:
+    batch_id = orders[0].order_id if len(orders) == 1 else f"B-{orders[0].order_id}"
+    seen: set[str] = set()
+    unified: list[str] = []
+    item_to_order: dict[str, str] = {}
+    for order in orders:
+        for iid in order.item_ids:
+            if iid not in seen:
+                seen.add(iid)
+                unified.append(iid)
+                item_to_order[iid] = order.order_id
+    return BatchedOrder(
+        batch_id=batch_id,
+        orders=orders,
+        unified_item_ids=unified,
+        item_to_order=item_to_order,
+    )
+
+
+class FIFOBatcher:
+    """One BatchedOrder per Order — preserves current single-order behaviour."""
+
+    def batch(self, orders: list[Order]) -> list[BatchedOrder]:
+        return [
+            BatchedOrder(
+                batch_id=order.order_id,
+                orders=[order],
+                unified_item_ids=list(order.item_ids),
+                item_to_order={iid: order.order_id for iid in order.item_ids},
+            )
+            for order in orders
+        ]
+
+
+class ZoneBatcher:
+    """Greedily merges orders that share ≥ min_zone_overlap rack zones, up to max_batch_size."""
+
+    def __init__(
+        self,
+        grid: WarehouseGrid,
+        inventory: Inventory,
+        min_zone_overlap: int = 1,
+        max_batch_size: int = 4,
+    ) -> None:
+        self.grid = grid
+        self.inventory = inventory
+        self.min_zone_overlap = min_zone_overlap
+        self.max_batch_size = max_batch_size
+
+    def _order_zones(self, order: Order) -> set[str]:
+        zones: set[str] = set()
+        for iid in order.item_ids:
+            if iid in self.inventory._item_to_slot:
+                slot = self.inventory._item_to_slot[iid]
+                zone = self.grid.zone_map.get(slot.rack_pos)
+                if zone:
+                    zones.add(zone)
+        return zones
+
+    def batch(self, orders: list[Order]) -> list[BatchedOrder]:
+        remaining = list(orders)
+        batches: list[BatchedOrder] = []
+        while remaining:
+            anchor = remaining.pop(0)
+            anchor_zones = self._order_zones(anchor)
+            group = [anchor]
+            i = 0
+            while i < len(remaining) and len(group) < self.max_batch_size:
+                if len(anchor_zones & self._order_zones(remaining[i])) >= self.min_zone_overlap:
+                    group.append(remaining.pop(i))
+                else:
+                    i += 1
+            batches.append(_make_batch(group))
+        return batches
+
+
+class GreedyTSPBatcher:
+    """Groups orders by geographic proximity (centroid distance), up to max_batch_size."""
+
+    def __init__(
+        self,
+        inventory: Inventory,
+        grid: WarehouseGrid,
+        max_batch_size: int = 4,
+    ) -> None:
+        self.inventory = inventory
+        self.grid = grid
+        self.max_batch_size = max_batch_size
+        self._pack_pos = grid.pack_station_pos
+
+    def _centroid(self, order: Order) -> tuple[float, float]:
+        positions = [
+            self.inventory._item_to_slot[iid].stand_pos
+            for iid in order.item_ids
+            if iid in self.inventory._item_to_slot
+        ]
+        if not positions:
+            return (float(self._pack_pos[0]), float(self._pack_pos[1]))
+        return (
+            sum(p[0] for p in positions) / len(positions),
+            sum(p[1] for p in positions) / len(positions),
+        )
+
+    def batch(self, orders: list[Order]) -> list[BatchedOrder]:
+        remaining = list(orders)
+        batches: list[BatchedOrder] = []
+        while remaining:
+            anchor = remaining.pop(0)
+            anchor_c = self._centroid(anchor)
+            group = [anchor]
+
+            candidates = sorted(
+                enumerate(remaining),
+                key=lambda t: abs(self._centroid(t[1])[0] - anchor_c[0])
+                + abs(self._centroid(t[1])[1] - anchor_c[1]),
+            )
+            added: set[int] = set()
+            for idx, _ in candidates:
+                if len(group) >= self.max_batch_size:
+                    break
+                group.append(remaining[idx])
+                added.add(idx)
+
+            remaining = [o for i, o in enumerate(remaining) if i not in added]
+            batches.append(_make_batch(group))
+        return batches
+
+```
+
+## warehouse\data_gen.py
+
+```python
+from __future__ import annotations
+import math
+import time
+import numpy as np
+from warehouse.inventory import Item, Order
+
+
+def generate_catalog(
+    n_items: int = 40,
+    n_families: int = 5,
+    demand_skew: float = 2.0,
+    seed: int = 42,
+) -> list[Item]:
+    """
+    Creates items with power-law demand weights and family assignments.
+
+    demand_skew: scale of the exponential distribution. Higher = more extreme skew
+    (a few items dominate). Weights are normalised to sum to 1.
+    Family is assigned round-robin: item i → family F{i % n_families}.
+    """
+    rng = np.random.default_rng(seed)
+    # Raise unit-exponential samples to the power of demand_skew.
+    # Exponential(scale) is a linear transform and cancels under normalisation,
+    # so using a power instead gives genuinely different distributions:
+    # skew > 1 amplifies high values → concentrated; skew < 1 compresses → flat.
+    raw_weights = rng.exponential(scale=1.0, size=n_items) ** demand_skew
+    total = raw_weights.sum()
+    weights = raw_weights / total
+
+    items = []
+    for i in range(n_items):
+        items.append(Item(
+            item_id=f"I{i:03d}",
+            name=f"Product-{i:03d}",
+            demand_weight=float(weights[i]),
+            family=f"F{i % n_families}",
+        ))
+    return items
+
+
+def generate_orders(
+    items: list[Item],
+    n_orders: int = 100,
+    items_per_order: int = 4,
+    family_affinity: float = 0.7,
+    seed: int = 42,
+) -> list[Order]:
+    """
+    Generates orders with demand-weighted sampling and family affinity.
+
+    Same item CAN appear in multiple different orders (items restock after pick).
+    Each order contains no duplicates.
+
+    Per order:
+      - Pick a theme family weighted by total family demand sum
+      - Sample ceil(items_per_order * family_affinity) items from that family
+      - Fill remaining slots from the full catalog
+      - Both draws are weighted by demand_weight
+    """
+    rng = np.random.default_rng(seed)
+
+    # Group items by family
+    families: dict[str, list[Item]] = {}
+    for item in items:
+        families.setdefault(item.family, []).append(item)
+
+    family_names = list(families.keys())
+    family_demand = np.array([
+        sum(i.demand_weight for i in families[f]) for f in family_names
+    ])
+    family_probs = family_demand / family_demand.sum()
+
+    all_weights = np.array([i.demand_weight for i in items])
+
+    orders: list[Order] = []
+    for idx in range(n_orders):
+        # Choose theme family
+        theme_family = family_names[rng.choice(len(family_names), p=family_probs)]
+        family_items = families[theme_family]
+
+        n_from_family = math.ceil(items_per_order * family_affinity)
+        n_from_family = min(n_from_family, len(family_items), items_per_order)
+
+        chosen: list[Item] = []
+
+        # Sample from theme family
+        fam_weights = np.array([i.demand_weight for i in family_items])
+        fam_probs = fam_weights / fam_weights.sum()
+        fam_indices = rng.choice(len(family_items), size=n_from_family, replace=False, p=fam_probs)
+        chosen.extend(family_items[i] for i in fam_indices)
+
+        # Fill remaining slots from the full catalog — computed after the actual family draw
+        # so a small theme family never leaves the order short
+        n_from_rest = items_per_order - len(chosen)
+        if n_from_rest > 0:
+            chosen_ids = {i.item_id for i in chosen}
+            remaining = [i for i in items if i.item_id not in chosen_ids]
+            if remaining:
+                rem_weights = np.array([i.demand_weight for i in remaining])
+                rem_probs = rem_weights / rem_weights.sum()
+                n_pick2 = min(n_from_rest, len(remaining))
+                rem_indices = rng.choice(len(remaining), size=n_pick2, replace=False, p=rem_probs)
+                chosen.extend(remaining[i] for i in rem_indices)
+
+        orders.append(Order(
+            order_id=f"ORD-{idx + 1:04d}",
+            item_ids=[i.item_id for i in chosen],
+            created_at=time.monotonic(),
+        ))
+
+    return orders
+
+```
+
+## warehouse\grid.py
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass, field
+from enum import IntEnum
+import numpy as np
+
+
+class CellType(IntEnum):
+    EMPTY = 0
+    RACK = 1
+    AISLE = 2
+    PACK_STATION = 3
+
+
+@dataclass
+class WarehouseGrid:
+    rows: int
+    cols: int
+    grid: np.ndarray  # shape (rows, cols), dtype=np.uint8
+    pack_station_pos: tuple[int, int]
+    zone_map: dict[tuple[int, int], str] = field(default_factory=dict)
+    # zone_map: rack_pos (row, col) -> zone label ("A", "B", ...) ordered by distance from pack station
+
+    @staticmethod
+    def _fill_rack_bands(g: np.ndarray, row_start: int, row_end: int,
+                         col_start: int, col_end: int) -> None:
+        """Fill alternating 2-wide RACK bands within a rectangular region (exclusive end).
+        Bands are separated by 2-cell aisles to allow congestion modelling."""
+        col = col_start + 1
+        while col + 1 < col_end - 1:
+            for r in range(row_start + 1, row_end - 1):
+                g[r, col] = CellType.RACK
+                g[r, col + 1] = CellType.RACK
+            col += 4
+
+    @staticmethod
+    def _assign_zones(
+        g: np.ndarray,
+        pack_pos: tuple[int, int],
+    ) -> dict[tuple[int, int], str]:
+        """
+        Assign zone labels ("A", "B", ...) to each RACK cell based on which column band
+        it belongs to, ordered by ascending distance of the band's centre column from
+        pack_pos[1].  Bands are groups of consecutive rack columns.
+        """
+        rack_rows, rack_cols = np.where(g == CellType.RACK)
+        if len(rack_cols) == 0:
+            return {}
+
+        # Group consecutive rack columns into bands
+        unique_cols = sorted(set(rack_cols.tolist()))
+        bands: list[list[int]] = []
+        current: list[int] = [unique_cols[0]]
+        for c in unique_cols[1:]:
+            if c == current[-1] + 1:
+                current.append(c)
+            else:
+                bands.append(current)
+                current = [c]
+        bands.append(current)
+
+        # Sort bands by centre-column distance to pack station column
+        pack_col = pack_pos[1]
+        bands.sort(key=lambda band: abs(sum(band) / len(band) - pack_col))
+
+        # Build lookup: column -> zone label
+        col_to_zone: dict[int, str] = {}
+        for idx, band in enumerate(bands):
+            label = chr(ord("A") + idx)
+            for c in band:
+                col_to_zone[c] = label
+
+        return {
+            (int(r), int(c)): col_to_zone[int(c)]
+            for r, c in zip(rack_rows.tolist(), rack_cols.tolist())
+        }
+
+    @staticmethod
+    def build_default(rows: int = 12, cols: int = 24) -> "WarehouseGrid":
+        """
+        Symmetrical standard layout:
+          - All cells start as AISLE
+          - Alternating 2-wide RACK bands separated by 2-col aisles
+          - Outer rows and cols remain AISLE (corridors on all four sides)
+          - Pack station at bottom-left (rows-1, 0)
+        cols=24 gives 6 rack bands with 2-cell aisles between them.
+        """
+        g = np.full((rows, cols), CellType.AISLE, dtype=np.uint8)
+        WarehouseGrid._fill_rack_bands(g, 0, rows, 0, cols)
+        pack_pos = (rows - 1, 0)
+        g[pack_pos[0], pack_pos[1]] = CellType.PACK_STATION
+        zone_map = WarehouseGrid._assign_zones(g, pack_pos)
+        return WarehouseGrid(rows=rows, cols=cols, grid=g,
+                             pack_station_pos=pack_pos, zone_map=zone_map)
+
+    @staticmethod
+    def build_quad(unit_rows: int = 12, unit_cols: int = 24) -> "WarehouseGrid":
+        """
+        Four default layouts arranged in a 2×2 grid.
+        Total size: (2*unit_rows) × (2*unit_cols).
+        Each quadrant has its own rack bands and surrounding aisle corridors.
+        The shared borders create wider central aisles acting as main thoroughfares.
+        Pack station at bottom-left corner.
+        """
+        rows = unit_rows * 2
+        cols = unit_cols * 2
+        g = np.full((rows, cols), CellType.AISLE, dtype=np.uint8)
+
+        for r_off in (0, unit_rows):
+            for c_off in (0, unit_cols):
+                WarehouseGrid._fill_rack_bands(
+                    g, r_off, r_off + unit_rows, c_off, c_off + unit_cols
+                )
+
+        pack_pos = (rows - 1, 0)
+        g[pack_pos[0], pack_pos[1]] = CellType.PACK_STATION
+        zone_map = WarehouseGrid._assign_zones(g, pack_pos)
+        return WarehouseGrid(rows=rows, cols=cols, grid=g,
+                             pack_station_pos=pack_pos, zone_map=zone_map)
+
+    def in_bounds(self, row: int, col: int) -> bool:
+        return 0 <= row < self.rows and 0 <= col < self.cols
+
+    def is_walkable(self, row: int, col: int) -> bool:
+        if not self.in_bounds(row, col):
+            return False
+        ct = self.grid[row, col]
+        return ct == CellType.AISLE or ct == CellType.PACK_STATION
+
+    def get_rack_neighbors(self, row: int, col: int) -> list[tuple[int, int]]:
+        """Returns walkable cells adjacent to a RACK cell."""
+        neighbors = []
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = row + dr, col + dc
+            if self.is_walkable(nr, nc):
+                neighbors.append((nr, nc))
+        return neighbors
+
+    def to_dict(self) -> dict:
+        return {
+            "rows": self.rows,
+            "cols": self.cols,
+            "grid": self.grid.tolist(),
+            "pack_station_pos": list(self.pack_station_pos),
+            "zone_map_list": [[r, c, z] for (r, c), z in self.zone_map.items()],
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "WarehouseGrid":
+        g = np.array(data["grid"], dtype=np.uint8)
+        pack_pos = tuple(data["pack_station_pos"])
+        zone_map: dict[tuple[int, int], str] = {
+            (entry[0], entry[1]): entry[2]
+            for entry in data.get("zone_map_list", [])
+        }
+        if not zone_map:
+            zone_map = WarehouseGrid._assign_zones(g, pack_pos)
+        return WarehouseGrid(
+            rows=data["rows"],
+            cols=data["cols"],
+            grid=g,
+            pack_station_pos=pack_pos,
+            zone_map=zone_map,
+        )
+
+```
+
+## warehouse\inventory.py
+
+```python
+from __future__ import annotations
+import time
+from dataclasses import dataclass, field
+from warehouse.grid import WarehouseGrid
+
+
+@dataclass
+class Item:
+    item_id: str
+    name: str
+    weight: float = 1.0
+    demand_weight: float = 1.0  # relative pick frequency; higher = ordered more often
+    family: str = "default"     # product family; items in same family co-occur in orders
+
+
+@dataclass
+class RackSlot:
+    rack_pos: tuple[int, int]
+    stand_pos: tuple[int, int]  # walkable cell the agent stands at to pick
+    item: Item | None = None
+    stock: int = 0      # units currently in this slot
+    max_stock: int = 1  # slot capacity (for future stock-level optimisation)
+
+
+@dataclass
+class Order:
+    order_id: str
+    item_ids: list[str]
+    created_at: float = field(default_factory=time.monotonic)
+
+
+class Inventory:
+    def __init__(self, grid: WarehouseGrid) -> None:
+        self._slots: list[RackSlot] = []
+        self._item_to_slot: dict[str, RackSlot] = {}
+        self._original_slot_for: dict[str, RackSlot] = {}  # for restock
+
+        from warehouse.grid import CellType
+        for r in range(grid.rows):
+            for c in range(grid.cols):
+                if grid.grid[r, c] == CellType.RACK:
+                    neighbors = grid.get_rack_neighbors(r, c)
+                    if neighbors:
+                        self._slots.append(RackSlot(rack_pos=(r, c), stand_pos=neighbors[0]))
+
+    def seed(
+        self,
+        items: list[Item],
+        slot_order: list[int] | None = None,
+        initial_stock: int = 1,
+    ) -> None:
+        """
+        Assign items to rack slots.
+        slot_order: optional permutation of slot indices — items[i] → slots[slot_order[i]].
+        If None, assigns items round-robin to empty slots in discovery order.
+        initial_stock: units to place in each slot; scales with demand in future.
+        """
+        if slot_order is not None:
+            if len(items) > len(slot_order):
+                raise ValueError("More items than slot_order entries")
+            pairs = [(items[i], self._slots[slot_order[i]]) for i in range(len(items))]
+        else:
+            empty = [s for s in self._slots if s.item is None]
+            if len(items) > len(empty):
+                raise ValueError(f"More items ({len(items)}) than available slots ({len(empty)})")
+            pairs = [(items[i], empty[i]) for i in range(len(items))]
+
+        for item, slot in pairs:
+            slot.item = item
+            slot.stock = initial_stock
+            slot.max_stock = initial_stock
+            self._item_to_slot[item.item_id] = slot
+            self._original_slot_for[item.item_id] = slot
+
+    def get_slot(self, item_id: str) -> RackSlot:
+        return self._item_to_slot[item_id]
+
+    def remove_item(self, item_id: str) -> Item:
+        slot = self._item_to_slot[item_id]
+        item = slot.item
+        slot.stock -= 1
+        if slot.stock == 0:
+            self._item_to_slot.pop(item_id)
+            slot.item = None
+        return item  # type: ignore[return-value]
+
+    def restock(self, item: Item) -> None:
+        """Return one unit of an item to its original rack slot."""
+        slot = self._original_slot_for[item.item_id]
+        was_empty = slot.stock == 0
+        slot.stock = min(slot.stock + 1, slot.max_stock)
+        if was_empty:
+            slot.item = item
+            self._item_to_slot[item.item_id] = slot
+
+    def stock_level(self, item_id: str) -> int:
+        """Current on-hand units for an item (0 if picked out)."""
+        slot = self._original_slot_for.get(item_id)
+        return slot.stock if slot else 0
+
+    def reset(self) -> None:
+        """Clear all item assignments (used between analysis runs)."""
+        for slot in self._slots:
+            slot.item = None
+        self._item_to_slot.clear()
+        self._original_slot_for.clear()
+
+    def available_slots(self) -> list[RackSlot]:
+        return [s for s in self._slots if s.item is not None]
+
+```
+
+## warehouse\optimizer.py
+
+```python
+from __future__ import annotations
+import random
+from collections import defaultdict
+from warehouse.grid import WarehouseGrid
+from warehouse.inventory import Item, Inventory, Order
+
+
+def slot_distances(grid: WarehouseGrid, inventory: Inventory) -> list[tuple[int, int]]:
+    """
+    Returns list of (slot_index, manhattan_distance_to_pack_station) for every slot,
+    sorted ascending by distance. slot_index indexes into inventory._slots.
+    """
+    pr, pc = grid.pack_station_pos
+    result = []
+    for i, slot in enumerate(inventory._slots):
+        sr, sc = slot.stand_pos
+        dist = abs(sr - pr) + abs(sc - pc)
+        result.append((i, dist))
+    result.sort(key=lambda x: x[1])
+    return result
+
+
+def random_placement(items: list[Item], seed: int = 0) -> list[Item]:
+    """Returns a shuffled copy of items (random slot assignment order)."""
+    shuffled = list(items)
+    random.Random(seed).shuffle(shuffled)
+    return shuffled
+
+
+def demand_placement(items: list[Item]) -> list[Item]:
+    """
+    Returns items sorted by demand_weight descending.
+    When passed to Inventory.seed() with slot_order from slot_distances(),
+    the highest-demand items land in the closest slots to the pack station.
+    """
+    return sorted(items, key=lambda i: i.demand_weight, reverse=True)
+
+
+def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
+    """
+    Greedy placement using demand + co-occurrence affinity.
+
+    1. Build co-occurrence matrix: co[id_a][id_b] = number of orders containing both
+    2. Greedily fill slots closest-to-farthest:
+       - Score each unplaced item = demand_weight + alpha * co-occurrence with already-placed items
+       - Pick highest-scoring item for the current slot
+    Returns items in placement order (item[0] → closest slot, item[-1] → farthest).
+    """
+    alpha = 1.0
+
+    # Build co-occurrence counts
+    co: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for order in orders:
+        ids = order.item_ids
+        for a in ids:
+            for b in ids:
+                if a != b:
+                    co[a][b] += 1
+
+    # Normalise co-occurrence so it's on a similar scale to demand_weight
+    max_co = max((v for inner in co.values() for v in inner.values()), default=1)
+
+    unplaced = list(items)
+    placed: list[Item] = []
+
+    while unplaced:
+        best: Item | None = None
+        best_score = -1.0
+        placed_ids = {i.item_id for i in placed}
+
+        for candidate in unplaced:
+            affinity_score = sum(
+                co[candidate.item_id].get(pid, 0) / max_co
+                for pid in placed_ids
+            )
+            score = candidate.demand_weight + alpha * affinity_score
+            if score > best_score:
+                best_score = score
+                best = candidate
+
+        assert best is not None
+        placed.append(best)
+        unplaced.remove(best)
+
+    return placed
+
+```
+
+## warehouse\simulation.py
+
+```python
+from __future__ import annotations
+from collections import deque
+from dataclasses import dataclass, field
+from warehouse.grid import WarehouseGrid
+from warehouse.inventory import Inventory, Item, Order
+from warehouse.agent import PickAgent, AgentState
+from warehouse.batcher import BatchedOrder
+
+
+@dataclass
+class RestockJob:
+    item_id: str
+    item: Item
+    ready_at_tick: int
+
+
+@dataclass
+class OrderMetrics:
+    order_id: str
+    items_picked: int
+    distance_traveled: int
+    ticks_taken: int
+    completed_at_tick: int
+    wait_ticks: int = 0
+
+
+@dataclass
+class SimMetrics:
+    total_orders: int
+    total_items: int
+    total_distance: int
+    total_ticks: int
+    lines_per_hour: float   # items / total_ticks * 3600 (1 tick ≈ 1 second scale)
+    idle_ticks: int
+    wait_ticks_total: int
+    stockout_count: int
+
+
+class Simulation:
+    def __init__(
+        self,
+        grid: WarehouseGrid,
+        inventory: Inventory,
+        agent: PickAgent,
+        restock_delay: int = 10,
+    ) -> None:
+        self.grid = grid
+        self.inventory = inventory
+        self.agent = agent
+        self.order_queue: deque[Order] = deque()
+        self.batch_queue: deque[BatchedOrder] = deque()
+        self.completed_metrics: list[OrderMetrics] = []
+        self.current_tick: int = 0
+        self._active_batch: BatchedOrder | None = None
+        self._order_start_tick: int = 0
+        self._order_start_distance: int = 0
+
+        # Restock queue (1b)
+        self.restock_delay = restock_delay
+        self.restock_queue: list[RestockJob] = []
+        self.stockout_count: int = 0
+
+        # Metrics tracking (1c)
+        self.idle_ticks: int = 0
+        self._order_enqueue_tick: dict[str, int] = {}
+        self._order_wait_ticks: dict[str, int] = {}
+
+    @property
+    def _active_order(self) -> Order | None:
+        """Compat shim for server.py which reads sim._active_order directly."""
+        if self._active_batch is None:
+            return None
+        return self._active_batch.orders[0] if self._active_batch.orders else None
+
+    def enqueue_order(self, order: Order) -> None:
+        self.order_queue.append(order)
+        self._order_enqueue_tick[order.order_id] = self.current_tick
+
+    def enqueue_batch(self, batch: BatchedOrder) -> None:
+        self.batch_queue.append(batch)
+        for order in batch.orders:
+            self._order_enqueue_tick[order.order_id] = self.current_tick
+
+    def step(self) -> bool:
+        """Advance simulation by one tick. Returns True while work remains."""
+        agent = self.agent
+
+        # Process restock queue — release items whose delay has elapsed
+        ready = [j for j in self.restock_queue if j.ready_at_tick <= self.current_tick]
+        for job in ready:
+            self.restock_queue.remove(job)
+            self.inventory.restock(job.item)
+
+        # Dispatch next work when idle
+        if agent.state == AgentState.IDLE:
+            dispatched = False
+
+            # batch_queue takes priority — peek without removing; defer if any item is out of stock
+            if self.batch_queue:
+                front = self.batch_queue[0]
+                if all(iid in self.inventory._item_to_slot for iid in front.unified_item_ids):
+                    self.batch_queue.popleft()
+                    for order in front.orders:
+                        wait = self.current_tick - self._order_enqueue_tick.get(
+                            order.order_id, self.current_tick
+                        )
+                        self._order_wait_ticks[order.order_id] = wait
+                    self._active_batch = front
+                    self._order_start_tick = self.current_tick
+                    self._order_start_distance = agent.total_distance
+                    agent.assign_batch(front, self.inventory, self.grid.pack_station_pos)
+                    dispatched = True
+
+            # Fall back to order_queue — try each order once; defer unavailable ones to the back
+            if not dispatched:
+                queue_size = len(self.order_queue)
+                skipped = 0
+                while self.order_queue and skipped < queue_size:
+                    order = self.order_queue.popleft()
+                    if not all(iid in self.inventory._item_to_slot for iid in order.item_ids):
+                        self.order_queue.append(order)
+                        skipped += 1
+                        continue
+                    wait = self.current_tick - self._order_enqueue_tick.get(
+                        order.order_id, self.current_tick
+                    )
+                    self._order_wait_ticks[order.order_id] = wait
+                    batch = BatchedOrder(
+                        batch_id=order.order_id,
+                        orders=[order],
+                        unified_item_ids=list(order.item_ids),
+                        item_to_order={iid: order.order_id for iid in order.item_ids},
+                    )
+                    self._active_batch = batch
+                    self._order_start_tick = self.current_tick
+                    self._order_start_distance = agent.total_distance
+                    agent.assign_batch(batch, self.inventory, self.grid.pack_station_pos)
+                    dispatched = True
+                    break
+
+            if not dispatched:
+                has_pending = bool(self.restock_queue or self.order_queue or self.batch_queue)
+                if not has_pending:
+                    return False
+                # Waiting for items to restock; agent idles this tick
+                self.idle_ticks += 1
+                self.current_tick += 1
+                return True
+
+        # Move agent one step
+        arrived = not agent.step()  # step() returns False when path exhausted
+
+        # Handle arrival
+        if arrived:
+            if agent.state == AgentState.MOVING_TO_RACK:
+                agent.execute_pick(self.inventory)
+            elif agent.state == AgentState.MOVING_TO_STATION:
+                deposited, order_breakdown = agent.execute_deposit()
+                assert self._active_batch is not None
+                batch_distance = agent.total_distance - self._order_start_distance
+                batch_ticks = self.current_tick - self._order_start_tick
+                # Ensure every order in the batch gets a metrics entry even if all
+                # its items were deduplicated away (items_picked=0 rather than missing)
+                for order in self._active_batch.orders:
+                    if order.order_id not in order_breakdown:
+                        order_breakdown[order.order_id] = []
+                for oid, item_ids in order_breakdown.items():
+                    self.completed_metrics.append(OrderMetrics(
+                        order_id=oid,
+                        items_picked=len(item_ids),
+                        distance_traveled=batch_distance,
+                        ticks_taken=batch_ticks,
+                        completed_at_tick=self.current_tick,
+                        wait_ticks=self._order_wait_ticks.get(oid, 0),
+                    ))
+                self._active_batch = None
+                for item in deposited:
+                    self.restock_queue.append(RestockJob(
+                        item_id=item.item_id,
+                        item=item,
+                        ready_at_tick=self.current_tick + self.restock_delay,
+                    ))
+
+        self.current_tick += 1
+        return True
+
+    def get_summary(self) -> SimMetrics:
+        metrics = self.completed_metrics
+        total_items = sum(m.items_picked for m in metrics)
+        total_dist = sum(m.distance_traveled for m in metrics)
+        total_wait = sum(m.wait_ticks for m in metrics)
+        lph = (total_items / self.current_tick * 3600) if self.current_tick > 0 else 0.0
+        return SimMetrics(
+            total_orders=len(metrics),
+            total_items=total_items,
+            total_distance=total_dist,
+            total_ticks=self.current_tick,
+            lines_per_hour=round(lph, 2),
+            idle_ticks=self.idle_ticks,
+            wait_ticks_total=total_wait,
+            stockout_count=self.stockout_count,
+        )
+
+    def run(self, max_ticks: int = 10_000) -> list[OrderMetrics]:
+        """Run to completion (headless). Returns completed metrics."""
+        while self.current_tick < max_ticks:
+            if not self.step():
+                break
+        return self.completed_metrics
+
+```
+
+## warehouse\visualizer.py
+
+```python
+from __future__ import annotations
+import time
+from warehouse.grid import WarehouseGrid, CellType
+from warehouse.agent import PickAgent, AgentState
+from warehouse.inventory import Order
+from warehouse.simulation import Simulation, OrderMetrics
+
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich.layout import Layout
+from rich.live import Live
+from rich import box
+
+# Cell display: (characters, background style)
+_CELL = {
+    CellType.EMPTY:        ("  ", "on grey23"),
+    CellType.RACK:         ("[]", "on dark_orange3"),
+    CellType.AISLE:        ("  ", "on grey11"),
+    CellType.PACK_STATION: ("PS", "on green4"),
+}
+_AGENT_BG = "on blue"
+_AGENT_CARRYING_BG = "on bright_blue"
+
+
+class WarehouseVisualizer:
+    def __init__(self) -> None:
+        self.console = Console()
+
+    def render_grid(
+        self,
+        grid: WarehouseGrid,
+        agent: PickAgent,
+        current_tick: int,
+        active_order: Order | None,
+    ) -> Panel:
+        table = Table(show_header=False, show_edge=False, padding=(0, 0), box=None)
+        for _ in range(grid.cols):
+            table.add_column(no_wrap=True)
+
+        for r in range(grid.rows):
+            row_cells: list[Text] = []
+            for c in range(grid.cols):
+                ct = CellType(grid.grid[r, c])
+                chars, style = _CELL[ct]
+                if (r, c) == agent.pos:
+                    bg = _AGENT_CARRYING_BG if agent.carried_items else _AGENT_BG
+                    cell = Text(f"{'A' * len(chars)}", style=f"bold white {bg}")
+                else:
+                    cell = Text(chars, style=style)
+                row_cells.append(cell)
+            table.add_row(*row_cells)
+
+        order_str = active_order.order_id if active_order else "–"
+        carrying = ", ".join(i.item_id for i in agent.carried_items) or "nothing"
+        title = (
+            f"Tick [bold]{current_tick}[/bold]  |  "
+            f"Order: [cyan]{order_str}[/cyan]  |  "
+            f"Carrying: [yellow]{carrying}[/yellow]  |  "
+            f"State: [green]{agent.state.value}[/green]"
+        )
+        return Panel(table, title=title, border_style="bright_black")
+
+    def render_metrics_table(self, metrics: list[OrderMetrics]) -> Table:
+        table = Table(title="Order Metrics", box=box.SIMPLE_HEAVY, show_footer=True)
+        table.add_column("Order ID", style="cyan")
+        table.add_column("Items", justify="right",
+                         footer=str(sum(m.items_picked for m in metrics)))
+        table.add_column("Distance", justify="right",
+                         footer=str(sum(m.distance_traveled for m in metrics)))
+        table.add_column("Ticks", justify="right",
+                         footer=str(sum(m.ticks_taken for m in metrics)))
+        table.add_column("Completed At", justify="right")
+
+        for m in metrics:
+            table.add_row(
+                m.order_id,
+                str(m.items_picked),
+                str(m.distance_traveled),
+                str(m.ticks_taken),
+                str(m.completed_at_tick),
+            )
+        return table
+
+    def run_live(self, sim: Simulation, tick_delay: float = 0.05) -> None:
+        layout = Layout()
+        layout.split_column(
+            Layout(name="grid", ratio=3),
+            Layout(name="metrics", ratio=1),
+        )
+
+        with Live(layout, console=self.console, refresh_per_second=30, screen=False):
+            while True:
+                layout["grid"].update(
+                    self.render_grid(sim.grid, sim.agent, sim.current_tick, sim._active_order)
+                )
+                layout["metrics"].update(
+                    Panel(self.render_metrics_table(sim.completed_metrics),
+                          border_style="bright_black")
+                )
+                has_more = sim.step()
+                time.sleep(tick_delay)
+                if not has_more:
+                    # Final render
+                    layout["grid"].update(
+                        self.render_grid(sim.grid, sim.agent, sim.current_tick, sim._active_order)
+                    )
+                    layout["metrics"].update(
+                        Panel(self.render_metrics_table(sim.completed_metrics),
+                              border_style="bright_black")
+                    )
+                    time.sleep(0.5)
+                    break
+
+    def plot_metrics(self, metrics: list[OrderMetrics]) -> None:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            self.console.print("[yellow]matplotlib not installed — skipping chart.[/yellow]")
+            return
+
+        if not metrics:
+            return
+
+        order_ids = [m.order_id for m in metrics]
+        x = range(len(metrics))
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+        fig.suptitle("Warehouse Pick Agent — Order Metrics")
+
+        ax1.bar(x, [m.ticks_taken for m in metrics], color="steelblue")
+        ax1.set_xticks(list(x))
+        ax1.set_xticklabels(order_ids, rotation=30, ha="right")
+        ax1.set_ylabel("Ticks")
+        ax1.set_title("Ticks per Order")
+
+        ax2.bar(x, [m.distance_traveled for m in metrics], color="darkorange")
+        ax2.set_xticks(list(x))
+        ax2.set_xticklabels(order_ids, rotation=30, ha="right")
+        ax2.set_ylabel("Grid Cells")
+        ax2.set_title("Distance per Order")
+
+        plt.tight_layout()
+        plt.show()
+
+```
+
+## warehouse\__init__.py
+
+```python
+
+```
+
+## analyze.py
+
+```python
+from warehouse.grid import WarehouseGrid
+from warehouse.analysis import ScenarioConfig, run_analysis, plot_analysis
+
+
+def main() -> None:
+    configs = [
+        ScenarioConfig(n_items=30, n_families=4, demand_skew=1.5, n_orders=100, label="low-skew"),
+        ScenarioConfig(n_items=30, n_families=4, demand_skew=3.5, n_orders=100, label="high-skew"),
+        ScenarioConfig(n_items=30, n_families=4, family_affinity=0.3, n_orders=100, label="low-affinity"),
+        ScenarioConfig(n_items=30, n_families=4, family_affinity=0.9, n_orders=100, label="high-affinity"),
+        ScenarioConfig(n_items=50, n_families=6, demand_skew=2.5, n_orders=100, label="large-catalog"),
+    ]
+
+    print("Running warehouse layout analysis...")
+    grid = WarehouseGrid.build_default(rows=12, cols=20)
+    results = run_analysis(configs, grid)
+    plot_analysis(results)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+## main.py
+
+```python
+import logging
+from warehouse.grid import WarehouseGrid
+from warehouse.inventory import Inventory
+from warehouse.agent import PickAgent
+from warehouse.simulation import Simulation
+from warehouse.visualizer import WarehouseVisualizer
+from warehouse.data_gen import generate_catalog, generate_orders
+
+log = logging.getLogger(__name__)
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+
+    grid = WarehouseGrid.build_default()
+    inventory = Inventory(grid)
+
+    items = generate_catalog(n_items=30, n_families=4, demand_skew=2.0, seed=42)
+    inventory.seed(items)
+
+    agent = PickAgent(agent_id="A1", start_pos=grid.pack_station_pos, grid=grid)
+    sim = Simulation(grid=grid, inventory=inventory, agent=agent)
+
+    # Generate 10 orders for a visible live demo (items restock after each deposit)
+    orders = generate_orders(items, n_orders=10, items_per_order=4, family_affinity=0.7, seed=42)
+    for order in orders:
+        sim.enqueue_order(order)
+
+    viz = WarehouseVisualizer()
+    viz.run_live(sim, tick_delay=0.06)
+
+    viz.console.print(viz.render_metrics_table(sim.completed_metrics))
+    viz.plot_metrics(sim.completed_metrics)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+## requirements.txt
+
+```txt
+numpy
+rich
+matplotlib
+pandas
+fastapi
+uvicorn[standard]
+
+```
+
+## server.py
+
+```python
+from __future__ import annotations
+import asyncio
+import json
+import pathlib
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from warehouse.grid import WarehouseGrid, CellType
+from warehouse.inventory import Inventory
+from warehouse.agent import PickAgent
+from warehouse.simulation import Simulation
+from warehouse.batcher import ZoneBatcher, GreedyTSPBatcher
+from warehouse.data_gen import generate_catalog, generate_orders
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+EDITOR_DIR = pathlib.Path(__file__).parent / "editor"
+app.mount("/static", StaticFiles(directory=str(EDITOR_DIR)), name="static")
+
+
+@app.get("/")
+async def serve_editor() -> FileResponse:
+    return FileResponse(str(EDITOR_DIR / "index.html"))
+
+
+@app.get("/api/default-layout")
+async def get_default_layout() -> JSONResponse:
+    return JSONResponse(WarehouseGrid.build_default().to_dict())
+
+
+@app.get("/api/quad-layout")
+async def get_quad_layout() -> JSONResponse:
+    return JSONResponse(WarehouseGrid.build_quad().to_dict())
+
+
+class LayoutPayload(BaseModel):
+    rows: int
+    cols: int
+    grid: list[list[int]]
+    pack_station_pos: list[int]
+
+
+@app.post("/api/validate-layout")
+async def validate_layout(payload: LayoutPayload) -> JSONResponse:
+    errors: list[str] = []
+
+    if payload.rows < 3 or payload.cols < 3:
+        errors.append("Grid must be at least 3×3.")
+    if len(payload.grid) != payload.rows:
+        errors.append(f"Grid has {len(payload.grid)} rows, expected {payload.rows}.")
+    else:
+        for r, row in enumerate(payload.grid):
+            if len(row) != payload.cols:
+                errors.append(f"Row {r} has {len(row)} cols, expected {payload.cols}.")
+
+    r, c = payload.pack_station_pos
+    if not (0 <= r < payload.rows and 0 <= c < payload.cols):
+        errors.append("pack_station_pos is out of bounds.")
+    elif payload.grid[r][c] != int(CellType.PACK_STATION):
+        errors.append("pack_station_pos cell must be PACK_STATION (3).")
+
+    pack_count = sum(cell == int(CellType.PACK_STATION)
+                     for row in payload.grid for cell in row)
+    if pack_count != 1:
+        errors.append(f"Exactly one PACK_STATION required, found {pack_count}.")
+
+    rack_count = sum(cell == int(CellType.RACK)
+                     for row in payload.grid for cell in row)
+    if rack_count == 0:
+        errors.append("Layout must contain at least one RACK cell.")
+
+    if not errors:
+        wg = WarehouseGrid.from_dict({
+            "rows": payload.rows, "cols": payload.cols,
+            "grid": payload.grid, "pack_station_pos": payload.pack_station_pos,
+        })
+        any_reachable = any(
+            wg.get_rack_neighbors(rr, cc)
+            for rr in range(wg.rows)
+            for cc in range(wg.cols)
+            if wg.grid[rr, cc] == CellType.RACK
+        )
+        if not any_reachable:
+            errors.append("No RACK cell has a walkable neighbor — agent cannot pick any item.")
+
+    return JSONResponse({"valid": len(errors) == 0, "errors": errors})
+
+
+@app.websocket("/ws/simulate")
+async def ws_simulate(websocket: WebSocket) -> None:
+    await websocket.accept()
+    try:
+        raw = await websocket.receive_text()
+        config = json.loads(raw)
+        await _run_simulation(websocket, config)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+        except Exception:
+            pass
+
+
+async def _run_simulation(websocket: WebSocket, config: dict) -> None:
+    layout_dict = config["layout"]
+    n_orders = config.get("n_orders", 10)
+    n_items = config.get("n_items", 30)
+    items_per_order = config.get("items_per_order", 4)
+    n_families = config.get("n_families", 4)
+    demand_skew = config.get("demand_skew", 2.0)
+    family_affinity = config.get("family_affinity", 0.7)
+    seed = config.get("seed", 42)
+    tick_delay_s = config.get("tick_delay_ms", 80) / 1000.0
+    batch_strategy = config.get("batch_strategy", "none")
+    batch_size = int(config.get("batch_size", 2))
+
+    grid = WarehouseGrid.from_dict(layout_dict)
+    inventory = Inventory(grid)
+
+    items = generate_catalog(n_items=n_items, n_families=n_families, demand_skew=demand_skew, seed=seed)
+    items = items[:len(inventory._slots)]  # clamp to available rack slots
+    if not items:
+        await websocket.send_text(json.dumps(
+            {"type": "error", "message": "Layout has no reachable rack slots."}
+        ))
+        return
+
+    inventory.seed(items)
+    orders = generate_orders(
+        items, n_orders=n_orders, items_per_order=items_per_order,
+        family_affinity=family_affinity, seed=seed
+    )
+
+    agent = PickAgent(agent_id="A1", start_pos=grid.pack_station_pos, grid=grid)
+    sim = Simulation(grid=grid, inventory=inventory, agent=agent, restock_delay=0)
+
+    if batch_strategy == "zone":
+        batches = ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders)
+        for batch in batches:
+            sim.enqueue_batch(batch)
+        order_batch = {o.order_id: b.batch_id for b in batches for o in b.orders}
+    elif batch_strategy == "tsp":
+        batches = GreedyTSPBatcher(inventory, grid, max_batch_size=batch_size).batch(orders)
+        for batch in batches:
+            sim.enqueue_batch(batch)
+        order_batch = {o.order_id: b.batch_id for b in batches for o in b.orders}
+    else:
+        for order in orders:
+            sim.enqueue_order(order)
+        order_batch = {o.order_id: o.order_id for o in orders}
+
+    # Sort by batch_id so batched orders appear grouped in the UI
+    orders_sorted = sorted(orders, key=lambda o: order_batch[o.order_id])
+    await websocket.send_text(json.dumps({
+        "type": "orders_ready",
+        "orders": [
+            {
+                "order_id": o.order_id,
+                "n_items": len(o.item_ids),
+                "batch_id": order_batch[o.order_id],
+            }
+            for o in orders_sorted
+        ],
+    }))
+
+    prev_metrics_count = 0
+
+    while True:
+        has_more = sim.step()
+
+        # Emit one order_complete per completed order — a batch deposit adds multiple at once
+        if len(sim.completed_metrics) > prev_metrics_count:
+            for m in sim.completed_metrics[prev_metrics_count:]:
+                await websocket.send_text(json.dumps({
+                    "type": "order_complete",
+                    "tick": sim.current_tick,
+                    "order_id": m.order_id,
+                    "items_picked": m.items_picked,
+                    "distance_traveled": m.distance_traveled,
+                    "ticks_taken": m.ticks_taken,
+                    "completed_at_tick": m.completed_at_tick,
+                }))
+            prev_metrics_count = len(sim.completed_metrics)
+
+        await websocket.send_text(json.dumps({
+            "type": "tick",
+            "tick": sim.current_tick,
+            "agent": {
+                "row": sim.agent.pos[0],
+                "col": sim.agent.pos[1],
+                "state": sim.agent.state.value,
+                "carrying": [item.item_id for item in sim.agent.carried_items],
+            },
+            "active_order": sim._active_order.order_id if sim._active_order else None,
+            "active_batch": sim._active_batch.batch_id if sim._active_batch else None,
+        }))
+
+        if not has_more:
+            break
+
+        # Wait tick_delay_s before next tick, processing any control messages
+        # that arrive mid-wait without accidentally advancing the simulation.
+        tick_start = asyncio.get_event_loop().time()
+        while True:
+            elapsed = asyncio.get_event_loop().time() - tick_start
+            remaining = tick_delay_s - elapsed
+            if remaining <= 0.005:
+                break
+            try:
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
+                ctrl = json.loads(msg)
+                if ctrl.get("type") == "set_speed":
+                    tick_delay_s = max(0.01, ctrl["tick_delay_ms"] / 1000.0)
+                elif ctrl.get("type") == "stop":
+                    return
+            except asyncio.TimeoutError:
+                break
+
+    summary = sim.get_summary()
+    metrics = sim.completed_metrics
+    avg_ticks = (
+        sum(m.ticks_taken for m in metrics) / len(metrics) if metrics else 0.0
+    )
+    await websocket.send_text(json.dumps({
+        "type": "complete",
+        "total_ticks": summary.total_ticks,
+        "total_orders": summary.total_orders,
+        "summary": {
+            "total_items_picked": summary.total_items,
+            "total_distance": summary.total_distance,
+            "avg_ticks_per_order": round(avg_ticks, 1),
+            "lines_per_hour": summary.lines_per_hour,
+            "idle_ticks": summary.idle_ticks,
+            "stockout_count": summary.stockout_count,
+        },
+    }))
+
+```
+

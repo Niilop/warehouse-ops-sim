@@ -23,7 +23,8 @@ class PickAgent:
         self.state = AgentState.IDLE
 
         self._path: list[tuple[int, int]] = []
-        self._task_queue: list[tuple[tuple[int, int], str]] = []  # (stand_pos, item_id)
+        self._task_queue: list[tuple[tuple[int, int], str, str]] = []  # (stand_pos, item_id, order_id)
+        self._carried_order_ids: list[str] = []
         self._pack_pos: tuple[int, int] = start_pos
         self._batch: BatchedOrder | None = None
 
@@ -85,13 +86,13 @@ class PickAgent:
         self._pack_pos = pack_pos
         self._batch = batch
 
-        targets: list[tuple[tuple[int, int], str]] = []
-        for item_id in batch.unified_item_ids:
+        targets: list[tuple[tuple[int, int], str, str]] = []
+        for item_id, order_id in zip(batch.unified_item_ids, batch.item_to_order):
             slot = inventory.get_slot(item_id)
-            targets.append((slot.stand_pos, item_id))
+            targets.append((slot.stand_pos, item_id, order_id))
 
         # Greedy nearest-neighbor ordering
-        ordered: list[tuple[tuple[int, int], str]] = []
+        ordered: list[tuple[tuple[int, int], str, str]] = []
         current = self.pos
         remaining = list(targets)
         while remaining:
@@ -109,7 +110,7 @@ class PickAgent:
                 batch_id=order.order_id,
                 orders=[order],
                 unified_item_ids=list(order.item_ids),
-                item_to_order={iid: order.order_id for iid in order.item_ids},
+                item_to_order=[order.order_id for _ in order.item_ids],
             ),
             inventory,
             pack_pos,
@@ -117,7 +118,7 @@ class PickAgent:
 
     def _advance_to_next_task(self) -> None:
         if self._task_queue:
-            next_stand, _ = self._task_queue[0]
+            next_stand, _, _ = self._task_queue[0]
             self._path = self.find_path(next_stand)
             self.state = AgentState.MOVING_TO_RACK
         else:
@@ -128,21 +129,22 @@ class PickAgent:
         """Called when agent arrives at a rack stand_pos. Picks item, advances queue."""
         if not self._task_queue:
             return None
-        _, item_id = self._task_queue.pop(0)
+        _, item_id, order_id = self._task_queue.pop(0)
         item = inventory.remove_item(item_id)
         self.carried_items.append(item)
+        self._carried_order_ids.append(order_id)
         self._advance_to_next_task()
         return item
 
     def execute_deposit(self) -> tuple[list[Item], dict[str, list[str]]]:
         """Called when agent arrives at pack station. Returns (items, order_id -> [item_ids])."""
         deposited = list(self.carried_items)
+        carried_oids = list(self._carried_order_ids)
         self.carried_items = []
+        self._carried_order_ids = []
         self.state = AgentState.IDLE
         order_breakdown: dict[str, list[str]] = {}
-        if self._batch is not None:
-            for item in deposited:
-                oid = self._batch.item_to_order.get(item.item_id, "unknown")
-                order_breakdown.setdefault(oid, []).append(item.item_id)
+        for item, oid in zip(deposited, carried_oids):
+            order_breakdown.setdefault(oid, []).append(item.item_id)
         self._batch = None
         return deposited, order_breakdown

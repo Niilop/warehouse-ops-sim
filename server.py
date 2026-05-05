@@ -13,6 +13,7 @@ from warehouse.grid import WarehouseGrid, CellType
 from warehouse.inventory import Inventory
 from warehouse.agent import PickAgent
 from warehouse.simulation import Simulation
+from warehouse.batcher import ZoneBatcher, GreedyTSPBatcher
 from warehouse.data_gen import generate_catalog, generate_orders
 
 app = FastAPI()
@@ -122,6 +123,8 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     family_affinity = config.get("family_affinity", 0.7)
     seed = config.get("seed", 42)
     tick_delay_s = config.get("tick_delay_ms", 80) / 1000.0
+    batch_strategy = config.get("batch_strategy", "none")
+    batch_size = int(config.get("batch_size", 2))
 
     grid = WarehouseGrid.from_dict(layout_dict)
     inventory = Inventory(grid)
@@ -141,27 +144,54 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     )
 
     agent = PickAgent(agent_id="A1", start_pos=grid.pack_station_pos, grid=grid)
-    sim = Simulation(grid=grid, inventory=inventory, agent=agent)
-    for order in orders:
-        sim.enqueue_order(order)
+    sim = Simulation(grid=grid, inventory=inventory, agent=agent, restock_delay=0)
+
+    if batch_strategy == "zone":
+        batches = ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders)
+        for batch in batches:
+            sim.enqueue_batch(batch)
+        order_batch = {o.order_id: b.batch_id for b in batches for o in b.orders}
+    elif batch_strategy == "tsp":
+        batches = GreedyTSPBatcher(inventory, grid, max_batch_size=batch_size).batch(orders)
+        for batch in batches:
+            sim.enqueue_batch(batch)
+        order_batch = {o.order_id: b.batch_id for b in batches for o in b.orders}
+    else:
+        for order in orders:
+            sim.enqueue_order(order)
+        order_batch = {o.order_id: o.order_id for o in orders}
+
+    # Sort by batch_id so batched orders appear grouped in the UI
+    orders_sorted = sorted(orders, key=lambda o: order_batch[o.order_id])
+    await websocket.send_text(json.dumps({
+        "type": "orders_ready",
+        "orders": [
+            {
+                "order_id": o.order_id,
+                "n_items": len(o.item_ids),
+                "batch_id": order_batch[o.order_id],
+            }
+            for o in orders_sorted
+        ],
+    }))
 
     prev_metrics_count = 0
 
     while True:
         has_more = sim.step()
 
-        # Emit order_complete before the tick frame so the UI updates cleanly
+        # Emit one order_complete per completed order — a batch deposit adds multiple at once
         if len(sim.completed_metrics) > prev_metrics_count:
-            m = sim.completed_metrics[-1]
-            await websocket.send_text(json.dumps({
-                "type": "order_complete",
-                "tick": sim.current_tick,
-                "order_id": m.order_id,
-                "items_picked": m.items_picked,
-                "distance_traveled": m.distance_traveled,
-                "ticks_taken": m.ticks_taken,
-                "completed_at_tick": m.completed_at_tick,
-            }))
+            for m in sim.completed_metrics[prev_metrics_count:]:
+                await websocket.send_text(json.dumps({
+                    "type": "order_complete",
+                    "tick": sim.current_tick,
+                    "order_id": m.order_id,
+                    "items_picked": m.items_picked,
+                    "distance_traveled": m.distance_traveled,
+                    "ticks_taken": m.ticks_taken,
+                    "completed_at_tick": m.completed_at_tick,
+                }))
             prev_metrics_count = len(sim.completed_metrics)
 
         await websocket.send_text(json.dumps({
@@ -174,6 +204,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
                 "carrying": [item.item_id for item in sim.agent.carried_items],
             },
             "active_order": sim._active_order.order_id if sim._active_order else None,
+            "active_batch": sim._active_batch.batch_id if sim._active_batch else None,
         }))
 
         if not has_more:

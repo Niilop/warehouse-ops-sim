@@ -10,8 +10,8 @@ from warehouse.grid import WarehouseGrid
 class BatchedOrder:
     batch_id: str
     orders: list[Order]
-    unified_item_ids: list[str]    # pick list; duplicates preserved for multi-qty items
-    item_to_order: dict[str, str]  # item_id -> order_id
+    unified_item_ids: list[str]  # pick list; one entry per pick (duplicates allowed)
+    item_to_order: list[str]     # parallel to unified_item_ids: order_id for each pick
 
 
 class BatchStrategy(Protocol):
@@ -20,15 +20,12 @@ class BatchStrategy(Protocol):
 
 def _make_batch(orders: list[Order]) -> BatchedOrder:
     batch_id = orders[0].order_id if len(orders) == 1 else f"B-{orders[0].order_id}"
-    seen: set[str] = set()
     unified: list[str] = []
-    item_to_order: dict[str, str] = {}
+    item_to_order: list[str] = []
     for order in orders:
         for iid in order.item_ids:
-            if iid not in seen:
-                seen.add(iid)
-                unified.append(iid)
-                item_to_order[iid] = order.order_id
+            unified.append(iid)
+            item_to_order.append(order.order_id)
     return BatchedOrder(
         batch_id=batch_id,
         orders=orders,
@@ -46,7 +43,7 @@ class FIFOBatcher:
                 batch_id=order.order_id,
                 orders=[order],
                 unified_item_ids=list(order.item_ids),
-                item_to_order={iid: order.order_id for iid in order.item_ids},
+                item_to_order=[order.order_id for _ in order.item_ids],
             )
             for order in orders
         ]
@@ -59,7 +56,7 @@ class ZoneBatcher:
         self,
         grid: WarehouseGrid,
         inventory: Inventory,
-        min_zone_overlap: int = 2,
+        min_zone_overlap: int = 1,
         max_batch_size: int = 4,
     ) -> None:
         self.grid = grid

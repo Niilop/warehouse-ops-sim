@@ -80,18 +80,18 @@ def generate_orders(
 
         n_from_family = math.ceil(items_per_order * family_affinity)
         n_from_family = min(n_from_family, len(family_items), items_per_order)
-        n_from_rest = items_per_order - n_from_family
 
         chosen: list[Item] = []
 
         # Sample from theme family
         fam_weights = np.array([i.demand_weight for i in family_items])
         fam_probs = fam_weights / fam_weights.sum()
-        n_pick = min(n_from_family, len(family_items))
-        fam_indices = rng.choice(len(family_items), size=n_pick, replace=False, p=fam_probs)
+        fam_indices = rng.choice(len(family_items), size=n_from_family, replace=False, p=fam_probs)
         chosen.extend(family_items[i] for i in fam_indices)
 
-        # Sample remaining from full catalog excluding already chosen
+        # Fill remaining slots from the full catalog — computed after the actual family draw
+        # so a small theme family never leaves the order short
+        n_from_rest = items_per_order - len(chosen)
         if n_from_rest > 0:
             chosen_ids = {i.item_id for i in chosen}
             remaining = [i for i in items if i.item_id not in chosen_ids]

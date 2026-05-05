@@ -213,7 +213,8 @@ input[type="range"] { width: 120px; padding: 2px; cursor: pointer; }
     text-transform: uppercase;
     letter-spacing: 0.5px;
 }
-.param input {
+.param input,
+.param select {
     width: 100%;
     background: #222;
     color: #ccc;
@@ -223,6 +224,7 @@ input[type="range"] { width: 120px; padding: 2px; cursor: pointer; }
     font-family: monospace;
     font-size: 12px;
 }
+.param select { cursor: pointer; }
 .param-hints {
     display: flex;
     flex-direction: column;
@@ -236,6 +238,41 @@ input[type="range"] { width: 120px; padding: 2px; cursor: pointer; }
     cursor: help;
 }
 .param-hints span:hover { color: #888; }
+
+/* ── Order queue list ────────────────────────────────── */
+.order-list {
+    max-height: 180px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+.order-row {
+    display: grid;
+    grid-template-columns: 14px 1fr auto auto;
+    gap: 0 8px;
+    align-items: center;
+    padding: 3px 4px;
+    border-radius: 2px;
+    font-size: 11px;
+    color: #555;
+    transition: background 0.1s, color 0.1s;
+}
+.order-status { text-align: center; font-size: 10px; }
+.order-row.active {
+    color: #4a9fd4;
+    background: rgba(26, 111, 181, 0.12);
+}
+.order-row.done { color: #333; }
+.order-row.done .order-status { color: #2d6a2d; }
+.order-batch-tag {
+    font-size: 10px;
+    color: #666;
+    background: #1e1e1e;
+    border: 1px solid #2a2a2a;
+    border-radius: 2px;
+    padding: 0 4px;
+}
 
 /* ── File load hidden input ──────────────────────────── */
 #file-load-input { display: none; }

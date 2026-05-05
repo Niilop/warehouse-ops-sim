@@ -1,5 +1,5 @@
 from __future__ import annotations
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from warehouse.grid import WarehouseGrid
 from warehouse.inventory import Inventory, Item, Order
@@ -86,54 +86,44 @@ class Simulation:
         agent = self.agent
 
         # Process restock queue — release items whose delay has elapsed
-        ready = [j for j in self.restock_queue if j.ready_at_tick <= self.current_tick]
-        for job in ready:
-            self.restock_queue.remove(job)
+        due, self.restock_queue = (
+            [j for j in self.restock_queue if j.ready_at_tick <= self.current_tick],
+            [j for j in self.restock_queue if j.ready_at_tick > self.current_tick],
+        )
+        for job in due:
             self.inventory.restock(job.item)
 
         # Dispatch next work when idle
         if agent.state == AgentState.IDLE:
             dispatched = False
 
-            # batch_queue takes priority over order_queue
+            # batch_queue takes priority — peek without removing; defer if stock insufficient
             if self.batch_queue:
-                batch = self.batch_queue.popleft()
-                available_ids = [
-                    iid for iid in batch.unified_item_ids
-                    if iid in self.inventory._item_to_slot
-                ]
-                missing = len(batch.unified_item_ids) - len(available_ids)
-                self.stockout_count += missing
-                if available_ids:
-                    available_set = set(available_ids)
-                    batch = BatchedOrder(
-                        batch_id=batch.batch_id,
-                        orders=batch.orders,
-                        unified_item_ids=available_ids,
-                        item_to_order={k: v for k, v in batch.item_to_order.items()
-                                       if k in available_set},
-                    )
-                    for order in batch.orders:
+                front = self.batch_queue[0]
+                needed = Counter(front.unified_item_ids)
+                if all(self.inventory.stock_level(iid) >= cnt for iid, cnt in needed.items()):
+                    self.batch_queue.popleft()
+                    for order in front.orders:
                         wait = self.current_tick - self._order_enqueue_tick.get(
                             order.order_id, self.current_tick
                         )
                         self._order_wait_ticks[order.order_id] = wait
-                    self._active_batch = batch
+                    self._active_batch = front
                     self._order_start_tick = self.current_tick
                     self._order_start_distance = agent.total_distance
-                    agent.assign_batch(batch, self.inventory, self.grid.pack_station_pos)
+                    agent.assign_batch(front, self.inventory, self.grid.pack_station_pos)
                     dispatched = True
 
+            # Fall back to order_queue — try each order once; defer unavailable ones to the back
             if not dispatched:
-                while self.order_queue:
+                queue_size = len(self.order_queue)
+                skipped = 0
+                while self.order_queue and skipped < queue_size:
                     order = self.order_queue.popleft()
-                    available_ids = [
-                        iid for iid in order.item_ids
-                        if iid in self.inventory._item_to_slot
-                    ]
-                    missing = len(order.item_ids) - len(available_ids)
-                    self.stockout_count += missing
-                    if not available_ids:
+                    needed = Counter(order.item_ids)
+                    if not all(self.inventory.stock_level(iid) >= cnt for iid, cnt in needed.items()):
+                        self.order_queue.append(order)
+                        skipped += 1
                         continue
                     wait = self.current_tick - self._order_enqueue_tick.get(
                         order.order_id, self.current_tick
@@ -142,8 +132,8 @@ class Simulation:
                     batch = BatchedOrder(
                         batch_id=order.order_id,
                         orders=[order],
-                        unified_item_ids=available_ids,
-                        item_to_order={iid: order.order_id for iid in available_ids},
+                        unified_item_ids=list(order.item_ids),
+                        item_to_order=[order.order_id for _ in order.item_ids],
                     )
                     self._active_batch = batch
                     self._order_start_tick = self.current_tick
@@ -153,9 +143,10 @@ class Simulation:
                     break
 
             if not dispatched:
-                if not self.restock_queue:
-                    return False  # queues empty and no pending restocks — done
-                # Waiting for restocks; agent idles this tick
+                has_pending = bool(self.restock_queue or self.order_queue or self.batch_queue)
+                if not has_pending:
+                    return False
+                # Waiting for items to restock; agent idles this tick
                 self.idle_ticks += 1
                 self.current_tick += 1
                 return True

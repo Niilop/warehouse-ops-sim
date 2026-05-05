@@ -131,6 +131,25 @@
       </div>
     </div>
 
+    <!-- Batching -->
+    <div class="section">
+      <div class="section-title">Batching</div>
+      <div class="param-grid">
+        <div class="param">
+          <span class="param-label">Strategy</span>
+          <select id="input-batch-strategy">
+            <option value="none">None (FIFO)</option>
+            <option value="zone">Zone overlap</option>
+            <option value="tsp">Nearest neighbor</option>
+          </select>
+        </div>
+        <div class="param" id="batch-size-param" style="display:none">
+          <span class="param-label">Batch size</span>
+          <input type="number" id="input-batch-size" value="2" min="2" max="6" title="Max 6 — larger batches cause heavy item overlap with small catalogs" />
+        </div>
+      </div>
+    </div>
+
     <!-- Simulation controls -->
     <div class="section">
       <div class="section-title">Simulation</div>
@@ -164,6 +183,12 @@
         <span class="label">Carrying</span>
         <span class="value" id="status-carrying">—</span>
       </div>
+    </div>
+
+    <!-- Order queue -->
+    <div class="section">
+      <div class="section-title">Order Queue</div>
+      <div class="order-list" id="order-list"></div>
     </div>
 
     <!-- Summary (shown on complete) -->

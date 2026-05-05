@@ -168,13 +168,16 @@ class SimulationViewer {
 // SimulationClient — WebSocket lifecycle
 // ─────────────────────────────────────────────────────────────────
 class SimulationClient {
-  constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner) {
+  constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner, orderList) {
     this.viewer = viewer;
     this.metricsTbody = metricsTbody;
     this.metricsFooter = metricsFooter;
     this.summaryBox = summaryBox;
     this.errorBanner = errorBanner;
+    this.orderList = orderList;
     this.ws = null;
+    this.orderRows = new Map();  // order_id -> { el, batchId }
+    this.activeBatchId = null;
   }
 
   sendSpeedUpdate(ms) {
@@ -204,10 +207,11 @@ class SimulationClient {
     this.ws.onmessage = (event) => {
       const frame = JSON.parse(event.data);
       switch (frame.type) {
-        case "tick":          this.viewer.applyTick(frame); break;
-        case "order_complete": this._appendMetricsRow(frame); break;
-        case "complete":      this._onComplete(frame); break;
-        case "error":         this._showError(frame.message); break;
+        case "orders_ready":   this._onOrdersReady(frame); break;
+        case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.active_batch); break;
+        case "order_complete": this._appendMetricsRow(frame); this._markOrderDone(frame.order_id); break;
+        case "complete":       this._onComplete(frame); break;
+        case "error":          this._showError(frame.message); break;
       }
     };
 
@@ -221,6 +225,65 @@ class SimulationClient {
 
   disconnect() {
     if (this.ws) { this.ws.close(); this.ws = null; }
+  }
+
+  _onOrdersReady(frame) {
+    this.orderList.innerHTML = "";
+    this.orderRows.clear();
+    this.activeBatchId = null;
+
+    for (const o of frame.orders) {
+      const row = document.createElement("div");
+      row.className = "order-row";
+
+      const status = document.createElement("span");
+      status.className = "order-status";
+      status.textContent = "·";
+
+      const id = document.createElement("span");
+      id.textContent = o.order_id;
+
+      const items = document.createElement("span");
+      items.style.color = "#444";
+      items.textContent = o.n_items + "×";
+
+      const batch = document.createElement("span");
+      batch.className = "order-batch-tag";
+      if (o.batch_id && o.batch_id !== o.order_id) batch.textContent = o.batch_id;
+
+      row.append(status, id, items, batch);
+      this.orderList.appendChild(row);
+      this.orderRows.set(o.order_id, { el: row, batchId: o.batch_id });
+    }
+  }
+
+  _updateActiveOrders(batchId) {
+    if (batchId === this.activeBatchId) return;
+
+    for (const [, info] of this.orderRows) {
+      if (info.el.classList.contains("active")) {
+        info.el.classList.remove("active");
+        info.el.querySelector(".order-status").textContent = "·";
+      }
+    }
+    if (batchId) {
+      for (const [, info] of this.orderRows) {
+        if (info.batchId === batchId && !info.el.classList.contains("done")) {
+          info.el.classList.add("active");
+          info.el.querySelector(".order-status").textContent = "●";
+          info.el.scrollIntoView({ block: "nearest" });
+        }
+      }
+    }
+    this.activeBatchId = batchId;
+  }
+
+  _markOrderDone(orderId) {
+    const info = this.orderRows.get(orderId);
+    if (!info) return;
+    info.el.classList.remove("active");
+    info.el.classList.add("done");
+    info.el.querySelector(".order-status").textContent = "✓";
   }
 
   _appendMetricsRow(frame) {
@@ -350,6 +413,12 @@ document.addEventListener("DOMContentLoaded", () => {
     e.target.value = "";
   });
 
+  // ── Batch strategy — show/hide batch size ────────────
+  document.getElementById("input-batch-strategy").addEventListener("change", (e) => {
+    document.getElementById("batch-size-param").style.display =
+      e.target.value === "none" ? "none" : "";
+  });
+
   // ── Speed slider — updates live if simulation is running ─────────
   document.getElementById("speed-slider").addEventListener("input", (e) => {
     document.getElementById("speed-label").textContent = e.target.value + " ms";
@@ -398,6 +467,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // Reset UI
     document.getElementById("metrics-tbody").innerHTML = "";
     document.getElementById("metrics-footer").style.display = "none";
+    document.getElementById("order-list").innerHTML = "";
     viewer.build(dict);
     btn.dataset.running = "1";
     btn.textContent = "■ Stop";
@@ -409,6 +479,7 @@ document.addEventListener("DOMContentLoaded", () => {
       document.getElementById("metrics-footer"),
       document.getElementById("summary-box"),
       errorBanner,
+      document.getElementById("order-list"),
     );
 
     client.connect({
@@ -419,6 +490,8 @@ document.addEventListener("DOMContentLoaded", () => {
       n_families: parseInt(document.getElementById("input-families").value),
       demand_skew: parseFloat(document.getElementById("input-skew").value),
       family_affinity: parseFloat(document.getElementById("input-affinity").value),
+      batch_strategy: document.getElementById("input-batch-strategy").value,
+      batch_size: parseInt(document.getElementById("input-batch-size").value),
       seed: 42,
       tick_delay_ms: parseInt(document.getElementById("speed-slider").value),
     });

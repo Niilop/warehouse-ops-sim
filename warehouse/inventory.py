@@ -18,6 +18,8 @@ class RackSlot:
     rack_pos: tuple[int, int]
     stand_pos: tuple[int, int]  # walkable cell the agent stands at to pick
     item: Item | None = None
+    stock: int = 0      # units currently in this slot
+    max_stock: int = 1  # slot capacity (for future stock-level optimisation)
 
 
 @dataclass
@@ -41,11 +43,17 @@ class Inventory:
                     if neighbors:
                         self._slots.append(RackSlot(rack_pos=(r, c), stand_pos=neighbors[0]))
 
-    def seed(self, items: list[Item], slot_order: list[int] | None = None) -> None:
+    def seed(
+        self,
+        items: list[Item],
+        slot_order: list[int] | None = None,
+        initial_stock: int = 10,
+    ) -> None:
         """
         Assign items to rack slots.
         slot_order: optional permutation of slot indices — items[i] → slots[slot_order[i]].
         If None, assigns items round-robin to empty slots in discovery order.
+        initial_stock: units to place in each slot; scales with demand in future.
         """
         if slot_order is not None:
             if len(items) > len(slot_order):
@@ -59,6 +67,8 @@ class Inventory:
 
         for item, slot in pairs:
             slot.item = item
+            slot.stock = initial_stock
+            slot.max_stock = initial_stock
             self._item_to_slot[item.item_id] = slot
             self._original_slot_for[item.item_id] = slot
 
@@ -66,16 +76,27 @@ class Inventory:
         return self._item_to_slot[item_id]
 
     def remove_item(self, item_id: str) -> Item:
-        slot = self._item_to_slot.pop(item_id)
+        slot = self._item_to_slot[item_id]
         item = slot.item
-        slot.item = None
+        slot.stock -= 1
+        if slot.stock == 0:
+            self._item_to_slot.pop(item_id)
+            slot.item = None
         return item  # type: ignore[return-value]
 
     def restock(self, item: Item) -> None:
-        """Return a picked item to its original rack slot."""
+        """Return one unit of an item to its original rack slot."""
         slot = self._original_slot_for[item.item_id]
-        slot.item = item
-        self._item_to_slot[item.item_id] = slot
+        was_empty = slot.stock == 0
+        slot.stock = min(slot.stock + 1, slot.max_stock)
+        if was_empty:
+            slot.item = item
+            self._item_to_slot[item.item_id] = slot
+
+    def stock_level(self, item_id: str) -> int:
+        """Current on-hand units for an item (0 if picked out)."""
+        slot = self._original_slot_for.get(item_id)
+        return slot.stock if slot else 0
 
     def reset(self) -> None:
         """Clear all item assignments (used between analysis runs)."""

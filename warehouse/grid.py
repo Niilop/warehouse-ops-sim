@@ -146,14 +146,18 @@ class WarehouseGrid:
 
     @staticmethod
     def from_dict(data: dict) -> "WarehouseGrid":
+        g = np.array(data["grid"], dtype=np.uint8)
+        pack_pos = tuple(data["pack_station_pos"])
         zone_map: dict[tuple[int, int], str] = {
             (entry[0], entry[1]): entry[2]
             for entry in data.get("zone_map_list", [])
         }
+        if not zone_map:
+            zone_map = WarehouseGrid._assign_zones(g, pack_pos)
         return WarehouseGrid(
             rows=data["rows"],
             cols=data["cols"],
-            grid=np.array(data["grid"], dtype=np.uint8),
-            pack_station_pos=tuple(data["pack_station_pos"]),
+            grid=g,
+            pack_station_pos=pack_pos,
             zone_map=zone_map,
         )
