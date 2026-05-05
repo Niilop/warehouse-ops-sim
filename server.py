@@ -15,6 +15,7 @@ from warehouse.agent import PickAgent
 from warehouse.simulation import Simulation
 from warehouse.batcher import ZoneBatcher, GreedyTSPBatcher
 from warehouse.data_gen import generate_catalog, generate_orders
+from warehouse.optimizer import slot_distances, demand_placement, affinity_placement
 
 app = FastAPI()
 
@@ -126,6 +127,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     steps_per_frame = max(1, int(config.get("steps_per_frame", 4)))
     batch_strategy = config.get("batch_strategy", "none")
     batch_size = int(config.get("batch_size", 2))
+    slot_strategy = config.get("slot_strategy", "spread")
 
     grid = WarehouseGrid.from_dict(layout_dict)
     inventory = Inventory(grid)
@@ -138,11 +140,21 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
         ))
         return
 
-    inventory.seed(items)
+    # Generate orders before seeding so affinity placement can use co-occurrence data
     orders = generate_orders(
         items, n_orders=n_orders, items_per_order=items_per_order,
         family_affinity=family_affinity, seed=seed
     )
+
+    if slot_strategy in ("demand", "affinity"):
+        sorted_slot_order = [idx for idx, _ in slot_distances(grid, inventory)][:len(items)]
+        if slot_strategy == "demand":
+            ordered_items = demand_placement(items)
+        else:
+            ordered_items = affinity_placement(items, orders)
+        inventory.seed(ordered_items, slot_order=sorted_slot_order)
+    else:
+        inventory.seed(items)
 
     n_agents = max(1, int(config.get("n_agents", 1)))
     agents = [PickAgent(agent_id=f"A{i+1}", start_pos=grid.pack_station_pos, grid=grid) for i in range(n_agents)]

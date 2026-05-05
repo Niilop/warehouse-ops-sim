@@ -1,38 +1,38 @@
 "use strict";
 
-const API_BASE = "http://localhost:8000"; // prefix all fetch calls — swap for Tauri sidecar later
+const API_BASE = "http://localhost:8000";
 
-// CellType values (mirror warehouse/grid.py CellType enum)
 const CT = { EMPTY: 0, RACK: 1, AISLE: 2, PACK: 3 };
 const CELL_CLASS = { 0: "cell-empty", 1: "cell-rack", 2: "cell-aisle", 3: "cell-pack" };
 
+// Canvas cell colors (sim viewer)
+const CANVAS_COLORS   = { 0: "#2a2a2a", 1: "#b06010", 2: "#181818", 3: "#276027" };
+const AGENT_IDLE      = ["#1a6fb5", "#a04000", "#1a7a5a", "#6a2090"];
+const AGENT_CARRY     = ["#4a9fd4", "#f07020", "#30c890", "#b060e0"];
+
 // ─────────────────────────────────────────────────────────────────
-// GridEditor — manages the drawable editor table
+// GridEditor — drawable editor table
 // ─────────────────────────────────────────────────────────────────
 class GridEditor {
   constructor(tableEl) {
     this.tableEl = tableEl;
-    this.rows = 0;
-    this.cols = 0;
-    this.cells = [];      // 2D array of CellType int
+    this.rows = 0; this.cols = 0;
+    this.cells = [];
     this.brush = CT.RACK;
     this.painting = false;
-    this.packPos = null;  // [row, col] of current PACK_STATION, enforces exactly one
-
+    this.packPos = null;
     document.addEventListener("mouseup", () => { this.painting = false; });
   }
 
   build(rows, cols) {
-    this.rows = rows;
-    this.cols = cols;
+    this.rows = rows; this.cols = cols;
     this.cells = Array.from({ length: rows }, () => new Array(cols).fill(CT.AISLE));
     this.packPos = null;
     this._render();
   }
 
   loadFromDict(dict) {
-    this.rows = dict.rows;
-    this.cols = dict.cols;
+    this.rows = dict.rows; this.cols = dict.cols;
     this.cells = dict.grid.map(row => [...row]);
     this.packPos = dict.pack_station_pos ? [...dict.pack_station_pos] : null;
     this._render();
@@ -40,21 +40,16 @@ class GridEditor {
 
   toDict() {
     return {
-      rows: this.rows,
-      cols: this.cols,
+      rows: this.rows, cols: this.cols,
       grid: this.cells.map(row => [...row]),
       pack_station_pos: this.packPos ? [...this.packPos] : [0, 0],
     };
   }
 
-  setBrush(type) {
-    this.brush = type;
-  }
+  setBrush(type) { this.brush = type; }
 
   setCellType(row, col, type) {
     if (row < 0 || row >= this.rows || col < 0 || col >= this.cols) return;
-
-    // Enforce single pack station
     if (type === CT.PACK) {
       if (this.packPos) {
         const [pr, pc] = this.packPos;
@@ -65,16 +60,14 @@ class GridEditor {
     } else if (this.packPos && this.packPos[0] === row && this.packPos[1] === col) {
       this.packPos = null;
     }
-
     this.cells[row][col] = type;
     this._updateTd(row, col);
   }
 
   validateLocal() {
     const errors = [];
-    if (!this.packPos) errors.push("Place exactly one Pack Station on the grid.");
-    const rackCount = this.cells.flat().filter(c => c === CT.RACK).length;
-    if (rackCount === 0) errors.push("Add at least one Rack cell.");
+    if (!this.packPos) errors.push("Place exactly one Pack Station.");
+    if (!this.cells.flat().some(c => c === CT.RACK)) errors.push("Add at least one Rack cell.");
     return errors.length ? errors : null;
   }
 
@@ -84,17 +77,10 @@ class GridEditor {
       const tr = document.createElement("tr");
       for (let c = 0; c < this.cols; c++) {
         const td = document.createElement("td");
-        td.dataset.row = r;
-        td.dataset.col = c;
+        td.dataset.row = r; td.dataset.col = c;
         td.className = CELL_CLASS[this.cells[r][c]];
-        td.addEventListener("mousedown", (e) => {
-          e.preventDefault();
-          this.painting = true;
-          this.setCellType(r, c, this.brush);
-        });
-        td.addEventListener("mouseenter", () => {
-          if (this.painting) this.setCellType(r, c, this.brush);
-        });
+        td.addEventListener("mousedown", (e) => { e.preventDefault(); this.painting = true; this.setCellType(r, c, this.brush); });
+        td.addEventListener("mouseenter", () => { if (this.painting) this.setCellType(r, c, this.brush); });
         tr.appendChild(td);
       }
       this.tableEl.appendChild(tr);
@@ -107,83 +93,140 @@ class GridEditor {
   }
 }
 
-// Agent index → CSS color token (matches styles.css .cell-agent-N / .cell-agent-N-carry)
-const AGENT_COLORS = ["#1a6fb5", "#a04000", "#1a7a5a", "#6a2090"];
-
 // ─────────────────────────────────────────────────────────────────
-// SimulationViewer — read-only grid with multi-agent overlay
+// SimulationViewer — canvas-based with zoom + auto-fit
 // ─────────────────────────────────────────────────────────────────
 class SimulationViewer {
-  constructor(tableEl) {
-    this.tableEl = tableEl;
-    this.rows = 0;
-    this.cols = 0;
-    // agentPositions: Map<agentId, {row, col, idx}>
-    this.agentPositions = new Map();
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.dict = null;
+    this.agents = [];
+    this._zoom = 1.0;
+
+    // Wheel zoom — zoom toward cursor
+    canvas.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      this._zoom = Math.max(0.1, Math.min(12, this._zoom * factor));
+      this._draw();
+    }, { passive: false });
+
+    // Resize observer keeps canvas pixel-perfect
+    const ro = new ResizeObserver(() => { this._syncSize(); this._draw(); });
+    ro.observe(canvas.parentElement);
+    this._syncSize();
   }
 
-  build(dict) {
-    this.rows = dict.rows;
-    this.cols = dict.cols;
-    this.agentPositions.clear();
-    this.tableEl.innerHTML = "";
-    for (let r = 0; r < this.rows; r++) {
-      const tr = document.createElement("tr");
-      for (let c = 0; c < this.cols; c++) {
-        const td = document.createElement("td");
-        td.className = CELL_CLASS[dict.grid[r][c]];
-        tr.appendChild(td);
-      }
-      this.tableEl.appendChild(tr);
-    }
+  // ── Public API ──────────────────────────────────────
+
+  build(dict, resetZoom = true) {
+    this.dict = dict;
+    this.agents = [];
+    if (resetZoom) this._zoom = 0.78;
+    this._draw();
   }
 
   applyTick(frame) {
-    // Clear all previous agent cells
-    for (const { row, col, idx } of this.agentPositions.values()) {
-      const td = this.tableEl.rows[row]?.cells[col];
-      if (td) td.classList.remove(`cell-agent-${idx}`, `cell-agent-${idx}-carry`);
-    }
-    this.agentPositions.clear();
+    this.agents = frame.agents ||
+      [{ ...frame.agent, id: "A1", active_batch: frame.active_batch }];
+    this._draw();
+    this._updateHUD(frame);
+  }
 
-    // Paint new positions
-    const agents = frame.agents || [{ ...frame.agent, id: "A1", active_batch: frame.active_batch }];
-    for (let idx = 0; idx < agents.length; idx++) {
-      const a = agents[idx];
-      const td = this.tableEl.rows[a.row]?.cells[a.col];
-      if (td) {
-        td.classList.add(a.carrying.length > 0 ? `cell-agent-${idx}-carry` : `cell-agent-${idx}`);
+  resetZoom() { this._zoom = 0.78; this._draw(); }
+  zoomBy(f)   { this._zoom = Math.max(0.1, Math.min(12, this._zoom * f)); this._draw(); }
+
+  // ── Internal ────────────────────────────────────────
+
+  _syncSize() {
+    const dpr = window.devicePixelRatio || 1;
+    const el  = this.canvas.parentElement;
+    const w   = el.clientWidth;
+    const h   = el.clientHeight;
+    this.canvas.width  = w * dpr;
+    this.canvas.height = h * dpr;
+    this.canvas.style.width  = w + "px";
+    this.canvas.style.height = h + "px";
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  _logical() {
+    const dpr = window.devicePixelRatio || 1;
+    return { w: this.canvas.width / dpr, h: this.canvas.height / dpr };
+  }
+
+  _layout() {
+    const { w, h } = this._logical();
+    const padX = Math.max(48, w * 0.08);
+    const padY = Math.max(48, h * 0.08);
+    const base = Math.min(
+      (w - padX * 2) / this.dict.cols,
+      (h - padY * 2) / this.dict.rows
+    );
+    const cs = base * this._zoom;
+    const ox = (w - this.dict.cols * cs) / 2;
+    const oy = (h - this.dict.rows * cs) / 2;
+    return { cs, ox, oy };
+  }
+
+  _draw() {
+    const ctx = this.ctx;
+    const { w, h } = this._logical();
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+
+    if (!this.dict) return;
+
+    const { cs, ox, oy } = this._layout();
+    const { rows, cols, grid } = this.dict;
+    const gap = cs > 3 ? 1 : 0;
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        ctx.fillStyle = CANVAS_COLORS[grid[r][c]] || "#000";
+        ctx.fillRect(ox + c * cs + gap, oy + r * cs + gap, cs - gap, cs - gap);
       }
-      this.agentPositions.set(a.id, { row: a.row, col: a.col, idx });
     }
 
-    // Update tick label
-    document.getElementById("status-tick-label").textContent = `tick ${frame.tick}`;
-
-    // Update per-agent status rows
-    const container = document.getElementById("agents-status");
-    // Reuse or create rows
-    while (container.children.length < agents.length) {
-      container.appendChild(document.createElement("div"));
+    // Agents — slightly inset square
+    const pad = Math.max(1, cs * 0.12);
+    for (let i = 0; i < this.agents.length; i++) {
+      const a = this.agents[i];
+      ctx.fillStyle = a.carrying.length ? AGENT_CARRY[i % 4] : AGENT_IDLE[i % 4];
+      ctx.fillRect(
+        ox + a.col * cs + pad,
+        oy + a.row * cs + pad,
+        cs - pad * 2,
+        cs - pad * 2
+      );
     }
-    while (container.children.length > agents.length) {
-      container.removeChild(container.lastChild);
-    }
-    for (let idx = 0; idx < agents.length; idx++) {
-      const a = agents[idx];
-      const row = container.children[idx];
-      row.className = "agent-status-row";
+  }
 
-      const stateText = a.state.replace(/_/g, " ");
-      const carryText = a.carrying.length ? a.carrying.join(", ") : "empty";
-      const batchText = a.active_batch ? `batch ${a.active_batch}` : "idle";
+  _updateHUD(frame) {
+    document.getElementById("hud-tick").textContent = `tick ${frame.tick}`;
 
-      row.innerHTML = `
-        <span class="agent-dot" style="background:${AGENT_COLORS[idx % AGENT_COLORS.length]}"></span>
-        <span class="agent-id">${a.id}</span>
-        <span class="agent-info">${stateText} — ${batchText}</span>
-        <span class="agent-carry-tag">${carryText}</span>
-      `;
+    const container = document.getElementById("hud-agents");
+    const agents = this.agents;
+
+    while (container.children.length < agents.length) container.appendChild(document.createElement("div"));
+    while (container.children.length > agents.length) container.removeChild(container.lastChild);
+
+    for (let i = 0; i < agents.length; i++) {
+      const a    = agents[i];
+      const row  = container.children[i];
+      row.className = "hud-agent-row";
+      const state = a.state.replace(/_/g, " ");
+      const carry = a.carrying.length ? ` — ${a.carrying.length} item${a.carrying.length > 1 ? "s" : ""}` : "";
+      const dot   = row.children[0] || (() => { const s = document.createElement("span"); s.className = "hud-dot"; row.appendChild(s); return s; })();
+      const label = row.children[1] || (() => { const s = document.createElement("span"); row.appendChild(s); return s; })();
+      dot.className = "hud-dot";
+      dot.style.background = AGENT_IDLE[i % 4];
+      dot.style.flexShrink = "0";
+      label.textContent = `${a.id} ${state}${carry}`;
+      label.style.overflow = "hidden";
+      label.style.textOverflow = "ellipsis";
     }
   }
 }
@@ -193,68 +236,60 @@ class SimulationViewer {
 // ─────────────────────────────────────────────────────────────────
 class SimulationClient {
   constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner, orderList) {
-    this.viewer = viewer;
+    this.viewer       = viewer;
     this.metricsTbody = metricsTbody;
     this.metricsFooter = metricsFooter;
-    this.summaryBox = summaryBox;
-    this.errorBanner = errorBanner;
-    this.orderList = orderList;
-    this.ws = null;
-    this.orderRows = new Map();  // order_id -> { el, batchId }
+    this.summaryBox   = summaryBox;
+    this.errorBanner  = errorBanner;
+    this.orderList    = orderList;
+    this.ws           = null;
+    this.orderRows    = new Map();
     this._activeBatchKey = "";
   }
 
   sendSpeedUpdate(ms) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this.ws?.readyState === WebSocket.OPEN)
       this.ws.send(JSON.stringify({ type: "set_speed", tick_delay_ms: ms }));
-    }
   }
 
   sendStepsUpdate(steps) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this.ws?.readyState === WebSocket.OPEN)
       this.ws.send(JSON.stringify({ type: "set_steps", steps_per_frame: steps }));
-    }
   }
 
   stop() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this.ws?.readyState === WebSocket.OPEN)
       this.ws.send(JSON.stringify({ type: "stop" }));
-    }
     this.disconnect();
   }
 
   connect(config) {
     this.errorBanner.style.display = "none";
-    this.summaryBox.style.display = "none";
+    this.summaryBox.style.display  = "none";
+    document.getElementById("hud-summary").style.display = "none";
 
     const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws/simulate";
     this.ws = new WebSocket(wsUrl);
-
-    this.ws.onopen = () => {
-      this.ws.send(JSON.stringify(config));
-    };
-
-    this.ws.onmessage = (event) => {
-      const frame = JSON.parse(event.data);
-      switch (frame.type) {
-        case "orders_ready":   this._onOrdersReady(frame); break;
-        case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.agents || []); break;
-        case "order_complete": this._appendMetricsRow(frame); this._markOrderDone(frame.order_id); break;
-        case "complete":       this._onComplete(frame); break;
-        case "error":          this._showError(frame.message); break;
-      }
-    };
-
-    this.ws.onerror = () => this._showError("WebSocket connection error.");
-    this.ws.onclose = () => {
+    this.ws.onopen    = () => this.ws.send(JSON.stringify(config));
+    this.ws.onmessage = (e) => this._onMessage(JSON.parse(e.data));
+    this.ws.onerror   = () => this._showError("WebSocket connection error.");
+    this.ws.onclose   = () => {
       const btn = document.getElementById("btn-run");
       btn.dataset.running = "0";
       btn.textContent = "▶ Run Simulation";
     };
   }
 
-  disconnect() {
-    if (this.ws) { this.ws.close(); this.ws = null; }
+  disconnect() { if (this.ws) { this.ws.close(); this.ws = null; } }
+
+  _onMessage(frame) {
+    switch (frame.type) {
+      case "orders_ready":   this._onOrdersReady(frame); break;
+      case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.agents || []); break;
+      case "order_complete": this._appendMetricsRow(frame); this._markOrderDone(frame.order_id); break;
+      case "complete":       this._onComplete(frame); break;
+      case "error":          this._showError(frame.message); break;
+    }
   }
 
   _onOrdersReady(frame) {
@@ -263,7 +298,7 @@ class SimulationClient {
     this._activeBatchKey = "";
 
     for (const o of frame.orders) {
-      const row = document.createElement("div");
+      const row    = document.createElement("div");
       row.className = "order-row";
 
       const status = document.createElement("span");
@@ -274,7 +309,7 @@ class SimulationClient {
       id.textContent = o.order_id;
 
       const items = document.createElement("span");
-      items.style.color = "#444";
+      items.style.color = "#333";
       items.textContent = o.n_items + "×";
 
       const batch = document.createElement("span");
@@ -288,12 +323,7 @@ class SimulationClient {
   }
 
   _updateActiveOrders(agents) {
-    // Collect all batch IDs currently being worked by any agent
-    const activeBatches = new Set(
-      agents.map(a => a.active_batch).filter(Boolean)
-    );
-
-    // Stringify for cheap change detection
+    const activeBatches = new Set(agents.map(a => a.active_batch).filter(Boolean));
     const key = [...activeBatches].sort().join(",");
     if (key === this._activeBatchKey) return;
     this._activeBatchKey = key;
@@ -305,9 +335,9 @@ class SimulationClient {
         info.el.querySelector(".order-status").textContent = "●";
         const list = info.el.parentElement;
         if (list) {
-          const elBottom = info.el.offsetTop + info.el.offsetHeight;
+          const bot = info.el.offsetTop + info.el.offsetHeight;
           if (info.el.offsetTop < list.scrollTop) list.scrollTop = info.el.offsetTop;
-          else if (elBottom > list.scrollTop + list.clientHeight) list.scrollTop = elBottom - list.clientHeight;
+          else if (bot > list.scrollTop + list.clientHeight) list.scrollTop = bot - list.clientHeight;
         }
       } else if (info.el.classList.contains("active")) {
         info.el.classList.remove("active");
@@ -330,10 +360,8 @@ class SimulationClient {
       <td>${frame.order_id}</td>
       <td class="text-right">${frame.items_picked}</td>
       <td class="text-right">${frame.distance_traveled}</td>
-      <td class="text-right">${frame.ticks_taken}</td>
-    `;
+      <td class="text-right">${frame.ticks_taken}</td>`;
     this.metricsTbody.appendChild(tr);
-    // Scroll the metrics container, not the page
     const scroll = this.metricsTbody.closest(".metrics-scroll");
     if (scroll) scroll.scrollTop = scroll.scrollHeight;
   }
@@ -341,15 +369,20 @@ class SimulationClient {
   _onComplete(frame) {
     const s = frame.summary;
     document.getElementById("footer-items").textContent = s.total_items_picked;
-    document.getElementById("footer-dist").textContent = s.total_distance;
+    document.getElementById("footer-dist").textContent  = s.total_distance;
     document.getElementById("footer-ticks").textContent = frame.total_ticks;
     this.metricsFooter.style.display = "";
 
+    const summaryText =
+      `✓ ${frame.total_orders} orders · ${frame.total_ticks} ticks\n` +
+      `avg ${s.avg_ticks_per_order} ticks/order · dist ${s.total_distance}`;
+
     this.summaryBox.style.display = "block";
-    this.summaryBox.innerHTML =
-      `✓ Done — ${frame.total_orders} orders completed in ${frame.total_ticks} ticks &nbsp;|&nbsp; ` +
-      `avg ${s.avg_ticks_per_order} ticks/order &nbsp;|&nbsp; ` +
-      `total distance ${s.total_distance}`;
+    this.summaryBox.textContent   = summaryText;
+
+    const hudSummary = document.getElementById("hud-summary");
+    hudSummary.style.display = "block";
+    hudSummary.textContent   = summaryText;
   }
 
   _showError(message) {
@@ -363,42 +396,45 @@ class SimulationClient {
 // ─────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
   const editor = new GridEditor(document.getElementById("editor-grid"));
-  const viewer = new SimulationViewer(document.getElementById("sim-grid"));
+  const viewer = new SimulationViewer(document.getElementById("sim-canvas"));
   let client = null;
 
   // Load default layout on startup
   fetch(API_BASE + "/api/default-layout")
     .then(r => r.json())
-    .then(dict => {
-      editor.loadFromDict(dict);
-      viewer.build(dict);
-    });
+    .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
+
+  // ── Sidebar collapse / expand ────────────────
+  const sidebar = document.getElementById("sidebar");
+  const btnExpand = document.getElementById("btn-expand-sidebar");
+
+  document.getElementById("btn-collapse-sidebar").addEventListener("click", () => {
+    sidebar.classList.add("collapsed");
+    btnExpand.classList.add("visible");
+  });
+  btnExpand.addEventListener("click", () => {
+    sidebar.classList.remove("collapsed");
+    btnExpand.classList.remove("visible");
+  });
 
   // ── Mode toggle ──────────────────────────────
   const modeButtons = ["mode-default", "mode-quad", "mode-custom"];
-
   function setActiveMode(activeId) {
     modeButtons.forEach(id => document.getElementById(id).classList.toggle("active", id === activeId));
     document.getElementById("custom-controls").style.display = activeId === "mode-custom" ? "" : "none";
   }
 
   document.getElementById("mode-default").addEventListener("click", () => {
-    fetch(API_BASE + "/api/default-layout")
-      .then(r => r.json())
+    fetch(API_BASE + "/api/default-layout").then(r => r.json())
       .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
     setActiveMode("mode-default");
   });
-
   document.getElementById("mode-quad").addEventListener("click", () => {
-    fetch(API_BASE + "/api/quad-layout")
-      .then(r => r.json())
+    fetch(API_BASE + "/api/quad-layout").then(r => r.json())
       .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
     setActiveMode("mode-quad");
   });
-
-  document.getElementById("mode-custom").addEventListener("click", () => {
-    setActiveMode("mode-custom");
-  });
+  document.getElementById("mode-custom").addEventListener("click", () => setActiveMode("mode-custom"));
 
   // ── Custom size ──────────────────────────────
   document.getElementById("btn-apply-size").addEventListener("click", () => {
@@ -409,12 +445,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   // ── Brushes ──────────────────────────────────
-  const brushMap = {
-    "brush-rack":  CT.RACK,
-    "brush-aisle": CT.AISLE,
-    "brush-pack":  CT.PACK,
-    "brush-empty": CT.EMPTY,
-  };
+  const brushMap = { "brush-rack": CT.RACK, "brush-aisle": CT.AISLE, "brush-pack": CT.PACK, "brush-empty": CT.EMPTY };
   Object.entries(brushMap).forEach(([id, type]) => {
     document.getElementById(id).addEventListener("click", () => {
       editor.setBrush(type);
@@ -427,11 +458,9 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-save").addEventListener("click", () => {
     const dict = editor.toDict();
     const blob = new Blob([JSON.stringify(dict, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "warehouse-layout.json";
-    a.click();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url; a.download = "warehouse-layout.json"; a.click();
     URL.revokeObjectURL(url);
   });
 
@@ -445,15 +474,13 @@ document.addEventListener("DOMContentLoaded", () => {
         const dict = JSON.parse(ev.target.result);
         editor.loadFromDict(dict);
         viewer.build(dict);
-      } catch {
-        alert("Invalid JSON file.");
-      }
+      } catch { alert("Invalid JSON file."); }
     };
     reader.readAsText(file);
     e.target.value = "";
   });
 
-  // ── Collapsible sections ─────────────────────────────
+  // ── Collapsible sections ─────────────────────
   document.querySelectorAll(".section-title").forEach(title => {
     title.addEventListener("click", () => {
       const section = title.closest(".section");
@@ -462,46 +489,41 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  // Auto-expand Order Metrics when simulation completes
-  // (handled in _onComplete — section is collapsed by default)
-
-  // ── Batch strategy — show/hide batch size ────────────
+  // ── Batch strategy toggle ────────────────────
   document.getElementById("input-batch-strategy").addEventListener("change", (e) => {
-    document.getElementById("batch-size-param").style.display =
-      e.target.value === "none" ? "none" : "";
+    document.getElementById("batch-size-param").style.display = e.target.value === "none" ? "none" : "";
   });
 
-  // ── Speed slider — updates live if simulation is running ─────────
+  // ── Speed / steps sliders ────────────────────
   document.getElementById("speed-slider").addEventListener("input", (e) => {
     const ms = parseInt(e.target.value);
     document.getElementById("speed-label").textContent = ms === 0 ? "max" : ms + " ms";
     if (client) client.sendSpeedUpdate(ms);
   });
-
-  // ── Steps slider ─────────────────────────────────────
   document.getElementById("steps-slider").addEventListener("input", (e) => {
     const steps = parseInt(e.target.value);
     document.getElementById("steps-label").textContent = "×" + steps;
     if (client) client.sendStepsUpdate(steps);
   });
 
-  // ── Run / Stop button ─────────────────────────
+  // ── Zoom buttons ─────────────────────────────
+  document.getElementById("btn-zoom-in").addEventListener("click",    () => viewer.zoomBy(1.3));
+  document.getElementById("btn-zoom-out").addEventListener("click",   () => viewer.zoomBy(1 / 1.3));
+  document.getElementById("btn-zoom-reset").addEventListener("click", () => viewer.resetZoom());
+
+  // ── Run / Stop ───────────────────────────────
   document.getElementById("btn-run").addEventListener("click", async () => {
     const btn = document.getElementById("btn-run");
-
-    // If simulation is running, stop it
     if (btn.dataset.running === "1") {
       if (client) client.stop();
       btn.dataset.running = "0";
       btn.textContent = "▶ Run Simulation";
-      btn.classList.remove("stopping");
       return;
     }
 
     const errorBanner = document.getElementById("error-banner");
     errorBanner.style.display = "none";
 
-    // Local validation first
     const localErrors = editor.validateLocal();
     if (localErrors) {
       errorBanner.textContent = localErrors.join(" ");
@@ -510,8 +532,6 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     const dict = editor.toDict();
-
-    // Server-side validation
     const vRes = await fetch(API_BASE + "/api/validate-layout", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -524,11 +544,10 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
-    // Reset UI
     document.getElementById("metrics-tbody").innerHTML = "";
     document.getElementById("metrics-footer").style.display = "none";
     document.getElementById("order-list").innerHTML = "";
-    viewer.build(dict);
+    viewer.build(dict, false);
     btn.dataset.running = "1";
     btn.textContent = "■ Stop";
 
@@ -543,18 +562,19 @@ document.addEventListener("DOMContentLoaded", () => {
     );
 
     client.connect({
-      layout: dict,
-      n_orders: parseInt(document.getElementById("input-orders").value),
-      n_items: parseInt(document.getElementById("input-items").value),
+      layout:          dict,
+      n_orders:        parseInt(document.getElementById("input-orders").value),
+      n_items:         parseInt(document.getElementById("input-items").value),
       items_per_order: parseInt(document.getElementById("input-per-order").value),
-      n_families: parseInt(document.getElementById("input-families").value),
-      demand_skew: parseFloat(document.getElementById("input-skew").value),
+      n_families:      parseInt(document.getElementById("input-families").value),
+      demand_skew:     parseFloat(document.getElementById("input-skew").value),
       family_affinity: parseFloat(document.getElementById("input-affinity").value),
-      batch_strategy: document.getElementById("input-batch-strategy").value,
-      batch_size: parseInt(document.getElementById("input-batch-size").value),
-      n_agents: parseInt(document.getElementById("input-agents").value),
-      seed: parseInt(document.getElementById("input-seed").value),
-      tick_delay_ms: parseInt(document.getElementById("speed-slider").value),
+      slot_strategy:   document.getElementById("input-slot-strategy").value,
+      batch_strategy:  document.getElementById("input-batch-strategy").value,
+      batch_size:      parseInt(document.getElementById("input-batch-size").value),
+      n_agents:        parseInt(document.getElementById("input-agents").value),
+      seed:            parseInt(document.getElementById("input-seed").value),
+      tick_delay_ms:   parseInt(document.getElementById("speed-slider").value),
       steps_per_frame: parseInt(document.getElementById("steps-slider").value),
     });
   });

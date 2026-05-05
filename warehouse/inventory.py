@@ -61,9 +61,14 @@ class Inventory:
             pairs = [(items[i], self._slots[slot_order[i]]) for i in range(len(items))]
         else:
             empty = [s for s in self._slots if s.item is None]
-            if len(items) > len(empty):
-                raise ValueError(f"More items ({len(items)}) than available slots ({len(empty)})")
-            pairs = [(items[i], empty[i]) for i in range(len(items))]
+            n = len(items)
+            if n > len(empty):
+                raise ValueError(f"More items ({n}) than available slots ({len(empty)})")
+            # Stride evenly so items spread across the whole warehouse,
+            # not just the first rows discovered top-to-bottom.
+            step = len(empty) / n if n < len(empty) else 1
+            indices = [int(i * step) for i in range(n)]
+            pairs = [(items[i], empty[indices[i]]) for i in range(n)]
 
         for item, slot in pairs:
             slot.item = item
