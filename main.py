@@ -19,7 +19,7 @@ def main() -> None:
     inventory.seed(items)
 
     agent = PickAgent(agent_id="A1", start_pos=grid.pack_station_pos, grid=grid)
-    sim = Simulation(grid=grid, inventory=inventory, agent=agent)
+    sim = Simulation(grid=grid, inventory=inventory, agents=[agent])
 
     # Generate 10 orders for a visible live demo (items restock after each deposit)
     orders = generate_orders(items, n_orders=10, items_per_order=4, family_affinity=0.7, seed=42)

@@ -143,8 +143,9 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
         family_affinity=family_affinity, seed=seed
     )
 
-    agent = PickAgent(agent_id="A1", start_pos=grid.pack_station_pos, grid=grid)
-    sim = Simulation(grid=grid, inventory=inventory, agent=agent, restock_delay=0)
+    n_agents = max(1, int(config.get("n_agents", 1)))
+    agents = [PickAgent(agent_id=f"A{i+1}", start_pos=grid.pack_station_pos, grid=grid) for i in range(n_agents)]
+    sim = Simulation(grid=grid, inventory=inventory, agents=agents, restock_delay=0)
 
     if batch_strategy == "zone":
         batches = ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders)
@@ -197,6 +198,19 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
         await websocket.send_text(json.dumps({
             "type": "tick",
             "tick": sim.current_tick,
+            "agents": [
+                {
+                    "id": a.agent_id,
+                    "row": a.pos[0],
+                    "col": a.pos[1],
+                    "state": a.state.value,
+                    "carrying": [item.item_id for item in a.carried_items],
+                    "active_batch": sim._agent_batch[a.agent_id].batch_id
+                        if sim._agent_batch[a.agent_id] else None,
+                }
+                for a in sim.agents
+            ],
+            # backward-compat single-agent fields
             "agent": {
                 "row": sim.agent.pos[0],
                 "col": sim.agent.pos[1],

@@ -11,6 +11,7 @@ build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.contextwindow
 
 # Generated analysis output — regenerate with: python blog_analysis.py
 warehouse-layout-optimization.md

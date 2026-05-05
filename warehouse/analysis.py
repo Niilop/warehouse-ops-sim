@@ -46,7 +46,7 @@ def _run_scenario(
     inventory.seed(placement[:n], slot_order=sorted_slot_indices[:n])
 
     agent = PickAgent("A1", grid.pack_station_pos, grid)
-    sim = Simulation(grid, inventory, agent)
+    sim = Simulation(grid, inventory, [agent])
     for order in orders:
         sim.enqueue_order(order)
     return sim.run(max_ticks=max_ticks)
@@ -255,7 +255,7 @@ def run_batch_analysis(
 
                 batches = batcher.batch(orders)
                 agent = PickAgent("A1", grid.pack_station_pos, grid)
-                sim = Simulation(grid, inventory, agent)
+                sim = Simulation(grid, inventory, [agent])
                 for batch in batches:
                     sim.enqueue_batch(batch)
                 metrics = sim.run()

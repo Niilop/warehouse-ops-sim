@@ -57,6 +57,11 @@ def generate_orders(
       - Fill remaining slots from the full catalog
       - Both draws are weighted by demand_weight
     """
+    if items_per_order > len(items):
+        raise ValueError(
+            f"items_per_order ({items_per_order}) exceeds catalog size ({len(items)})"
+        )
+
     rng = np.random.default_rng(seed)
 
     # Group items by family

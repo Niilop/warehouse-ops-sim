@@ -3,7 +3,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from warehouse.grid import WarehouseGrid
 from warehouse.inventory import Inventory, Item, Order
-from warehouse.agent import PickAgent, AgentState
+from warehouse.agent import PickAgent, AgentState, StepResult
 from warehouse.batcher import BatchedOrder
 
 
@@ -41,36 +41,57 @@ class Simulation:
         self,
         grid: WarehouseGrid,
         inventory: Inventory,
-        agent: PickAgent,
+        agents: list[PickAgent],
         restock_delay: int = 10,
     ) -> None:
         self.grid = grid
         self.inventory = inventory
-        self.agent = agent
+        self.agents = agents
         self.order_queue: deque[Order] = deque()
         self.batch_queue: deque[BatchedOrder] = deque()
         self.completed_metrics: list[OrderMetrics] = []
         self.current_tick: int = 0
-        self._active_batch: BatchedOrder | None = None
-        self._order_start_tick: int = 0
-        self._order_start_distance: int = 0
 
-        # Restock queue (1b)
+        # Per-agent batch tracking
+        self._agent_batch: dict[str, BatchedOrder | None] = {a.agent_id: None for a in agents}
+        self._agent_start_tick: dict[str, int] = {a.agent_id: 0 for a in agents}
+        self._agent_start_dist: dict[str, int] = {a.agent_id: 0 for a in agents}
+
+        # Pack station contention
+        self.station_busy: bool = False
+
+        # Restock queue
         self.restock_delay = restock_delay
         self.restock_queue: list[RestockJob] = []
         self.stockout_count: int = 0
 
-        # Metrics tracking (1c)
+        # Metrics tracking
         self.idle_ticks: int = 0
         self._order_enqueue_tick: dict[str, int] = {}
         self._order_wait_ticks: dict[str, int] = {}
 
+    # ------------------------------------------------------------------
+    # Backward-compat properties (single-agent callers)
+    # ------------------------------------------------------------------
+
+    @property
+    def agent(self) -> PickAgent:
+        return self.agents[0]
+
+    @property
+    def _active_batch(self) -> BatchedOrder | None:
+        return self._agent_batch.get(self.agents[0].agent_id)
+
     @property
     def _active_order(self) -> Order | None:
-        """Compat shim for server.py which reads sim._active_order directly."""
-        if self._active_batch is None:
+        batch = self._active_batch
+        if batch is None:
             return None
-        return self._active_batch.orders[0] if self._active_batch.orders else None
+        return batch.orders[0] if batch.orders else None
+
+    # ------------------------------------------------------------------
+    # Queue management
+    # ------------------------------------------------------------------
 
     def enqueue_order(self, order: Order) -> None:
         self.order_queue.append(order)
@@ -81,11 +102,90 @@ class Simulation:
         for order in batch.orders:
             self._order_enqueue_tick[order.order_id] = self.current_tick
 
+    # ------------------------------------------------------------------
+    # Per-agent dispatch and deposit helpers
+    # ------------------------------------------------------------------
+
+    def _dispatch_agent(self, agent: PickAgent, occupied: set[tuple[int, int]]) -> bool:
+        """Try to assign the next available batch or order to an idle agent.
+        Returns True if something was dispatched."""
+        # batch_queue: peek without removing; defer if stock insufficient
+        if self.batch_queue:
+            front = self.batch_queue[0]
+            needed = Counter(front.unified_item_ids)
+            if all(self.inventory.stock_level(iid) >= cnt for iid, cnt in needed.items()):
+                self.batch_queue.popleft()
+                for order in front.orders:
+                    wait = self.current_tick - self._order_enqueue_tick.get(
+                        order.order_id, self.current_tick
+                    )
+                    self._order_wait_ticks[order.order_id] = wait
+                self._agent_batch[agent.agent_id] = front
+                self._agent_start_tick[agent.agent_id] = self.current_tick
+                self._agent_start_dist[agent.agent_id] = agent.total_distance
+                agent.assign_batch(front, self.inventory, self.grid.pack_station_pos, occupied)
+                return True
+
+        # order_queue: try each once; defer unavailable ones to the back
+        queue_size = len(self.order_queue)
+        skipped = 0
+        while self.order_queue and skipped < queue_size:
+            order = self.order_queue.popleft()
+            needed = Counter(order.item_ids)
+            if not all(self.inventory.stock_level(iid) >= cnt for iid, cnt in needed.items()):
+                self.order_queue.append(order)
+                skipped += 1
+                continue
+            wait = self.current_tick - self._order_enqueue_tick.get(
+                order.order_id, self.current_tick
+            )
+            self._order_wait_ticks[order.order_id] = wait
+            batch = BatchedOrder(
+                batch_id=order.order_id,
+                orders=[order],
+                unified_item_ids=list(order.item_ids),
+                item_to_order=[order.order_id for _ in order.item_ids],
+            )
+            self._agent_batch[agent.agent_id] = batch
+            self._agent_start_tick[agent.agent_id] = self.current_tick
+            self._agent_start_dist[agent.agent_id] = agent.total_distance
+            agent.assign_batch(batch, self.inventory, self.grid.pack_station_pos, occupied)
+            return True
+
+        return False
+
+    def _do_deposit(self, agent: PickAgent) -> None:
+        """Execute deposit for an agent that has arrived at the pack station."""
+        deposited, order_breakdown = agent.execute_deposit()
+        batch = self._agent_batch[agent.agent_id]
+        assert batch is not None
+        batch_distance = agent.total_distance - self._agent_start_dist[agent.agent_id]
+        batch_ticks = self.current_tick - self._agent_start_tick[agent.agent_id]
+        for oid, item_ids in order_breakdown.items():
+            self.completed_metrics.append(OrderMetrics(
+                order_id=oid,
+                items_picked=len(item_ids),
+                distance_traveled=batch_distance,
+                ticks_taken=batch_ticks,
+                completed_at_tick=self.current_tick,
+                wait_ticks=self._order_wait_ticks.pop(oid, 0),
+            ))
+            self._order_enqueue_tick.pop(oid, None)
+        self._agent_batch[agent.agent_id] = None
+        for item in deposited:
+            self.restock_queue.append(RestockJob(
+                item_id=item.item_id,
+                item=item,
+                ready_at_tick=self.current_tick + self.restock_delay,
+            ))
+
+    # ------------------------------------------------------------------
+    # Main simulation loop
+    # ------------------------------------------------------------------
+
     def step(self) -> bool:
         """Advance simulation by one tick. Returns True while work remains."""
-        agent = self.agent
-
-        # Process restock queue — release items whose delay has elapsed
+        # 1. Process restock queue
         due, self.restock_queue = (
             [j for j in self.restock_queue if j.ready_at_tick <= self.current_tick],
             [j for j in self.restock_queue if j.ready_at_tick > self.current_tick],
@@ -93,92 +193,52 @@ class Simulation:
         for job in due:
             self.inventory.restock(job.item)
 
-        # Dispatch next work when idle
-        if agent.state == AgentState.IDLE:
-            dispatched = False
+        # 2. Reset station contention flag for this tick
+        self.station_busy = False
 
-            # batch_queue takes priority — peek without removing; defer if stock insufficient
-            if self.batch_queue:
-                front = self.batch_queue[0]
-                needed = Counter(front.unified_item_ids)
-                if all(self.inventory.stock_level(iid) >= cnt for iid, cnt in needed.items()):
-                    self.batch_queue.popleft()
-                    for order in front.orders:
-                        wait = self.current_tick - self._order_enqueue_tick.get(
-                            order.order_id, self.current_tick
-                        )
-                        self._order_wait_ticks[order.order_id] = wait
-                    self._active_batch = front
-                    self._order_start_tick = self.current_tick
-                    self._order_start_distance = agent.total_distance
-                    agent.assign_batch(front, self.inventory, self.grid.pack_station_pos)
-                    dispatched = True
+        # 3. Dispatch idle agents serially (serial order = implicit order lock)
+        occupied = {a.pos for a in self.agents}
+        for agent in self.agents:
+            if agent.state == AgentState.IDLE:
+                self._dispatch_agent(agent, occupied)
 
-            # Fall back to order_queue — try each order once; defer unavailable ones to the back
-            if not dispatched:
-                queue_size = len(self.order_queue)
-                skipped = 0
-                while self.order_queue and skipped < queue_size:
-                    order = self.order_queue.popleft()
-                    needed = Counter(order.item_ids)
-                    if not all(self.inventory.stock_level(iid) >= cnt for iid, cnt in needed.items()):
-                        self.order_queue.append(order)
-                        skipped += 1
-                        continue
-                    wait = self.current_tick - self._order_enqueue_tick.get(
-                        order.order_id, self.current_tick
-                    )
-                    self._order_wait_ticks[order.order_id] = wait
-                    batch = BatchedOrder(
-                        batch_id=order.order_id,
-                        orders=[order],
-                        unified_item_ids=list(order.item_ids),
-                        item_to_order=[order.order_id for _ in order.item_ids],
-                    )
-                    self._active_batch = batch
-                    self._order_start_tick = self.current_tick
-                    self._order_start_distance = agent.total_distance
-                    agent.assign_batch(batch, self.inventory, self.grid.pack_station_pos)
-                    dispatched = True
-                    break
+        # 4. Move each active agent and handle arrivals.
+        # Recompute occupied before each agent so moves earlier in the loop
+        # are visible to agents later in the loop — prevents two agents
+        # stepping onto the same cell in the same tick.
+        # IDLE agents are excluded: they sit at the pack station and must not
+        # block a moving agent from arriving there to deposit.
+        for idx, agent in enumerate(self.agents):
+            if agent.state == AgentState.IDLE:
+                continue
 
-            if not dispatched:
-                has_pending = bool(self.restock_queue or self.order_queue or self.batch_queue)
-                if not has_pending:
-                    return False
-                # Waiting for items to restock; agent idles this tick
-                self.idle_ticks += 1
-                self.current_tick += 1
-                return True
+            occupied = {a.pos for a in self.agents if a.state != AgentState.IDLE}
+            result = agent.step(occupied - {agent.pos})
 
-        # Move agent one step
-        arrived = not agent.step()  # step() returns False when path exhausted
+            if result == StepResult.WAITING:
+                # Stagger replan threshold by agent index so lower-priority agents
+                # yield first, preventing simultaneous replans that cause new deadlocks.
+                threshold = 3 + 2 * idx
+                if agent._wait_count >= threshold:
+                    agent.replan(occupied - {agent.pos})
+            elif result == StepResult.ARRIVED:
+                if agent.state == AgentState.MOVING_TO_RACK:
+                    agent.execute_pick(self.inventory)
+                elif agent.state == AgentState.MOVING_TO_STATION:
+                    if self.station_busy:
+                        pass  # hold in MOVING_TO_STATION; retry next tick
+                    else:
+                        self.station_busy = True
+                        self._do_deposit(agent)
 
-        # Handle arrival
-        if arrived:
-            if agent.state == AgentState.MOVING_TO_RACK:
-                agent.execute_pick(self.inventory)
-            elif agent.state == AgentState.MOVING_TO_STATION:
-                deposited, order_breakdown = agent.execute_deposit()
-                assert self._active_batch is not None
-                batch_distance = agent.total_distance - self._order_start_distance
-                batch_ticks = self.current_tick - self._order_start_tick
-                for oid, item_ids in order_breakdown.items():
-                    self.completed_metrics.append(OrderMetrics(
-                        order_id=oid,
-                        items_picked=len(item_ids),
-                        distance_traveled=batch_distance,
-                        ticks_taken=batch_ticks,
-                        completed_at_tick=self.current_tick,
-                        wait_ticks=self._order_wait_ticks.get(oid, 0),
-                    ))
-                self._active_batch = None
-                for item in deposited:
-                    self.restock_queue.append(RestockJob(
-                        item_id=item.item_id,
-                        item=item,
-                        ready_at_tick=self.current_tick + self.restock_delay,
-                    ))
+        # 5. Termination and idle tracking
+        all_idle = all(a.state == AgentState.IDLE for a in self.agents)
+        has_pending = bool(self.restock_queue or self.order_queue or self.batch_queue)
+
+        if all_idle:
+            if not has_pending:
+                return False
+            self.idle_ticks += 1
 
         self.current_tick += 1
         return True

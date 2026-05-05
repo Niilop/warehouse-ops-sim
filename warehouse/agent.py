@@ -13,6 +13,12 @@ class AgentState(Enum):
     MOVING_TO_STATION = "moving_to_station"
 
 
+class StepResult(Enum):
+    MOVED = "moved"
+    WAITING = "waiting"   # next cell occupied; stays in place
+    ARRIVED = "arrived"   # path exhausted
+
+
 class PickAgent:
     def __init__(self, agent_id: str, start_pos: tuple[int, int], grid: WarehouseGrid) -> None:
         self.agent_id = agent_id
@@ -27,18 +33,23 @@ class PickAgent:
         self._carried_order_ids: list[str] = []
         self._pack_pos: tuple[int, int] = start_pos
         self._batch: BatchedOrder | None = None
+        self._wait_count: int = 0  # consecutive ticks blocked by another agent
 
     # ------------------------------------------------------------------
     # Pathfinding
     # ------------------------------------------------------------------
 
-    def find_path(self, goal: tuple[int, int]) -> list[tuple[int, int]]:
-        """A* returning list of positions from current pos to goal (exclusive of start)."""
+    def find_path(
+        self,
+        goal: tuple[int, int],
+        occupied_cells: set[tuple[int, int]] | None = None,
+    ) -> list[tuple[int, int]]:
+        """A* returning list of positions from current pos to goal (exclusive of start).
+        occupied_cells: positions to treat as blocked during planning."""
         start = self.pos
         if start == goal:
             return []
 
-        # heap: (f, g, pos, path)
         open_heap: list[tuple[int, int, tuple[int, int], list[tuple[int, int]]]] = []
         heapq.heappush(open_heap, (self._h(start, goal), 0, start, []))
         visited: set[tuple[int, int]] = set()
@@ -56,9 +67,14 @@ class PickAgent:
             for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 nr, nc = pos[0] + dr, pos[1] + dc
                 neighbor = (nr, nc)
-                if neighbor not in visited and self.grid.is_walkable(nr, nc):
-                    ng = g + 1
-                    heapq.heappush(open_heap, (ng + self._h(neighbor, goal), ng, neighbor, new_path))
+                if neighbor in visited:
+                    continue
+                if not self.grid.is_walkable(nr, nc):
+                    continue
+                if occupied_cells and neighbor in occupied_cells:
+                    continue
+                ng = g + 1
+                heapq.heappush(open_heap, (ng + self._h(neighbor, goal), ng, neighbor, new_path))
 
         return []  # no path found
 
@@ -70,19 +86,31 @@ class PickAgent:
     # Movement
     # ------------------------------------------------------------------
 
-    def step(self) -> bool:
-        """Advance one cell along _path. Returns True if moved, False if arrived."""
+    def step(self, occupied_cells: set[tuple[int, int]] | None = None) -> StepResult:
+        """Advance one cell along _path. Returns StepResult."""
         if not self._path:
-            return False
+            self._wait_count = 0
+            return StepResult.ARRIVED
+        next_cell = self._path[0]
+        if occupied_cells and next_cell in occupied_cells:
+            self._wait_count += 1
+            return StepResult.WAITING
+        self._wait_count = 0
         self.pos = self._path.pop(0)
         self.total_distance += 1
-        return True
+        return StepResult.MOVED
 
     # ------------------------------------------------------------------
     # Order execution
     # ------------------------------------------------------------------
 
-    def assign_batch(self, batch: BatchedOrder, inventory: Inventory, pack_pos: tuple[int, int]) -> None:
+    def assign_batch(
+        self,
+        batch: BatchedOrder,
+        inventory: Inventory,
+        pack_pos: tuple[int, int],
+        occupied_cells: set[tuple[int, int]] | None = None,
+    ) -> None:
         self._pack_pos = pack_pos
         self._batch = batch
 
@@ -102,6 +130,9 @@ class PickAgent:
             current = chosen[0]
 
         self._task_queue = ordered
+        # Path planning ignores other agents — step-level blocking handles collisions.
+        # Passing occupied_cells to A* can produce empty paths when all routes are
+        # temporarily blocked, causing agents to falsely "arrive" at wrong positions.
         self._advance_to_next_task()
 
     def assign_order(self, order: Order, inventory: Inventory, pack_pos: tuple[int, int]) -> None:
@@ -116,14 +147,33 @@ class PickAgent:
             pack_pos,
         )
 
-    def _advance_to_next_task(self) -> None:
+    def _advance_to_next_task(
+        self, occupied_cells: set[tuple[int, int]] | None = None
+    ) -> None:
         if self._task_queue:
             next_stand, _, _ = self._task_queue[0]
-            self._path = self.find_path(next_stand)
+            self._path = self.find_path(next_stand, occupied_cells)
             self.state = AgentState.MOVING_TO_RACK
         else:
-            self._path = self.find_path(self._pack_pos)
+            self._path = self.find_path(self._pack_pos, occupied_cells)
             self.state = AgentState.MOVING_TO_STATION
+
+    def replan(self, occupied_cells: set[tuple[int, int]] | None = None) -> None:
+        """Replan path to current target. Tries to route around occupied cells;
+        falls back to a free path if no detour exists."""
+        if self._task_queue:
+            goal, _, _ = self._task_queue[0]
+        elif self.state == AgentState.MOVING_TO_STATION:
+            goal = self._pack_pos
+        else:
+            return
+        if self.pos == goal:
+            self._path = []
+            return
+        new_path = self.find_path(goal, occupied_cells)
+        if not new_path:
+            new_path = self.find_path(goal)
+        self._path = new_path
 
     def execute_pick(self, inventory: Inventory) -> Item | None:
         """Called when agent arrives at a rack stand_pos. Picks item, advances queue."""

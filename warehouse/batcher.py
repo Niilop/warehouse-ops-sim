@@ -19,6 +19,8 @@ class BatchStrategy(Protocol):
 
 
 def _make_batch(orders: list[Order]) -> BatchedOrder:
+    if not orders:
+        raise ValueError("Cannot create a batch from an empty order list")
     batch_id = orders[0].order_id if len(orders) == 1 else f"B-{orders[0].order_id}"
     unified: list[str] = []
     item_to_order: list[str] = []

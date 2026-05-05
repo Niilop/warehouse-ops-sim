@@ -24,13 +24,13 @@ class WarehouseGrid:
     def _fill_rack_bands(g: np.ndarray, row_start: int, row_end: int,
                          col_start: int, col_end: int) -> None:
         """Fill alternating 2-wide RACK bands within a rectangular region (exclusive end).
-        Bands are separated by 2-cell aisles to allow congestion modelling."""
-        col = col_start + 1
-        while col + 1 < col_end - 1:
-            for r in range(row_start + 1, row_end - 1):
+        2-cell outer walls on all sides; 3-cell corridors between bands so agents can pass."""
+        col = col_start + 2
+        while col + 1 < col_end - 2:
+            for r in range(row_start + 2, row_end - 2):
                 g[r, col] = CellType.RACK
                 g[r, col + 1] = CellType.RACK
-            col += 4
+            col += 5  # 2 rack + 3 corridor
 
     @staticmethod
     def _assign_zones(
@@ -75,14 +75,14 @@ class WarehouseGrid:
         }
 
     @staticmethod
-    def build_default(rows: int = 12, cols: int = 24) -> "WarehouseGrid":
+    def build_default(rows: int = 14, cols: int = 26) -> "WarehouseGrid":
         """
         Symmetrical standard layout:
           - All cells start as AISLE
-          - Alternating 2-wide RACK bands separated by 2-col aisles
-          - Outer rows and cols remain AISLE (corridors on all four sides)
+          - 2-wide RACK bands separated by 3-cell corridors (wide enough for agents to pass)
+          - 2-cell outer wall on all four sides
           - Pack station at bottom-left (rows-1, 0)
-        cols=24 gives 6 rack bands with 2-cell aisles between them.
+        cols=26 gives 5 rack bands; rows=14 gives 10 pick rows.
         """
         g = np.full((rows, cols), CellType.AISLE, dtype=np.uint8)
         WarehouseGrid._fill_rack_bands(g, 0, rows, 0, cols)
@@ -93,7 +93,7 @@ class WarehouseGrid:
                              pack_station_pos=pack_pos, zone_map=zone_map)
 
     @staticmethod
-    def build_quad(unit_rows: int = 12, unit_cols: int = 24) -> "WarehouseGrid":
+    def build_quad(unit_rows: int = 14, unit_cols: int = 26) -> "WarehouseGrid":
         """
         Four default layouts arranged in a 2×2 grid.
         Total size: (2*unit_rows) × (2*unit_cols).

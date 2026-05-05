@@ -30,11 +30,11 @@ def orders(items, n=8, per_order=4, seed=42):
     return generate_orders(items, n_orders=n, items_per_order=per_order, seed=seed)
 
 
-def run_sim(grid, items, orders, strategy="none", batch_size=2, restock_delay=0):
+def run_sim(grid, items, orders, strategy="none", batch_size=2, restock_delay=0, n_agents=1):
     inventory = Inventory(grid)
     inventory.seed(items)
-    agent = PickAgent("A1", grid.pack_station_pos, grid)
-    sim = Simulation(grid, inventory, agent, restock_delay=restock_delay)
+    agents = [PickAgent(f"A{i+1}", grid.pack_station_pos, grid) for i in range(n_agents)]
+    sim = Simulation(grid, inventory, agents, restock_delay=restock_delay)
 
     if strategy == "zone":
         for b in ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders):
@@ -216,6 +216,102 @@ def test_summary_totals_consistent():
     assert s.total_distance == sum(m.distance_traveled for m in sim.completed_metrics)
 
 
+# ── multi-agent ───────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("n_agents,n_orders", [(2, 10), (3, 15), (4, 20)])
+def test_multi_agent_all_orders_complete(n_agents, n_orders):
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=n_orders), n_agents=n_agents)
+    assert len(sim.completed_metrics) == n_orders, \
+        f"{n_agents} agents: {len(sim.completed_metrics)} metrics for {n_orders} orders"
+
+
+@pytest.mark.parametrize("n_agents", [2, 3, 4])
+def test_multi_agent_no_position_collision(n_agents):
+    """No two agents share the same cell in any tick."""
+    items = catalog()
+    os = orders(items, n=12)
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    from warehouse.agent import PickAgent
+    from warehouse.simulation import Simulation
+    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(n_agents)]
+    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0)
+    for o in os:
+        sim.enqueue_order(o)
+    pack_pos = DEFAULT.pack_station_pos
+    while sim.current_tick < 10_000:
+        positions = [a.pos for a in sim.agents if a.pos != pack_pos]
+        assert len(positions) == len(set(positions)), \
+            f"Tick {sim.current_tick}: collision outside pack station {[a.pos for a in sim.agents]}"
+        if not sim.step():
+            break
+
+
+@pytest.mark.parametrize("n_agents,batch_size,strategy", [
+    (2, 1, "none"),
+    (4, 1, "none"),
+    (2, 2, "tsp"),
+    (3, 2, "zone"),
+])
+def test_multi_agent_no_simultaneous_deposit(n_agents, batch_size, strategy):
+    """station_busy flag: at most one agent deposits per tick regardless of strategy."""
+    items = catalog()
+    os = orders(items, n=12)
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(n_agents)]
+    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0)
+
+    if strategy == "tsp":
+        for b in GreedyTSPBatcher(inventory, DEFAULT, max_batch_size=batch_size).batch(os):
+            sim.enqueue_batch(b)
+    elif strategy == "zone":
+        for b in ZoneBatcher(DEFAULT, inventory, max_batch_size=batch_size).batch(os):
+            sim.enqueue_batch(b)
+    else:
+        for o in os:
+            sim.enqueue_order(o)
+
+    depositing_agents_per_tick = []
+    prev_count = 0
+    while sim.current_tick < 10_000:
+        if not sim.step():
+            break
+        new_completions = len(sim.completed_metrics) - prev_count
+        if new_completions > 0:
+            # Count how many distinct agents just finished (station_busy allows max 1)
+            depositing_agents_per_tick.append(new_completions)
+        prev_count = len(sim.completed_metrics)
+
+    # Each deposit event may complete multiple orders (one per order in a batch),
+    # but only one agent may deposit per tick — so the max orders completed in
+    # a single tick is bounded by the largest batch size used.
+    assert all(d <= batch_size for d in depositing_agents_per_tick), \
+        f"A tick completed more orders than one batch allows: {depositing_agents_per_tick}"
+
+
+@pytest.mark.parametrize("n_agents", [2, 3])
+def test_multi_agent_total_items_correct(n_agents):
+    n_orders, per_order = 12, 4
+    items = catalog()
+    os = orders(items, n=n_orders, per_order=per_order)
+    sim = run_sim(DEFAULT, items, os, n_agents=n_agents)
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order, \
+        f"{n_agents} agents: total items {total} != {n_orders * per_order}"
+
+
+def test_multi_agent_faster_than_single():
+    """Two agents should complete the same orders in fewer ticks than one."""
+    items = catalog()
+    os = orders(items, n=20)
+    sim1 = run_sim(DEFAULT, items, os, n_agents=1)
+    sim2 = run_sim(DEFAULT, items, os, n_agents=2)
+    assert sim2.current_tick < sim1.current_tick, \
+        f"2 agents ({sim2.current_tick} ticks) not faster than 1 ({sim1.current_tick} ticks)"
+
+
 # ── server WebSocket messages ─────────────────────────────────────────────────
 
 @pytest.mark.parametrize("strategy,batch_size", [
@@ -264,3 +360,142 @@ def test_server_tick_has_active_batch(strategy):
     ticks = [m for m in msgs if m["type"] == "tick"]
     assert ticks, "No tick messages received"
     assert all("active_batch" in t for t in ticks), "Some tick frames missing active_batch key"
+
+
+def test_server_tick_agents_array_shape():
+    """Tick messages must include an 'agents' array with correct per-agent keys."""
+    msgs = run_server(n_orders=4)
+    ticks = [m for m in msgs if m["type"] == "tick"]
+    assert ticks
+    required_keys = {"id", "row", "col", "state", "carrying", "active_batch"}
+    for t in ticks:
+        assert "agents" in t, "tick missing 'agents' key"
+        assert isinstance(t["agents"], list) and len(t["agents"]) >= 1
+        for a in t["agents"]:
+            missing = required_keys - a.keys()
+            assert not missing, f"agent entry missing keys {missing}"
+
+
+# ── restock ───────────────────────────────────────────────────────────────────
+
+def test_restock_delay_orders_complete():
+    """Orders blocked by stockout still complete once items are restocked."""
+    items = catalog(n_items=10, n_families=2, seed=7)
+    # Use more orders than stock can serve at once; restock_delay ensures
+    # the queue has to wait for replenishment.
+    os = orders(items, n=15, per_order=3, seed=7)
+    sim = run_sim(DEFAULT, items, os, restock_delay=5)
+    assert len(sim.completed_metrics) == 15, \
+        f"Expected 15 completed orders, got {len(sim.completed_metrics)}"
+
+
+def test_restock_delay_slows_throughput():
+    """A positive restock_delay should cause more ticks than delay=0 when stock is exhausted."""
+    items = catalog(n_items=10, n_families=2, seed=7)
+    os = orders(items, n=15, per_order=3, seed=7)
+
+    sim_fast = run_sim(DEFAULT, items, os, restock_delay=0)
+    sim_slow = run_sim(DEFAULT, items, os, restock_delay=30)
+
+    assert sim_slow.current_tick >= sim_fast.current_tick, (
+        f"restock_delay=30 finished in {sim_slow.current_tick} ticks, "
+        f"faster than delay=0 ({sim_fast.current_tick} ticks)"
+    )
+
+
+def test_restock_items_return_to_stock_after_deposit():
+    """After an agent deposits items, those items re-enter inventory after restock_delay ticks."""
+    items = catalog(n_items=10, n_families=2, seed=7)
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items, initial_stock=1)
+    restock_delay = 20
+
+    agent = PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)
+    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=restock_delay)
+
+    # One order per item so every slot gets drained exactly once
+    from warehouse.inventory import Order
+    first_order = orders(items, n=1, per_order=4, seed=7)[0]
+    sim.enqueue_order(first_order)
+
+    # Run until the first order completes (items deposited → restock queue populated)
+    while sim.current_tick < 10_000 and not sim.completed_metrics:
+        sim.step()
+
+    assert sim.completed_metrics, "First order never completed"
+    deposit_tick = sim.completed_metrics[0].completed_at_tick
+
+    # Immediately after deposit, picked items must be unavailable
+    for iid in first_order.item_ids:
+        assert inventory.stock_level(iid) == 0, \
+            f"Item {iid} already restocked before delay (tick {sim.current_tick})"
+
+    # Run until the restock delay has elapsed from the deposit tick
+    target_tick = deposit_tick + restock_delay + 1
+    while sim.current_tick < target_tick:
+        if not sim.step():
+            break
+
+    # Items should now be back in stock
+    for iid in first_order.item_ids:
+        assert inventory.stock_level(iid) > 0, \
+            f"Item {iid} not restocked after delay (tick {sim.current_tick}, deposit at {deposit_tick})"
+
+
+# ── multi-agent + batch strategies ───────────────────────────────────────────
+
+@pytest.mark.parametrize("strategy,batch_size,n_agents", [
+    ("zone", 2, 2),
+    ("zone", 3, 3),
+    ("tsp",  2, 2),
+    ("tsp",  3, 3),
+    ("tsp",  2, 4),
+])
+def test_multi_agent_batch_all_orders_complete(strategy, batch_size, n_agents):
+    n_orders, per_order = 12, 4
+    items = catalog()
+    os = orders(items, n=n_orders, per_order=per_order)
+    sim = run_sim(DEFAULT, items, os, strategy=strategy, batch_size=batch_size, n_agents=n_agents)
+    assert len(sim.completed_metrics) == n_orders, (
+        f"strategy={strategy} bs={batch_size} agents={n_agents}: "
+        f"{len(sim.completed_metrics)} metrics for {n_orders} orders"
+    )
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order, (
+        f"strategy={strategy} bs={batch_size} agents={n_agents}: "
+        f"total items {total} != {n_orders * per_order}"
+    )
+
+
+@pytest.mark.parametrize("n_agents", [2, 3])
+def test_multi_agent_summary_totals_consistent(n_agents):
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=12), n_agents=n_agents)
+    s = sim.get_summary()
+    assert s.total_orders == len(sim.completed_metrics)
+    assert s.total_items == sum(m.items_picked for m in sim.completed_metrics)
+    assert s.total_distance == sum(m.distance_traveled for m in sim.completed_metrics)
+    assert s.idle_ticks >= 0
+    assert s.idle_ticks <= s.total_ticks
+
+
+# ── wait ticks ────────────────────────────────────────────────────────────────
+
+def test_wait_ticks_nonzero_when_queue_backpressure():
+    """Orders that sit in queue behind a stockout should accumulate wait_ticks > 0."""
+    items = catalog(n_items=5, n_families=1, seed=3)
+    inventory = Inventory(DEFAULT)
+    # seed with stock=1 so each pick drains the slot; restock_delay creates a wait
+    inventory.seed(items, initial_stock=1)
+
+    agent = PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)
+    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=20)
+
+    os = orders(items, n=8, per_order=2, seed=3)
+    for o in os:
+        sim.enqueue_order(o)
+    sim.run(max_ticks=50_000)
+
+    wait_values = [m.wait_ticks for m in sim.completed_metrics]
+    assert any(w > 0 for w in wait_values), \
+        f"Expected some orders to have wait_ticks > 0; got {wait_values}"
