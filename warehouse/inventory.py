@@ -9,7 +9,7 @@ class Item:
     item_id: str
     name: str
     weight: float = 1.0
-    demand_weight: float = 1.0  # relative pick frequency; higher = ordered more often
+    pick_rate: float = 1.0  # normalized pick frequency (0–1); higher = ordered more often
     family: str = "default"     # product family; items in same family co-occur in orders
 
 

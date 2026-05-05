@@ -34,39 +34,39 @@
 ```javascript
 "use strict";
 
-const API_BASE = "http://localhost:8000"; // prefix all fetch calls — swap for Tauri sidecar later
+const API_BASE = "http://localhost:8000";
 
-// CellType values (mirror warehouse/grid.py CellType enum)
 const CT = { EMPTY: 0, RACK: 1, AISLE: 2, PACK: 3 };
 const CELL_CLASS = { 0: "cell-empty", 1: "cell-rack", 2: "cell-aisle", 3: "cell-pack" };
 
+// Canvas cell colors (sim viewer)
+const CANVAS_COLORS   = { 0: "#2a2a2a", 1: "#b06010", 2: "#181818", 3: "#276027" };
+const AGENT_IDLE      = ["#1a6fb5", "#a04000", "#1a7a5a", "#6a2090"];
+const AGENT_CARRY     = ["#4a9fd4", "#f07020", "#30c890", "#b060e0"];
+
 // ─────────────────────────────────────────────────────────────────
-// GridEditor — manages the drawable editor table
+// GridEditor — drawable editor table
 // ─────────────────────────────────────────────────────────────────
 class GridEditor {
   constructor(tableEl) {
     this.tableEl = tableEl;
-    this.rows = 0;
-    this.cols = 0;
-    this.cells = [];      // 2D array of CellType int
+    this.rows = 0; this.cols = 0;
+    this.cells = [];
     this.brush = CT.RACK;
     this.painting = false;
-    this.packPos = null;  // [row, col] of current PACK_STATION, enforces exactly one
-
+    this.packPos = null;
     document.addEventListener("mouseup", () => { this.painting = false; });
   }
 
   build(rows, cols) {
-    this.rows = rows;
-    this.cols = cols;
+    this.rows = rows; this.cols = cols;
     this.cells = Array.from({ length: rows }, () => new Array(cols).fill(CT.AISLE));
     this.packPos = null;
     this._render();
   }
 
   loadFromDict(dict) {
-    this.rows = dict.rows;
-    this.cols = dict.cols;
+    this.rows = dict.rows; this.cols = dict.cols;
     this.cells = dict.grid.map(row => [...row]);
     this.packPos = dict.pack_station_pos ? [...dict.pack_station_pos] : null;
     this._render();
@@ -74,21 +74,16 @@ class GridEditor {
 
   toDict() {
     return {
-      rows: this.rows,
-      cols: this.cols,
+      rows: this.rows, cols: this.cols,
       grid: this.cells.map(row => [...row]),
       pack_station_pos: this.packPos ? [...this.packPos] : [0, 0],
     };
   }
 
-  setBrush(type) {
-    this.brush = type;
-  }
+  setBrush(type) { this.brush = type; }
 
   setCellType(row, col, type) {
     if (row < 0 || row >= this.rows || col < 0 || col >= this.cols) return;
-
-    // Enforce single pack station
     if (type === CT.PACK) {
       if (this.packPos) {
         const [pr, pc] = this.packPos;
@@ -99,16 +94,14 @@ class GridEditor {
     } else if (this.packPos && this.packPos[0] === row && this.packPos[1] === col) {
       this.packPos = null;
     }
-
     this.cells[row][col] = type;
     this._updateTd(row, col);
   }
 
   validateLocal() {
     const errors = [];
-    if (!this.packPos) errors.push("Place exactly one Pack Station on the grid.");
-    const rackCount = this.cells.flat().filter(c => c === CT.RACK).length;
-    if (rackCount === 0) errors.push("Add at least one Rack cell.");
+    if (!this.packPos) errors.push("Place exactly one Pack Station.");
+    if (!this.cells.flat().some(c => c === CT.RACK)) errors.push("Add at least one Rack cell.");
     return errors.length ? errors : null;
   }
 
@@ -118,17 +111,10 @@ class GridEditor {
       const tr = document.createElement("tr");
       for (let c = 0; c < this.cols; c++) {
         const td = document.createElement("td");
-        td.dataset.row = r;
-        td.dataset.col = c;
+        td.dataset.row = r; td.dataset.col = c;
         td.className = CELL_CLASS[this.cells[r][c]];
-        td.addEventListener("mousedown", (e) => {
-          e.preventDefault();
-          this.painting = true;
-          this.setCellType(r, c, this.brush);
-        });
-        td.addEventListener("mouseenter", () => {
-          if (this.painting) this.setCellType(r, c, this.brush);
-        });
+        td.addEventListener("mousedown", (e) => { e.preventDefault(); this.painting = true; this.setCellType(r, c, this.brush); });
+        td.addEventListener("mouseenter", () => { if (this.painting) this.setCellType(r, c, this.brush); });
         tr.appendChild(td);
       }
       this.tableEl.appendChild(tr);
@@ -142,59 +128,140 @@ class GridEditor {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// SimulationViewer — read-only grid with agent overlay
+// SimulationViewer — canvas-based with zoom + auto-fit
 // ─────────────────────────────────────────────────────────────────
 class SimulationViewer {
-  constructor(tableEl) {
-    this.tableEl = tableEl;
-    this.rows = 0;
-    this.cols = 0;
-    this.agentRow = -1;
-    this.agentCol = -1;
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.dict = null;
+    this.agents = [];
+    this._zoom = 1.0;
+
+    // Wheel zoom — zoom toward cursor
+    canvas.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      this._zoom = Math.max(0.1, Math.min(12, this._zoom * factor));
+      this._draw();
+    }, { passive: false });
+
+    // Resize observer keeps canvas pixel-perfect
+    const ro = new ResizeObserver(() => { this._syncSize(); this._draw(); });
+    ro.observe(canvas.parentElement);
+    this._syncSize();
   }
 
-  build(dict) {
-    this.rows = dict.rows;
-    this.cols = dict.cols;
-    this.agentRow = -1;
-    this.agentCol = -1;
-    this.tableEl.innerHTML = "";
-    for (let r = 0; r < this.rows; r++) {
-      const tr = document.createElement("tr");
-      for (let c = 0; c < this.cols; c++) {
-        const td = document.createElement("td");
-        td.className = CELL_CLASS[dict.grid[r][c]];
-        tr.appendChild(td);
-      }
-      this.tableEl.appendChild(tr);
-    }
+  // ── Public API ──────────────────────────────────────
+
+  build(dict, resetZoom = true) {
+    this.dict = dict;
+    this.agents = [];
+    if (resetZoom) this._zoom = 0.78;
+    this._draw();
   }
 
   applyTick(frame) {
-    const { row, col, state, carrying } = frame.agent;
+    this.agents = frame.agents ||
+      [{ ...frame.agent, id: "A1", active_batch: frame.active_batch }];
+    this._draw();
+    this._updateHUD(frame);
+  }
 
-    // Clear previous agent cell
-    if (this.agentRow >= 0) {
-      const prev = this.tableEl.rows[this.agentRow]?.cells[this.agentCol];
-      if (prev) {
-        prev.classList.remove("cell-agent", "cell-agent-carry");
+  resetZoom() { this._zoom = 0.78; this._draw(); }
+  zoomBy(f)   { this._zoom = Math.max(0.1, Math.min(12, this._zoom * f)); this._draw(); }
+
+  // ── Internal ────────────────────────────────────────
+
+  _syncSize() {
+    const dpr = window.devicePixelRatio || 1;
+    const el  = this.canvas.parentElement;
+    const w   = el.clientWidth;
+    const h   = el.clientHeight;
+    this.canvas.width  = w * dpr;
+    this.canvas.height = h * dpr;
+    this.canvas.style.width  = w + "px";
+    this.canvas.style.height = h + "px";
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  _logical() {
+    const dpr = window.devicePixelRatio || 1;
+    return { w: this.canvas.width / dpr, h: this.canvas.height / dpr };
+  }
+
+  _layout() {
+    const { w, h } = this._logical();
+    const padX = Math.max(48, w * 0.08);
+    const padY = Math.max(48, h * 0.08);
+    const base = Math.min(
+      (w - padX * 2) / this.dict.cols,
+      (h - padY * 2) / this.dict.rows
+    );
+    const cs = base * this._zoom;
+    const ox = (w - this.dict.cols * cs) / 2;
+    const oy = (h - this.dict.rows * cs) / 2;
+    return { cs, ox, oy };
+  }
+
+  _draw() {
+    const ctx = this.ctx;
+    const { w, h } = this._logical();
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+
+    if (!this.dict) return;
+
+    const { cs, ox, oy } = this._layout();
+    const { rows, cols, grid } = this.dict;
+    const gap = cs > 3 ? 1 : 0;
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        ctx.fillStyle = CANVAS_COLORS[grid[r][c]] || "#000";
+        ctx.fillRect(ox + c * cs + gap, oy + r * cs + gap, cs - gap, cs - gap);
       }
     }
 
-    // Set new agent cell
-    const td = this.tableEl.rows[row]?.cells[col];
-    if (td) {
-      td.classList.add(carrying.length > 0 ? "cell-agent-carry" : "cell-agent");
+    // Agents — slightly inset square
+    const pad = Math.max(1, cs * 0.12);
+    for (let i = 0; i < this.agents.length; i++) {
+      const a = this.agents[i];
+      ctx.fillStyle = a.carrying.length ? AGENT_CARRY[i % 4] : AGENT_IDLE[i % 4];
+      ctx.fillRect(
+        ox + a.col * cs + pad,
+        oy + a.row * cs + pad,
+        cs - pad * 2,
+        cs - pad * 2
+      );
     }
-    this.agentRow = row;
-    this.agentCol = col;
+  }
 
-    // Update status bar
-    document.getElementById("status-tick").textContent = frame.tick;
-    document.getElementById("status-order").textContent = frame.active_order ?? "—";
-    document.getElementById("status-state").textContent = state.replace(/_/g, " ");
-    document.getElementById("status-carrying").textContent =
-      carrying.length ? carrying.join(", ") : "nothing";
+  _updateHUD(frame) {
+    document.getElementById("hud-tick").textContent = `tick ${frame.tick}`;
+
+    const container = document.getElementById("hud-agents");
+    const agents = this.agents;
+
+    while (container.children.length < agents.length) container.appendChild(document.createElement("div"));
+    while (container.children.length > agents.length) container.removeChild(container.lastChild);
+
+    for (let i = 0; i < agents.length; i++) {
+      const a    = agents[i];
+      const row  = container.children[i];
+      row.className = "hud-agent-row";
+      const state = a.state.replace(/_/g, " ");
+      const carry = a.carrying.length ? ` — ${a.carrying.length} item${a.carrying.length > 1 ? "s" : ""}` : "";
+      const dot   = row.children[0] || (() => { const s = document.createElement("span"); s.className = "hud-dot"; row.appendChild(s); return s; })();
+      const label = row.children[1] || (() => { const s = document.createElement("span"); row.appendChild(s); return s; })();
+      dot.className = "hud-dot";
+      dot.style.background = AGENT_IDLE[i % 4];
+      dot.style.flexShrink = "0";
+      label.textContent = `${a.id} ${state}${carry}`;
+      label.style.overflow = "hidden";
+      label.style.textOverflow = "ellipsis";
+    }
   }
 }
 
@@ -203,71 +270,69 @@ class SimulationViewer {
 // ─────────────────────────────────────────────────────────────────
 class SimulationClient {
   constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner, orderList) {
-    this.viewer = viewer;
+    this.viewer       = viewer;
     this.metricsTbody = metricsTbody;
     this.metricsFooter = metricsFooter;
-    this.summaryBox = summaryBox;
-    this.errorBanner = errorBanner;
-    this.orderList = orderList;
-    this.ws = null;
-    this.orderRows = new Map();  // order_id -> { el, batchId }
-    this.activeBatchId = null;
+    this.summaryBox   = summaryBox;
+    this.errorBanner  = errorBanner;
+    this.orderList    = orderList;
+    this.ws           = null;
+    this.orderRows    = new Map();
+    this._activeBatchKey = "";
   }
 
   sendSpeedUpdate(ms) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this.ws?.readyState === WebSocket.OPEN)
       this.ws.send(JSON.stringify({ type: "set_speed", tick_delay_ms: ms }));
-    }
+  }
+
+  sendStepsUpdate(steps) {
+    if (this.ws?.readyState === WebSocket.OPEN)
+      this.ws.send(JSON.stringify({ type: "set_steps", steps_per_frame: steps }));
   }
 
   stop() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this.ws?.readyState === WebSocket.OPEN)
       this.ws.send(JSON.stringify({ type: "stop" }));
-    }
     this.disconnect();
   }
 
   connect(config) {
     this.errorBanner.style.display = "none";
-    this.summaryBox.style.display = "none";
+    this.summaryBox.style.display  = "none";
+    document.getElementById("hud-summary").style.display = "none";
 
     const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws/simulate";
     this.ws = new WebSocket(wsUrl);
-
-    this.ws.onopen = () => {
-      this.ws.send(JSON.stringify(config));
-    };
-
-    this.ws.onmessage = (event) => {
-      const frame = JSON.parse(event.data);
-      switch (frame.type) {
-        case "orders_ready":   this._onOrdersReady(frame); break;
-        case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.active_batch); break;
-        case "order_complete": this._appendMetricsRow(frame); this._markOrderDone(frame.order_id); break;
-        case "complete":       this._onComplete(frame); break;
-        case "error":          this._showError(frame.message); break;
-      }
-    };
-
-    this.ws.onerror = () => this._showError("WebSocket connection error.");
-    this.ws.onclose = () => {
+    this.ws.onopen    = () => this.ws.send(JSON.stringify(config));
+    this.ws.onmessage = (e) => this._onMessage(JSON.parse(e.data));
+    this.ws.onerror   = () => this._showError("WebSocket connection error.");
+    this.ws.onclose   = () => {
       const btn = document.getElementById("btn-run");
       btn.dataset.running = "0";
       btn.textContent = "▶ Run Simulation";
     };
   }
 
-  disconnect() {
-    if (this.ws) { this.ws.close(); this.ws = null; }
+  disconnect() { if (this.ws) { this.ws.close(); this.ws = null; } }
+
+  _onMessage(frame) {
+    switch (frame.type) {
+      case "orders_ready":   this._onOrdersReady(frame); break;
+      case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.agents || []); break;
+      case "order_complete": this._appendMetricsRow(frame); this._markOrderDone(frame.order_id); break;
+      case "complete":       this._onComplete(frame); break;
+      case "error":          this._showError(frame.message); break;
+    }
   }
 
   _onOrdersReady(frame) {
     this.orderList.innerHTML = "";
     this.orderRows.clear();
-    this.activeBatchId = null;
+    this._activeBatchKey = "";
 
     for (const o of frame.orders) {
-      const row = document.createElement("div");
+      const row    = document.createElement("div");
       row.className = "order-row";
 
       const status = document.createElement("span");
@@ -278,7 +343,7 @@ class SimulationClient {
       id.textContent = o.order_id;
 
       const items = document.createElement("span");
-      items.style.color = "#444";
+      items.style.color = "#333";
       items.textContent = o.n_items + "×";
 
       const batch = document.createElement("span");
@@ -291,25 +356,28 @@ class SimulationClient {
     }
   }
 
-  _updateActiveOrders(batchId) {
-    if (batchId === this.activeBatchId) return;
+  _updateActiveOrders(agents) {
+    const activeBatches = new Set(agents.map(a => a.active_batch).filter(Boolean));
+    const key = [...activeBatches].sort().join(",");
+    if (key === this._activeBatchKey) return;
+    this._activeBatchKey = key;
 
     for (const [, info] of this.orderRows) {
-      if (info.el.classList.contains("active")) {
+      const inActive = activeBatches.has(info.batchId) && !info.el.classList.contains("done");
+      if (inActive) {
+        info.el.classList.add("active");
+        info.el.querySelector(".order-status").textContent = "●";
+        const list = info.el.parentElement;
+        if (list) {
+          const bot = info.el.offsetTop + info.el.offsetHeight;
+          if (info.el.offsetTop < list.scrollTop) list.scrollTop = info.el.offsetTop;
+          else if (bot > list.scrollTop + list.clientHeight) list.scrollTop = bot - list.clientHeight;
+        }
+      } else if (info.el.classList.contains("active")) {
         info.el.classList.remove("active");
         info.el.querySelector(".order-status").textContent = "·";
       }
     }
-    if (batchId) {
-      for (const [, info] of this.orderRows) {
-        if (info.batchId === batchId && !info.el.classList.contains("done")) {
-          info.el.classList.add("active");
-          info.el.querySelector(".order-status").textContent = "●";
-          info.el.scrollIntoView({ block: "nearest" });
-        }
-      }
-    }
-    this.activeBatchId = batchId;
   }
 
   _markOrderDone(orderId) {
@@ -326,24 +394,29 @@ class SimulationClient {
       <td>${frame.order_id}</td>
       <td class="text-right">${frame.items_picked}</td>
       <td class="text-right">${frame.distance_traveled}</td>
-      <td class="text-right">${frame.ticks_taken}</td>
-    `;
+      <td class="text-right">${frame.ticks_taken}</td>`;
     this.metricsTbody.appendChild(tr);
-    tr.scrollIntoView({ block: "nearest" });
+    const scroll = this.metricsTbody.closest(".metrics-scroll");
+    if (scroll) scroll.scrollTop = scroll.scrollHeight;
   }
 
   _onComplete(frame) {
     const s = frame.summary;
     document.getElementById("footer-items").textContent = s.total_items_picked;
-    document.getElementById("footer-dist").textContent = s.total_distance;
+    document.getElementById("footer-dist").textContent  = s.total_distance;
     document.getElementById("footer-ticks").textContent = frame.total_ticks;
     this.metricsFooter.style.display = "";
 
+    const summaryText =
+      `✓ ${frame.total_orders} orders · ${frame.total_ticks} ticks\n` +
+      `avg ${s.avg_ticks_per_order} ticks/order · dist ${s.total_distance}`;
+
     this.summaryBox.style.display = "block";
-    this.summaryBox.innerHTML =
-      `✓ Done — ${frame.total_orders} orders completed in ${frame.total_ticks} ticks &nbsp;|&nbsp; ` +
-      `avg ${s.avg_ticks_per_order} ticks/order &nbsp;|&nbsp; ` +
-      `total distance ${s.total_distance}`;
+    this.summaryBox.textContent   = summaryText;
+
+    const hudSummary = document.getElementById("hud-summary");
+    hudSummary.style.display = "block";
+    hudSummary.textContent   = summaryText;
   }
 
   _showError(message) {
@@ -357,42 +430,45 @@ class SimulationClient {
 // ─────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
   const editor = new GridEditor(document.getElementById("editor-grid"));
-  const viewer = new SimulationViewer(document.getElementById("sim-grid"));
+  const viewer = new SimulationViewer(document.getElementById("sim-canvas"));
   let client = null;
 
   // Load default layout on startup
   fetch(API_BASE + "/api/default-layout")
     .then(r => r.json())
-    .then(dict => {
-      editor.loadFromDict(dict);
-      viewer.build(dict);
-    });
+    .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
+
+  // ── Sidebar collapse / expand ────────────────
+  const sidebar = document.getElementById("sidebar");
+  const btnExpand = document.getElementById("btn-expand-sidebar");
+
+  document.getElementById("btn-collapse-sidebar").addEventListener("click", () => {
+    sidebar.classList.add("collapsed");
+    btnExpand.classList.add("visible");
+  });
+  btnExpand.addEventListener("click", () => {
+    sidebar.classList.remove("collapsed");
+    btnExpand.classList.remove("visible");
+  });
 
   // ── Mode toggle ──────────────────────────────
   const modeButtons = ["mode-default", "mode-quad", "mode-custom"];
-
   function setActiveMode(activeId) {
     modeButtons.forEach(id => document.getElementById(id).classList.toggle("active", id === activeId));
     document.getElementById("custom-controls").style.display = activeId === "mode-custom" ? "" : "none";
   }
 
   document.getElementById("mode-default").addEventListener("click", () => {
-    fetch(API_BASE + "/api/default-layout")
-      .then(r => r.json())
+    fetch(API_BASE + "/api/default-layout").then(r => r.json())
       .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
     setActiveMode("mode-default");
   });
-
   document.getElementById("mode-quad").addEventListener("click", () => {
-    fetch(API_BASE + "/api/quad-layout")
-      .then(r => r.json())
+    fetch(API_BASE + "/api/quad-layout").then(r => r.json())
       .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
     setActiveMode("mode-quad");
   });
-
-  document.getElementById("mode-custom").addEventListener("click", () => {
-    setActiveMode("mode-custom");
-  });
+  document.getElementById("mode-custom").addEventListener("click", () => setActiveMode("mode-custom"));
 
   // ── Custom size ──────────────────────────────
   document.getElementById("btn-apply-size").addEventListener("click", () => {
@@ -403,12 +479,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   // ── Brushes ──────────────────────────────────
-  const brushMap = {
-    "brush-rack":  CT.RACK,
-    "brush-aisle": CT.AISLE,
-    "brush-pack":  CT.PACK,
-    "brush-empty": CT.EMPTY,
-  };
+  const brushMap = { "brush-rack": CT.RACK, "brush-aisle": CT.AISLE, "brush-pack": CT.PACK, "brush-empty": CT.EMPTY };
   Object.entries(brushMap).forEach(([id, type]) => {
     document.getElementById(id).addEventListener("click", () => {
       editor.setBrush(type);
@@ -421,11 +492,9 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-save").addEventListener("click", () => {
     const dict = editor.toDict();
     const blob = new Blob([JSON.stringify(dict, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "warehouse-layout.json";
-    a.click();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url; a.download = "warehouse-layout.json"; a.click();
     URL.revokeObjectURL(url);
   });
 
@@ -439,43 +508,56 @@ document.addEventListener("DOMContentLoaded", () => {
         const dict = JSON.parse(ev.target.result);
         editor.loadFromDict(dict);
         viewer.build(dict);
-      } catch {
-        alert("Invalid JSON file.");
-      }
+      } catch { alert("Invalid JSON file."); }
     };
     reader.readAsText(file);
     e.target.value = "";
   });
 
-  // ── Batch strategy — show/hide batch size ────────────
+  // ── Collapsible sections ─────────────────────
+  document.querySelectorAll(".section-title").forEach(title => {
+    title.addEventListener("click", () => {
+      const section = title.closest(".section");
+      if (section.id === "custom-controls" || section.classList.contains("no-collapse")) return;
+      section.classList.toggle("collapsed");
+    });
+  });
+
+  // ── Batch strategy toggle ────────────────────
   document.getElementById("input-batch-strategy").addEventListener("change", (e) => {
-    document.getElementById("batch-size-param").style.display =
-      e.target.value === "none" ? "none" : "";
+    document.getElementById("batch-size-param").style.display = e.target.value === "none" ? "none" : "";
   });
 
-  // ── Speed slider — updates live if simulation is running ─────────
+  // ── Speed / steps sliders ────────────────────
   document.getElementById("speed-slider").addEventListener("input", (e) => {
-    document.getElementById("speed-label").textContent = e.target.value + " ms";
-    if (client) client.sendSpeedUpdate(parseInt(e.target.value));
+    const ms = parseInt(e.target.value);
+    document.getElementById("speed-label").textContent = ms === 0 ? "max" : ms + " ms";
+    if (client) client.sendSpeedUpdate(ms);
+  });
+  document.getElementById("steps-slider").addEventListener("input", (e) => {
+    const steps = parseInt(e.target.value);
+    document.getElementById("steps-label").textContent = "×" + steps;
+    if (client) client.sendStepsUpdate(steps);
   });
 
-  // ── Run / Stop button ─────────────────────────
+  // ── Zoom buttons ─────────────────────────────
+  document.getElementById("btn-zoom-in").addEventListener("click",    () => viewer.zoomBy(1.3));
+  document.getElementById("btn-zoom-out").addEventListener("click",   () => viewer.zoomBy(1 / 1.3));
+  document.getElementById("btn-zoom-reset").addEventListener("click", () => viewer.resetZoom());
+
+  // ── Run / Stop ───────────────────────────────
   document.getElementById("btn-run").addEventListener("click", async () => {
     const btn = document.getElementById("btn-run");
-
-    // If simulation is running, stop it
     if (btn.dataset.running === "1") {
       if (client) client.stop();
       btn.dataset.running = "0";
       btn.textContent = "▶ Run Simulation";
-      btn.classList.remove("stopping");
       return;
     }
 
     const errorBanner = document.getElementById("error-banner");
     errorBanner.style.display = "none";
 
-    // Local validation first
     const localErrors = editor.validateLocal();
     if (localErrors) {
       errorBanner.textContent = localErrors.join(" ");
@@ -484,8 +566,6 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     const dict = editor.toDict();
-
-    // Server-side validation
     const vRes = await fetch(API_BASE + "/api/validate-layout", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -498,11 +578,10 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
-    // Reset UI
     document.getElementById("metrics-tbody").innerHTML = "";
     document.getElementById("metrics-footer").style.display = "none";
     document.getElementById("order-list").innerHTML = "";
-    viewer.build(dict);
+    viewer.build(dict, false);
     btn.dataset.running = "1";
     btn.textContent = "■ Stop";
 
@@ -517,17 +596,20 @@ document.addEventListener("DOMContentLoaded", () => {
     );
 
     client.connect({
-      layout: dict,
-      n_orders: parseInt(document.getElementById("input-orders").value),
-      n_items: parseInt(document.getElementById("input-items").value),
+      layout:          dict,
+      n_orders:        parseInt(document.getElementById("input-orders").value),
+      n_items:         parseInt(document.getElementById("input-items").value),
       items_per_order: parseInt(document.getElementById("input-per-order").value),
-      n_families: parseInt(document.getElementById("input-families").value),
-      demand_skew: parseFloat(document.getElementById("input-skew").value),
+      n_families:      parseInt(document.getElementById("input-families").value),
+      demand_skew:     parseFloat(document.getElementById("input-skew").value),
       family_affinity: parseFloat(document.getElementById("input-affinity").value),
-      batch_strategy: document.getElementById("input-batch-strategy").value,
-      batch_size: parseInt(document.getElementById("input-batch-size").value),
-      seed: 42,
-      tick_delay_ms: parseInt(document.getElementById("speed-slider").value),
+      slot_strategy:   document.getElementById("input-slot-strategy").value,
+      batch_strategy:  document.getElementById("input-batch-strategy").value,
+      batch_size:      parseInt(document.getElementById("input-batch-size").value),
+      n_agents:        parseInt(document.getElementById("input-agents").value),
+      seed:            parseInt(document.getElementById("input-seed").value),
+      tick_delay_ms:   parseInt(document.getElementById("speed-slider").value),
+      steps_per_frame: parseInt(document.getElementById("steps-slider").value),
     });
   });
 });
@@ -547,29 +629,30 @@ document.addEventListener("DOMContentLoaded", () => {
 </head>
 <body>
 
-<header>
-  <h1>Warehouse Sim</h1>
-  <span class="subtitle">Layout Editor &amp; Simulation Viewer</span>
-</header>
+<!-- ══════════════ SIDEBAR ══════════════ -->
+<div id="sidebar">
 
-<div id="content">
+  <div id="sidebar-header">
+    <span id="sidebar-title">Warehouse Sim</span>
+    <button id="btn-collapse-sidebar" title="Collapse sidebar">◀</button>
+  </div>
 
-  <!-- ══════════════ LEFT PANEL — EDITOR ══════════════ -->
-  <div id="left-panel">
-
-    <!-- Mode toggle -->
-    <div class="section">
-      <div class="section-title">Layout Mode</div>
+  <!-- Mode toggle -->
+  <div class="section">
+    <div class="section-title">Layout Mode</div>
+    <div class="section-body">
       <div class="mode-toggle">
-        <button id="mode-default" class="active">Default (12×19)</button>
-        <button id="mode-quad">Quad (24×38)</button>
+        <button id="mode-default" class="active">Default</button>
+        <button id="mode-quad">Quad</button>
         <button id="mode-custom">Custom</button>
       </div>
     </div>
+  </div>
 
-    <!-- Custom size controls (hidden in default mode) -->
-    <div class="section" id="custom-controls" style="display:none">
-      <div class="section-title">Canvas Size</div>
+  <!-- Custom size controls -->
+  <div class="section" id="custom-controls" style="display:none">
+    <div class="section-title">Canvas Size</div>
+    <div class="section-body">
       <div class="input-row">
         <label>Rows</label>
         <input type="number" id="input-rows" value="10" min="3" max="40" />
@@ -577,67 +660,50 @@ document.addEventListener("DOMContentLoaded", () => {
         <input type="number" id="input-cols" value="16" min="3" max="60" />
         <button id="btn-apply-size">Apply</button>
       </div>
-      <p style="color:#666;font-size:11px;margin-top:6px;">
-        All cells start as Aisle. Paint Rack cells and place one Pack Station.
-      </p>
     </div>
+  </div>
 
-    <!-- Brush toolbar -->
-    <div class="section">
-      <div class="section-title">Brush</div>
-      <div class="toolbar">
-        <button class="brush-btn" id="brush-rack">
-          <span class="brush-swatch swatch-rack"></span>Rack
-        </button>
-        <button class="brush-btn" id="brush-aisle">
-          <span class="brush-swatch swatch-aisle"></span>Aisle
-        </button>
-        <button class="brush-btn active" id="brush-pack">
-          <span class="brush-swatch swatch-pack"></span>Pack Station
-        </button>
-        <button class="brush-btn" id="brush-empty">
-          <span class="brush-swatch swatch-empty"></span>Empty
-        </button>
+  <!-- Editor grid + brush -->
+  <div class="section collapsed">
+    <div class="section-title">Editor</div>
+    <div class="section-body">
+      <div class="toolbar" style="margin-bottom:7px;">
+        <button class="brush-btn" id="brush-rack"><span class="brush-swatch swatch-rack"></span>Rack</button>
+        <button class="brush-btn" id="brush-aisle"><span class="brush-swatch swatch-aisle"></span>Aisle</button>
+        <button class="brush-btn active" id="brush-pack"><span class="brush-swatch swatch-pack"></span>Pack</button>
+        <button class="brush-btn" id="brush-empty"><span class="brush-swatch swatch-empty"></span>Empty</button>
       </div>
-    </div>
-
-    <!-- Editor grid -->
-    <div class="section">
-      <div class="section-title">Editor</div>
       <div class="grid-scroll">
         <table class="warehouse-grid" id="editor-grid"></table>
       </div>
     </div>
+  </div>
 
-    <!-- Save / Load -->
-    <div class="section">
-      <div class="section-title">File</div>
-      <div style="display:flex;gap:8px;">
+  <!-- Save / Load -->
+  <div class="section collapsed">
+    <div class="section-title">File</div>
+    <div class="section-body">
+      <div style="display:flex;gap:6px;">
         <button id="btn-save">Save JSON</button>
         <label>
-          <button id="btn-load" onclick="document.getElementById('file-load-input').click()">
-            Load JSON
-          </button>
+          <button id="btn-load" onclick="document.getElementById('file-load-input').click()">Load JSON</button>
           <input type="file" id="file-load-input" accept=".json" />
         </label>
       </div>
     </div>
+  </div>
 
-  </div><!-- /left-panel -->
-
-  <!-- ══════════════ RIGHT PANEL — SIMULATION ══════════════ -->
-  <div id="right-panel">
-
-    <!-- Catalog parameters -->
-    <div class="section">
-      <div class="section-title">Item Catalog</div>
+  <!-- Item Catalog -->
+  <div class="section collapsed">
+    <div class="section-title">Item Catalog</div>
+    <div class="section-body">
       <div class="param-grid">
         <div class="param">
-          <span class="param-label">Items in catalog</span>
+          <span class="param-label">Items</span>
           <input type="number" id="input-items" value="30" min="1" max="200" />
         </div>
         <div class="param">
-          <span class="param-label">Product families</span>
+          <span class="param-label">Families</span>
           <input type="number" id="input-families" value="4" min="1" max="20" />
         </div>
         <div class="param">
@@ -645,34 +711,42 @@ document.addEventListener("DOMContentLoaded", () => {
           <input type="number" id="input-skew" value="2.0" min="0.1" max="10" step="0.1" />
         </div>
         <div class="param">
-          <span class="param-label">Family affinity</span>
+          <span class="param-label">Affinity</span>
           <input type="number" id="input-affinity" value="0.7" min="0" max="1" step="0.05" />
         </div>
-      </div>
-      <div class="param-hints">
-        <span title="Higher = a few items dominate most orders (power-law distribution)">⚙ Demand skew: spread of item popularity</span>
-        <span title="Fraction of each order drawn from one product family (0 = random, 1 = all same family)">⚙ Affinity: how often items cluster by family</span>
+        <div class="param" style="grid-column:1/-1;">
+          <span class="param-label">Shelf placement</span>
+          <select id="input-slot-strategy">
+            <option value="spread">Spread (default)</option>
+            <option value="demand">Demand — high-demand near pack</option>
+            <option value="affinity">Affinity — demand + co-occurrence</option>
+          </select>
+        </div>
       </div>
     </div>
+  </div>
 
-    <!-- Order parameters -->
-    <div class="section">
-      <div class="section-title">Orders</div>
+  <!-- Orders -->
+  <div class="section">
+    <div class="section-title">Orders</div>
+    <div class="section-body">
       <div class="param-grid">
         <div class="param">
-          <span class="param-label">Number of orders</span>
+          <span class="param-label">Count</span>
           <input type="number" id="input-orders" value="10" min="1" max="500" />
         </div>
         <div class="param">
-          <span class="param-label">Items per order</span>
+          <span class="param-label">Items each</span>
           <input type="number" id="input-per-order" value="4" min="1" max="20" />
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- Batching -->
-    <div class="section">
-      <div class="section-title">Batching</div>
+  <!-- Batching -->
+  <div class="section collapsed">
+    <div class="section-title">Batching</div>
+    <div class="section-body">
       <div class="param-grid">
         <div class="param">
           <span class="param-label">Strategy</span>
@@ -684,68 +758,100 @@ document.addEventListener("DOMContentLoaded", () => {
         </div>
         <div class="param" id="batch-size-param" style="display:none">
           <span class="param-label">Batch size</span>
-          <input type="number" id="input-batch-size" value="2" min="2" max="6" title="Max 6 — larger batches cause heavy item overlap with small catalogs" />
+          <input type="number" id="input-batch-size" value="2" min="2" max="6" />
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- Simulation controls -->
-    <div class="section">
-      <div class="section-title">Simulation</div>
-      <div class="input-row" style="margin-bottom:10px;">
-        <label>Speed</label>
-        <input type="range" id="speed-slider" min="10" max="500" value="80" />
+  <!-- Simulation controls -->
+  <div class="section no-collapse">
+    <div class="section-title">Simulation</div>
+    <div class="section-body">
+      <div class="param-grid" style="margin-bottom:8px;">
+        <div class="param">
+          <span class="param-label">Agents</span>
+          <input type="number" id="input-agents" value="1" min="1" max="4" />
+        </div>
+        <div class="param">
+          <span class="param-label">Seed</span>
+          <input type="number" id="input-seed" value="42" min="0" max="9999" />
+        </div>
+      </div>
+      <div class="input-row" style="margin-bottom:5px;">
+        <label>Delay</label>
+        <input type="range" id="speed-slider" min="0" max="500" value="80" />
         <span class="speed-label" id="speed-label">80 ms</span>
+      </div>
+      <div class="input-row" style="margin-bottom:8px;">
+        <label>Steps</label>
+        <input type="range" id="steps-slider" min="1" max="20" value="4" />
+        <span class="speed-label" id="steps-label">×4</span>
       </div>
       <button class="primary" id="btn-run">▶ Run Simulation</button>
       <div id="error-banner"></div>
     </div>
+  </div>
 
-    <!-- Simulation grid -->
-    <div class="section">
-      <div class="section-title">Live View</div>
-      <div class="grid-scroll">
-        <table class="warehouse-grid" id="sim-grid"></table>
-      </div>
-    </div>
+</div><!-- /sidebar -->
 
-    <!-- Status bar -->
-    <div class="section">
-      <div class="section-title">Agent Status</div>
-      <div id="status-bar">
-        <span class="label">Tick</span>
-        <span class="value" id="status-tick">—</span>
-        <span class="label">Order</span>
-        <span class="value" id="status-order">—</span>
-        <span class="label">State</span>
-        <span class="value" id="status-state">—</span>
-        <span class="label">Carrying</span>
-        <span class="value" id="status-carrying">—</span>
-      </div>
-    </div>
+<!-- ══════════════ MAIN CANVAS AREA ══════════════ -->
+<div id="main">
 
-    <!-- Order queue -->
-    <div class="section">
-      <div class="section-title">Order Queue</div>
+  <button id="btn-expand-sidebar" title="Show controls">☰</button>
+
+  <canvas id="sim-canvas"></canvas>
+
+  <!-- HUD overlay — top-right of canvas -->
+  <div id="hud">
+    <div id="hud-tick" class="hud-pill">tick —</div>
+    <div id="hud-agents"></div>
+    <div id="hud-summary" class="hud-pill hud-summary" style="display:none"></div>
+  </div>
+
+  <!-- Zoom controls — bottom-right of canvas -->
+  <div id="zoom-bar">
+    <button id="btn-zoom-in" title="Zoom in">+</button>
+    <button id="btn-zoom-reset" title="Fit to screen">⊡</button>
+    <button id="btn-zoom-out" title="Zoom out">−</button>
+  </div>
+
+</div><!-- /main -->
+
+<!-- ══════════════ RIGHT PANEL ══════════════ -->
+<div id="right-panel">
+
+  <!-- Order queue -->
+  <div class="section no-collapse" style="flex:0 0 auto;">
+    <div class="section-title">Order Queue</div>
+    <div class="section-body">
       <div class="order-list" id="order-list"></div>
     </div>
+  </div>
 
-    <!-- Summary (shown on complete) -->
-    <div id="summary-box"></div>
+  <!-- Summary -->
+  <div id="summary-box"></div>
 
-    <!-- Metrics table -->
-    <div class="section">
-      <div class="section-title">Order Metrics</div>
+  <!-- Metrics -->
+  <div class="section no-collapse" style="flex:1 1 0;min-height:0;display:flex;flex-direction:column;">
+    <div class="section-title">Order Metrics</div>
+    <div class="section-body" style="flex:1 1 0;min-height:0;display:flex;flex-direction:column;">
       <table class="metrics-table">
         <thead>
           <tr>
             <th>Order</th>
             <th class="text-right">Items</th>
-            <th class="text-right">Distance</th>
+            <th class="text-right">Dist</th>
             <th class="text-right">Ticks</th>
           </tr>
         </thead>
-        <tbody id="metrics-tbody"></tbody>
+      </table>
+      <div class="metrics-scroll" style="flex:1 1 0;">
+        <table class="metrics-table metrics-body-table">
+          <tbody id="metrics-tbody"></tbody>
+        </table>
+      </div>
+      <table class="metrics-table">
         <tfoot>
           <tr id="metrics-footer" style="display:none">
             <td>Total</td>
@@ -756,9 +862,9 @@ document.addEventListener("DOMContentLoaded", () => {
         </tfoot>
       </table>
     </div>
+  </div>
 
-  </div><!-- /right-panel -->
-</div><!-- /content -->
+</div><!-- /right-panel -->
 
 <script src="/static/editor.js"></script>
 </body>
@@ -773,246 +879,358 @@ document.addEventListener("DOMContentLoaded", () => {
 
 body {
     display: flex;
-    flex-direction: column;
     height: 100vh;
-    background: #111;
-    color: #ddd;
+    overflow: hidden;
+    background: #000;
     font-family: monospace;
     font-size: 13px;
+    color: #ddd;
 }
 
-/* ── Header ─────────────────────────────────────────── */
-header {
-    padding: 10px 16px;
-    background: #1a1a1a;
-    border-bottom: 1px solid #333;
+/* ── Sidebar ─────────────────────────────────────────── */
+#sidebar {
+    width: 300px;
+    flex-shrink: 0;
+    background: #0c0c0c;
+    border-right: 1px solid #181818;
+    overflow-y: auto;
+    overflow-x: hidden;
     display: flex;
-    align-items: center;
-    gap: 12px;
+    flex-direction: column;
+    gap: 5px;
+    padding: 8px;
+    transition: width 0.2s ease, padding 0.2s ease, border-color 0.2s ease;
 }
-header h1 { font-size: 15px; color: #eee; letter-spacing: 1px; }
-header .subtitle { color: #666; font-size: 12px; }
-
-/* ── Two-panel content ───────────────────────────────── */
-#content {
-    display: grid;
-    grid-template-columns: 400px 1fr;
-    gap: 0;
-    flex: 1;
+#sidebar.collapsed {
+    width: 0;
+    padding: 0;
+    border-color: transparent;
     overflow: hidden;
 }
 
-#left-panel, #right-panel {
+#sidebar-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #1c1c1c;
+    flex-shrink: 0;
+}
+#sidebar-title {
+    font-size: 12px;
+    color: #666;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+#btn-collapse-sidebar {
+    background: none;
+    border: 1px solid #2a2a2a;
+    color: #555;
+    width: 24px;
+    height: 24px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-family: monospace;
+}
+#btn-collapse-sidebar:hover { border-color: #444; color: #aaa; }
+
+/* ── Main canvas area ────────────────────────────────── */
+#main {
+    flex: 1;
+    position: relative;
+    background: #000;
+    overflow: hidden;
+    min-width: 0;
+}
+
+/* ── Right panel ─────────────────────────────────────── */
+#right-panel {
+    width: 240px;
+    flex-shrink: 0;
+    background: #0c0c0c;
+    border-left: 1px solid #181818;
     overflow-y: auto;
-    padding: 12px;
+    overflow-x: hidden;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 5px;
+    padding: 8px;
 }
-#left-panel { border-right: 1px solid #2a2a2a; }
+
+#sim-canvas {
+    display: block;
+    position: absolute;
+    inset: 0;
+}
+
+/* Expand sidebar button (shown when sidebar is hidden) */
+#btn-expand-sidebar {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 20;
+    background: rgba(20,20,20,0.85);
+    border: 1px solid #2a2a2a;
+    color: #666;
+    width: 30px;
+    height: 30px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    transition: color 0.15s, border-color 0.15s;
+}
+#btn-expand-sidebar:hover { color: #aaa; border-color: #444; }
+#btn-expand-sidebar.visible { display: flex; }
+
+/* ── HUD overlay ─────────────────────────────────────── */
+#hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    width: 320px;
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 6px;
+    pointer-events: none;
+    z-index: 10;
+}
+#hud-tick {
+    flex-shrink: 0;
+    align-self: flex-start;
+}
+.hud-pill {
+    background: rgba(8,8,8,0.80);
+    border: 1px solid #1e1e1e;
+    border-radius: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding: 4px 8px;
+    font-size: 11px;
+    backdrop-filter: blur(6px);
+}
+#hud-tick {
+    color: #444;
+    font-size: 10px;
+    text-align: right;
+    letter-spacing: 0.5px;
+}
+#hud-agents { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.hud-agent-row {
+    background: rgba(8,8,8,0.80);
+    border: 1px solid #1e1e1e;
+    border-radius: 3px;
+    padding: 3px 7px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: #888;
+    backdrop-filter: blur(6px);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.hud-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.hud-summary {
+    color: #7ac87a;
+    font-size: 11px;
+    line-height: 1.6;
+}
+
+/* ── Zoom bar ────────────────────────────────────────── */
+#zoom-bar {
+    position: absolute;
+    bottom: 12px;
+    right: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    z-index: 10;
+}
+#zoom-bar button {
+    width: 28px;
+    height: 28px;
+    background: rgba(20,20,20,0.85);
+    border: 1px solid #2a2a2a;
+    color: #666;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 15px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    transition: color 0.15s, border-color 0.15s;
+}
+#zoom-bar button:hover { color: #aaa; border-color: #444; }
 
 /* ── Sections / cards ────────────────────────────────── */
 .section {
-    background: #1a1a1a;
-    border: 1px solid #2a2a2a;
+    background: #111;
+    border: 1px solid #1e1e1e;
     border-radius: 4px;
-    padding: 10px;
+    padding: 8px;
+    flex-shrink: 0;
 }
 .section-title {
-    font-size: 11px;
-    color: #888;
+    font-size: 10px;
+    color: #555;
     text-transform: uppercase;
     letter-spacing: 1px;
-    margin-bottom: 8px;
+    margin-bottom: 7px;
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 5px;
 }
+.section-title::before {
+    content: '▾';
+    font-size: 9px;
+    color: #444;
+    transition: transform 0.15s;
+    flex-shrink: 0;
+}
+.section.collapsed .section-title::before { transform: rotate(-90deg); }
+.section.collapsed .section-title { margin-bottom: 0; }
+.section-body { display: block; }
+.section.collapsed .section-body { display: none; }
+.section.no-collapse .section-title { cursor: default; }
+.section.no-collapse .section-title::before { content: ''; }
 
 /* ── Buttons ─────────────────────────────────────────── */
 button {
-    background: #2a2a2a;
-    color: #ccc;
-    border: 1px solid #444;
-    padding: 5px 10px;
+    background: #1a1a1a;
+    color: #aaa;
+    border: 1px solid #2e2e2e;
+    padding: 4px 9px;
     border-radius: 3px;
     cursor: pointer;
     font-family: monospace;
     font-size: 12px;
-    transition: background 0.15s, border-color 0.15s;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
 }
-button:hover { background: #333; border-color: #666; }
-button.active { background: #1a4a7a; border-color: #4a9fd4; color: #fff; }
+button:hover { background: #252525; border-color: #444; color: #ddd; }
+button.active { background: #12355a; border-color: #2a6090; color: #7ac4f0; }
 button.primary {
-    background: #1a4a1a;
-    border-color: #2d8a2d;
-    color: #aee8ae;
+    background: #0e2e0e;
+    border-color: #1d5a1d;
+    color: #7ac87a;
     width: 100%;
-    padding: 8px;
+    padding: 7px;
     font-size: 13px;
+    margin-top: 2px;
 }
-button.primary:hover { background: #245a24; }
-button.primary:disabled { background: #1a1a1a; color: #555; border-color: #333; cursor: default; }
-button.primary[data-running="1"] { background: #4a1010; border-color: #8a2020; color: #ffaaaa; }
+button.primary:hover { background: #162e16; }
+button.primary:disabled { background: #111; color: #333; border-color: #222; cursor: default; }
+button.primary[data-running="1"] { background: #2e0e0e; border-color: #5a1d1d; color: #c87a7a; }
 
 /* ── Mode toggle ─────────────────────────────────────── */
-.mode-toggle { display: flex; gap: 6px; }
-.mode-toggle button { flex: 1; }
+.mode-toggle { display: flex; gap: 5px; }
+.mode-toggle button { flex: 1; font-size: 11px; padding: 4px; }
 
 /* ── Toolbar ─────────────────────────────────────────── */
-.toolbar { display: flex; gap: 6px; flex-wrap: wrap; }
-.brush-btn {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    padding: 5px 8px;
-}
+.toolbar { display: flex; gap: 5px; flex-wrap: wrap; }
+.brush-btn { display: flex; align-items: center; gap: 4px; padding: 4px 7px; font-size: 11px; }
 .brush-swatch {
-    width: 14px; height: 14px;
+    width: 11px; height: 11px;
     border-radius: 2px;
-    border: 1px solid #555;
+    border: 1px solid #444;
     flex-shrink: 0;
 }
-.swatch-rack    { background: #c76b00; }
-.swatch-aisle   { background: #1c1c1c; border-color: #555; }
-.swatch-pack    { background: #2d6a2d; }
-.swatch-empty   { background: #3a3a3a; }
+.swatch-rack  { background: #9a5200; }
+.swatch-aisle { background: #141414; border-color: #333; }
+.swatch-pack  { background: #1d4d1d; }
+.swatch-empty { background: #2a2a2a; }
 
 /* ── Inputs ──────────────────────────────────────────── */
-.input-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.input-row label { color: #888; min-width: 40px; }
+.input-row { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.input-row label { color: #555; min-width: 36px; font-size: 11px; }
 input[type="number"], input[type="range"] {
-    background: #222;
-    color: #ccc;
-    border: 1px solid #444;
+    background: #161616;
+    color: #bbb;
+    border: 1px solid #2e2e2e;
     border-radius: 3px;
-    padding: 4px 6px;
+    padding: 3px 5px;
     font-family: monospace;
     font-size: 12px;
-    width: 60px;
+    width: 55px;
 }
-input[type="range"] { width: 120px; padding: 2px; cursor: pointer; }
-.speed-label { color: #aaa; min-width: 36px; }
+input[type="range"] { width: 100px; padding: 2px; cursor: pointer; }
+.speed-label { color: #555; min-width: 30px; font-size: 11px; }
 
-/* ── Grid tables ─────────────────────────────────────── */
-.grid-scroll { overflow: auto; max-height: 420px; }
+/* ── Editor grid ─────────────────────────────────────── */
+.grid-scroll { overflow: auto; max-height: 380px; }
 .warehouse-grid {
     border-collapse: collapse;
     table-layout: fixed;
     user-select: none;
 }
 .warehouse-grid td {
-    width: 24px; height: 24px;
-    border: 1px solid #0a0a0a;
+    width: 12px; height: 12px;
+    border: 1px solid #060606;
     cursor: pointer;
     transition: filter 0.05s;
 }
-.warehouse-grid td:hover { filter: brightness(1.4); }
-#sim-grid td { cursor: default; }
+.warehouse-grid td:hover { filter: brightness(1.5); }
 
 /* CellType colors */
-.cell-empty        { background: #3a3a3a; }
-.cell-rack         { background: #c76b00; }
-.cell-aisle        { background: #1c1c1c; }
-.cell-pack         { background: #2d6a2d; }
-.cell-agent        { background: #1a6fb5 !important; }
-.cell-agent-carry  { background: #4a9fd4 !important; }
+.cell-empty { background: #252525; }
+.cell-rack  { background: #9a5200; }
+.cell-aisle { background: #0d0d0d; }
+.cell-pack  { background: #1d4d1d; }
 
-/* ── Status bar ──────────────────────────────────────── */
-#status-bar {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 4px 12px;
-    font-size: 12px;
-}
-#status-bar span.label { color: #666; }
-#status-bar span.value { color: #ccc; }
-
-/* ── Metrics table ───────────────────────────────────── */
-.metrics-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-}
-.metrics-table th {
-    color: #888;
-    text-align: left;
-    padding: 4px 8px;
-    border-bottom: 1px solid #333;
-    font-weight: normal;
-    text-transform: uppercase;
-    font-size: 11px;
-    letter-spacing: 0.5px;
-}
-.metrics-table td {
-    padding: 3px 8px;
-    border-bottom: 1px solid #1e1e1e;
-    color: #bbb;
-}
-.metrics-table tr:last-child td { border-bottom: none; }
-.metrics-table tfoot td {
-    color: #eee;
-    border-top: 1px solid #444;
-    padding-top: 5px;
-    font-weight: bold;
-}
-.text-right { text-align: right; }
-
-/* ── Error banner ────────────────────────────────────── */
-#error-banner {
-    background: #4a1010;
-    border: 1px solid #8a2020;
-    color: #ffaaaa;
-    padding: 8px 10px;
-    border-radius: 3px;
-    font-size: 12px;
-    display: none;
-}
-
-/* ── Data generation param grid ──────────────────────── */
+/* ── Params grid ─────────────────────────────────────── */
 .param-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 6px 12px;
-    margin-bottom: 8px;
+    gap: 5px 10px;
+    margin-bottom: 6px;
 }
-.param {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-}
-.param-label {
-    font-size: 11px;
-    color: #888;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-.param input,
-.param select {
+.param { display: flex; flex-direction: column; gap: 2px; }
+.param-label { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 0.4px; }
+.param input, .param select {
     width: 100%;
-    background: #222;
-    color: #ccc;
-    border: 1px solid #444;
+    background: #161616;
+    color: #bbb;
+    border: 1px solid #2e2e2e;
     border-radius: 3px;
-    padding: 4px 6px;
+    padding: 3px 5px;
     font-family: monospace;
     font-size: 12px;
 }
 .param select { cursor: pointer; }
-.param-hints {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    padding-top: 4px;
-    border-top: 1px solid #222;
-}
-.param-hints span {
-    font-size: 11px;
-    color: #555;
-    cursor: help;
-}
-.param-hints span:hover { color: #888; }
 
-/* ── Order queue list ────────────────────────────────── */
+/* ── Error banner ────────────────────────────────────── */
+#error-banner {
+    background: #2e0e0e;
+    border: 1px solid #5a1d1d;
+    color: #c87a7a;
+    padding: 6px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    margin-top: 6px;
+    display: none;
+}
+
+/* ── Order queue ─────────────────────────────────────── */
 .order-list {
-    max-height: 180px;
+    max-height: 280px;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
@@ -1020,1076 +1238,83 @@ input[type="range"] { width: 120px; padding: 2px; cursor: pointer; }
 }
 .order-row {
     display: grid;
-    grid-template-columns: 14px 1fr auto auto;
-    gap: 0 8px;
+    grid-template-columns: 12px 1fr auto auto;
+    gap: 0 6px;
     align-items: center;
-    padding: 3px 4px;
+    padding: 2px 3px;
     border-radius: 2px;
     font-size: 11px;
-    color: #555;
+    color: #444;
     transition: background 0.1s, color 0.1s;
 }
 .order-status { text-align: center; font-size: 10px; }
-.order-row.active {
-    color: #4a9fd4;
-    background: rgba(26, 111, 181, 0.12);
-}
-.order-row.done { color: #333; }
-.order-row.done .order-status { color: #2d6a2d; }
+.order-row.active { color: #4a9fd4; background: rgba(26,111,181,0.10); }
+.order-row.done { color: #2a2a2a; }
+.order-row.done .order-status { color: #1d5a1d; }
 .order-batch-tag {
-    font-size: 10px;
-    color: #666;
-    background: #1e1e1e;
-    border: 1px solid #2a2a2a;
+    font-size: 9px; color: #444;
+    background: #161616;
+    border: 1px solid #222;
     border-radius: 2px;
-    padding: 0 4px;
+    padding: 0 3px;
 }
-
-/* ── File load hidden input ──────────────────────────── */
-#file-load-input { display: none; }
 
 /* ── Summary box ─────────────────────────────────────── */
 #summary-box {
-    background: #0e2a0e;
-    border: 1px solid #2d6a2d;
+    background: #071407;
+    border: 1px solid #1d4d1d;
     border-radius: 3px;
-    padding: 8px 10px;
-    font-size: 12px;
-    color: #aee8ae;
-    display: none;
-}
-
-```
-
-## editor\editor.js
-
-```javascript
-"use strict";
-
-const API_BASE = "http://localhost:8000"; // prefix all fetch calls — swap for Tauri sidecar later
-
-// CellType values (mirror warehouse/grid.py CellType enum)
-const CT = { EMPTY: 0, RACK: 1, AISLE: 2, PACK: 3 };
-const CELL_CLASS = { 0: "cell-empty", 1: "cell-rack", 2: "cell-aisle", 3: "cell-pack" };
-
-// ─────────────────────────────────────────────────────────────────
-// GridEditor — manages the drawable editor table
-// ─────────────────────────────────────────────────────────────────
-class GridEditor {
-  constructor(tableEl) {
-    this.tableEl = tableEl;
-    this.rows = 0;
-    this.cols = 0;
-    this.cells = [];      // 2D array of CellType int
-    this.brush = CT.RACK;
-    this.painting = false;
-    this.packPos = null;  // [row, col] of current PACK_STATION, enforces exactly one
-
-    document.addEventListener("mouseup", () => { this.painting = false; });
-  }
-
-  build(rows, cols) {
-    this.rows = rows;
-    this.cols = cols;
-    this.cells = Array.from({ length: rows }, () => new Array(cols).fill(CT.AISLE));
-    this.packPos = null;
-    this._render();
-  }
-
-  loadFromDict(dict) {
-    this.rows = dict.rows;
-    this.cols = dict.cols;
-    this.cells = dict.grid.map(row => [...row]);
-    this.packPos = dict.pack_station_pos ? [...dict.pack_station_pos] : null;
-    this._render();
-  }
-
-  toDict() {
-    return {
-      rows: this.rows,
-      cols: this.cols,
-      grid: this.cells.map(row => [...row]),
-      pack_station_pos: this.packPos ? [...this.packPos] : [0, 0],
-    };
-  }
-
-  setBrush(type) {
-    this.brush = type;
-  }
-
-  setCellType(row, col, type) {
-    if (row < 0 || row >= this.rows || col < 0 || col >= this.cols) return;
-
-    // Enforce single pack station
-    if (type === CT.PACK) {
-      if (this.packPos) {
-        const [pr, pc] = this.packPos;
-        this.cells[pr][pc] = CT.AISLE;
-        this._updateTd(pr, pc);
-      }
-      this.packPos = [row, col];
-    } else if (this.packPos && this.packPos[0] === row && this.packPos[1] === col) {
-      this.packPos = null;
-    }
-
-    this.cells[row][col] = type;
-    this._updateTd(row, col);
-  }
-
-  validateLocal() {
-    const errors = [];
-    if (!this.packPos) errors.push("Place exactly one Pack Station on the grid.");
-    const rackCount = this.cells.flat().filter(c => c === CT.RACK).length;
-    if (rackCount === 0) errors.push("Add at least one Rack cell.");
-    return errors.length ? errors : null;
-  }
-
-  _render() {
-    this.tableEl.innerHTML = "";
-    for (let r = 0; r < this.rows; r++) {
-      const tr = document.createElement("tr");
-      for (let c = 0; c < this.cols; c++) {
-        const td = document.createElement("td");
-        td.dataset.row = r;
-        td.dataset.col = c;
-        td.className = CELL_CLASS[this.cells[r][c]];
-        td.addEventListener("mousedown", (e) => {
-          e.preventDefault();
-          this.painting = true;
-          this.setCellType(r, c, this.brush);
-        });
-        td.addEventListener("mouseenter", () => {
-          if (this.painting) this.setCellType(r, c, this.brush);
-        });
-        tr.appendChild(td);
-      }
-      this.tableEl.appendChild(tr);
-    }
-  }
-
-  _updateTd(row, col) {
-    const td = this.tableEl.rows[row]?.cells[col];
-    if (td) td.className = CELL_CLASS[this.cells[row][col]];
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────
-// SimulationViewer — read-only grid with agent overlay
-// ─────────────────────────────────────────────────────────────────
-class SimulationViewer {
-  constructor(tableEl) {
-    this.tableEl = tableEl;
-    this.rows = 0;
-    this.cols = 0;
-    this.agentRow = -1;
-    this.agentCol = -1;
-  }
-
-  build(dict) {
-    this.rows = dict.rows;
-    this.cols = dict.cols;
-    this.agentRow = -1;
-    this.agentCol = -1;
-    this.tableEl.innerHTML = "";
-    for (let r = 0; r < this.rows; r++) {
-      const tr = document.createElement("tr");
-      for (let c = 0; c < this.cols; c++) {
-        const td = document.createElement("td");
-        td.className = CELL_CLASS[dict.grid[r][c]];
-        tr.appendChild(td);
-      }
-      this.tableEl.appendChild(tr);
-    }
-  }
-
-  applyTick(frame) {
-    const { row, col, state, carrying } = frame.agent;
-
-    // Clear previous agent cell
-    if (this.agentRow >= 0) {
-      const prev = this.tableEl.rows[this.agentRow]?.cells[this.agentCol];
-      if (prev) {
-        prev.classList.remove("cell-agent", "cell-agent-carry");
-      }
-    }
-
-    // Set new agent cell
-    const td = this.tableEl.rows[row]?.cells[col];
-    if (td) {
-      td.classList.add(carrying.length > 0 ? "cell-agent-carry" : "cell-agent");
-    }
-    this.agentRow = row;
-    this.agentCol = col;
-
-    // Update status bar
-    document.getElementById("status-tick").textContent = frame.tick;
-    document.getElementById("status-order").textContent = frame.active_order ?? "—";
-    document.getElementById("status-state").textContent = state.replace(/_/g, " ");
-    document.getElementById("status-carrying").textContent =
-      carrying.length ? carrying.join(", ") : "nothing";
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────
-// SimulationClient — WebSocket lifecycle
-// ─────────────────────────────────────────────────────────────────
-class SimulationClient {
-  constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner, orderList) {
-    this.viewer = viewer;
-    this.metricsTbody = metricsTbody;
-    this.metricsFooter = metricsFooter;
-    this.summaryBox = summaryBox;
-    this.errorBanner = errorBanner;
-    this.orderList = orderList;
-    this.ws = null;
-    this.orderRows = new Map();  // order_id -> { el, batchId }
-    this.activeBatchId = null;
-  }
-
-  sendSpeedUpdate(ms) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "set_speed", tick_delay_ms: ms }));
-    }
-  }
-
-  stop() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "stop" }));
-    }
-    this.disconnect();
-  }
-
-  connect(config) {
-    this.errorBanner.style.display = "none";
-    this.summaryBox.style.display = "none";
-
-    const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws/simulate";
-    this.ws = new WebSocket(wsUrl);
-
-    this.ws.onopen = () => {
-      this.ws.send(JSON.stringify(config));
-    };
-
-    this.ws.onmessage = (event) => {
-      const frame = JSON.parse(event.data);
-      switch (frame.type) {
-        case "orders_ready":   this._onOrdersReady(frame); break;
-        case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.active_batch); break;
-        case "order_complete": this._appendMetricsRow(frame); this._markOrderDone(frame.order_id); break;
-        case "complete":       this._onComplete(frame); break;
-        case "error":          this._showError(frame.message); break;
-      }
-    };
-
-    this.ws.onerror = () => this._showError("WebSocket connection error.");
-    this.ws.onclose = () => {
-      const btn = document.getElementById("btn-run");
-      btn.dataset.running = "0";
-      btn.textContent = "▶ Run Simulation";
-    };
-  }
-
-  disconnect() {
-    if (this.ws) { this.ws.close(); this.ws = null; }
-  }
-
-  _onOrdersReady(frame) {
-    this.orderList.innerHTML = "";
-    this.orderRows.clear();
-    this.activeBatchId = null;
-
-    for (const o of frame.orders) {
-      const row = document.createElement("div");
-      row.className = "order-row";
-
-      const status = document.createElement("span");
-      status.className = "order-status";
-      status.textContent = "·";
-
-      const id = document.createElement("span");
-      id.textContent = o.order_id;
-
-      const items = document.createElement("span");
-      items.style.color = "#444";
-      items.textContent = o.n_items + "×";
-
-      const batch = document.createElement("span");
-      batch.className = "order-batch-tag";
-      if (o.batch_id && o.batch_id !== o.order_id) batch.textContent = o.batch_id;
-
-      row.append(status, id, items, batch);
-      this.orderList.appendChild(row);
-      this.orderRows.set(o.order_id, { el: row, batchId: o.batch_id });
-    }
-  }
-
-  _updateActiveOrders(batchId) {
-    if (batchId === this.activeBatchId) return;
-
-    for (const [, info] of this.orderRows) {
-      if (info.el.classList.contains("active")) {
-        info.el.classList.remove("active");
-        info.el.querySelector(".order-status").textContent = "·";
-      }
-    }
-    if (batchId) {
-      for (const [, info] of this.orderRows) {
-        if (info.batchId === batchId && !info.el.classList.contains("done")) {
-          info.el.classList.add("active");
-          info.el.querySelector(".order-status").textContent = "●";
-          info.el.scrollIntoView({ block: "nearest" });
-        }
-      }
-    }
-    this.activeBatchId = batchId;
-  }
-
-  _markOrderDone(orderId) {
-    const info = this.orderRows.get(orderId);
-    if (!info) return;
-    info.el.classList.remove("active");
-    info.el.classList.add("done");
-    info.el.querySelector(".order-status").textContent = "✓";
-  }
-
-  _appendMetricsRow(frame) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${frame.order_id}</td>
-      <td class="text-right">${frame.items_picked}</td>
-      <td class="text-right">${frame.distance_traveled}</td>
-      <td class="text-right">${frame.ticks_taken}</td>
-    `;
-    this.metricsTbody.appendChild(tr);
-    tr.scrollIntoView({ block: "nearest" });
-  }
-
-  _onComplete(frame) {
-    const s = frame.summary;
-    document.getElementById("footer-items").textContent = s.total_items_picked;
-    document.getElementById("footer-dist").textContent = s.total_distance;
-    document.getElementById("footer-ticks").textContent = frame.total_ticks;
-    this.metricsFooter.style.display = "";
-
-    this.summaryBox.style.display = "block";
-    this.summaryBox.innerHTML =
-      `✓ Done — ${frame.total_orders} orders completed in ${frame.total_ticks} ticks &nbsp;|&nbsp; ` +
-      `avg ${s.avg_ticks_per_order} ticks/order &nbsp;|&nbsp; ` +
-      `total distance ${s.total_distance}`;
-  }
-
-  _showError(message) {
-    this.errorBanner.textContent = "Error: " + message;
-    this.errorBanner.style.display = "block";
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Module wiring
-// ─────────────────────────────────────────────────────────────────
-document.addEventListener("DOMContentLoaded", () => {
-  const editor = new GridEditor(document.getElementById("editor-grid"));
-  const viewer = new SimulationViewer(document.getElementById("sim-grid"));
-  let client = null;
-
-  // Load default layout on startup
-  fetch(API_BASE + "/api/default-layout")
-    .then(r => r.json())
-    .then(dict => {
-      editor.loadFromDict(dict);
-      viewer.build(dict);
-    });
-
-  // ── Mode toggle ──────────────────────────────
-  const modeButtons = ["mode-default", "mode-quad", "mode-custom"];
-
-  function setActiveMode(activeId) {
-    modeButtons.forEach(id => document.getElementById(id).classList.toggle("active", id === activeId));
-    document.getElementById("custom-controls").style.display = activeId === "mode-custom" ? "" : "none";
-  }
-
-  document.getElementById("mode-default").addEventListener("click", () => {
-    fetch(API_BASE + "/api/default-layout")
-      .then(r => r.json())
-      .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
-    setActiveMode("mode-default");
-  });
-
-  document.getElementById("mode-quad").addEventListener("click", () => {
-    fetch(API_BASE + "/api/quad-layout")
-      .then(r => r.json())
-      .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
-    setActiveMode("mode-quad");
-  });
-
-  document.getElementById("mode-custom").addEventListener("click", () => {
-    setActiveMode("mode-custom");
-  });
-
-  // ── Custom size ──────────────────────────────
-  document.getElementById("btn-apply-size").addEventListener("click", () => {
-    const rows = parseInt(document.getElementById("input-rows").value);
-    const cols = parseInt(document.getElementById("input-cols").value);
-    editor.build(rows, cols);
-    viewer.build({ rows, cols, grid: Array.from({ length: rows }, () => new Array(cols).fill(2)) });
-  });
-
-  // ── Brushes ──────────────────────────────────
-  const brushMap = {
-    "brush-rack":  CT.RACK,
-    "brush-aisle": CT.AISLE,
-    "brush-pack":  CT.PACK,
-    "brush-empty": CT.EMPTY,
-  };
-  Object.entries(brushMap).forEach(([id, type]) => {
-    document.getElementById(id).addEventListener("click", () => {
-      editor.setBrush(type);
-      document.querySelectorAll(".brush-btn").forEach(b => b.classList.remove("active"));
-      document.getElementById(id).classList.add("active");
-    });
-  });
-
-  // ── Save ─────────────────────────────────────
-  document.getElementById("btn-save").addEventListener("click", () => {
-    const dict = editor.toDict();
-    const blob = new Blob([JSON.stringify(dict, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "warehouse-layout.json";
-    a.click();
-    URL.revokeObjectURL(url);
-  });
-
-  // ── Load ─────────────────────────────────────
-  document.getElementById("file-load-input").addEventListener("change", (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      try {
-        const dict = JSON.parse(ev.target.result);
-        editor.loadFromDict(dict);
-        viewer.build(dict);
-      } catch {
-        alert("Invalid JSON file.");
-      }
-    };
-    reader.readAsText(file);
-    e.target.value = "";
-  });
-
-  // ── Batch strategy — show/hide batch size ────────────
-  document.getElementById("input-batch-strategy").addEventListener("change", (e) => {
-    document.getElementById("batch-size-param").style.display =
-      e.target.value === "none" ? "none" : "";
-  });
-
-  // ── Speed slider — updates live if simulation is running ─────────
-  document.getElementById("speed-slider").addEventListener("input", (e) => {
-    document.getElementById("speed-label").textContent = e.target.value + " ms";
-    if (client) client.sendSpeedUpdate(parseInt(e.target.value));
-  });
-
-  // ── Run / Stop button ─────────────────────────
-  document.getElementById("btn-run").addEventListener("click", async () => {
-    const btn = document.getElementById("btn-run");
-
-    // If simulation is running, stop it
-    if (btn.dataset.running === "1") {
-      if (client) client.stop();
-      btn.dataset.running = "0";
-      btn.textContent = "▶ Run Simulation";
-      btn.classList.remove("stopping");
-      return;
-    }
-
-    const errorBanner = document.getElementById("error-banner");
-    errorBanner.style.display = "none";
-
-    // Local validation first
-    const localErrors = editor.validateLocal();
-    if (localErrors) {
-      errorBanner.textContent = localErrors.join(" ");
-      errorBanner.style.display = "block";
-      return;
-    }
-
-    const dict = editor.toDict();
-
-    // Server-side validation
-    const vRes = await fetch(API_BASE + "/api/validate-layout", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(dict),
-    });
-    const validation = await vRes.json();
-    if (!validation.valid) {
-      errorBanner.textContent = validation.errors.join(" | ");
-      errorBanner.style.display = "block";
-      return;
-    }
-
-    // Reset UI
-    document.getElementById("metrics-tbody").innerHTML = "";
-    document.getElementById("metrics-footer").style.display = "none";
-    document.getElementById("order-list").innerHTML = "";
-    viewer.build(dict);
-    btn.dataset.running = "1";
-    btn.textContent = "■ Stop";
-
-    if (client) client.disconnect();
-    client = new SimulationClient(
-      viewer,
-      document.getElementById("metrics-tbody"),
-      document.getElementById("metrics-footer"),
-      document.getElementById("summary-box"),
-      errorBanner,
-      document.getElementById("order-list"),
-    );
-
-    client.connect({
-      layout: dict,
-      n_orders: parseInt(document.getElementById("input-orders").value),
-      n_items: parseInt(document.getElementById("input-items").value),
-      items_per_order: parseInt(document.getElementById("input-per-order").value),
-      n_families: parseInt(document.getElementById("input-families").value),
-      demand_skew: parseFloat(document.getElementById("input-skew").value),
-      family_affinity: parseFloat(document.getElementById("input-affinity").value),
-      batch_strategy: document.getElementById("input-batch-strategy").value,
-      batch_size: parseInt(document.getElementById("input-batch-size").value),
-      seed: 42,
-      tick_delay_ms: parseInt(document.getElementById("speed-slider").value),
-    });
-  });
-});
-
-```
-
-## editor\index.html
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Warehouse Sim</title>
-  <link rel="stylesheet" href="/static/styles.css" />
-</head>
-<body>
-
-<header>
-  <h1>Warehouse Sim</h1>
-  <span class="subtitle">Layout Editor &amp; Simulation Viewer</span>
-</header>
-
-<div id="content">
-
-  <!-- ══════════════ LEFT PANEL — EDITOR ══════════════ -->
-  <div id="left-panel">
-
-    <!-- Mode toggle -->
-    <div class="section">
-      <div class="section-title">Layout Mode</div>
-      <div class="mode-toggle">
-        <button id="mode-default" class="active">Default (12×19)</button>
-        <button id="mode-quad">Quad (24×38)</button>
-        <button id="mode-custom">Custom</button>
-      </div>
-    </div>
-
-    <!-- Custom size controls (hidden in default mode) -->
-    <div class="section" id="custom-controls" style="display:none">
-      <div class="section-title">Canvas Size</div>
-      <div class="input-row">
-        <label>Rows</label>
-        <input type="number" id="input-rows" value="10" min="3" max="40" />
-        <label>Cols</label>
-        <input type="number" id="input-cols" value="16" min="3" max="60" />
-        <button id="btn-apply-size">Apply</button>
-      </div>
-      <p style="color:#666;font-size:11px;margin-top:6px;">
-        All cells start as Aisle. Paint Rack cells and place one Pack Station.
-      </p>
-    </div>
-
-    <!-- Brush toolbar -->
-    <div class="section">
-      <div class="section-title">Brush</div>
-      <div class="toolbar">
-        <button class="brush-btn" id="brush-rack">
-          <span class="brush-swatch swatch-rack"></span>Rack
-        </button>
-        <button class="brush-btn" id="brush-aisle">
-          <span class="brush-swatch swatch-aisle"></span>Aisle
-        </button>
-        <button class="brush-btn active" id="brush-pack">
-          <span class="brush-swatch swatch-pack"></span>Pack Station
-        </button>
-        <button class="brush-btn" id="brush-empty">
-          <span class="brush-swatch swatch-empty"></span>Empty
-        </button>
-      </div>
-    </div>
-
-    <!-- Editor grid -->
-    <div class="section">
-      <div class="section-title">Editor</div>
-      <div class="grid-scroll">
-        <table class="warehouse-grid" id="editor-grid"></table>
-      </div>
-    </div>
-
-    <!-- Save / Load -->
-    <div class="section">
-      <div class="section-title">File</div>
-      <div style="display:flex;gap:8px;">
-        <button id="btn-save">Save JSON</button>
-        <label>
-          <button id="btn-load" onclick="document.getElementById('file-load-input').click()">
-            Load JSON
-          </button>
-          <input type="file" id="file-load-input" accept=".json" />
-        </label>
-      </div>
-    </div>
-
-  </div><!-- /left-panel -->
-
-  <!-- ══════════════ RIGHT PANEL — SIMULATION ══════════════ -->
-  <div id="right-panel">
-
-    <!-- Catalog parameters -->
-    <div class="section">
-      <div class="section-title">Item Catalog</div>
-      <div class="param-grid">
-        <div class="param">
-          <span class="param-label">Items in catalog</span>
-          <input type="number" id="input-items" value="30" min="1" max="200" />
-        </div>
-        <div class="param">
-          <span class="param-label">Product families</span>
-          <input type="number" id="input-families" value="4" min="1" max="20" />
-        </div>
-        <div class="param">
-          <span class="param-label">Demand skew</span>
-          <input type="number" id="input-skew" value="2.0" min="0.1" max="10" step="0.1" />
-        </div>
-        <div class="param">
-          <span class="param-label">Family affinity</span>
-          <input type="number" id="input-affinity" value="0.7" min="0" max="1" step="0.05" />
-        </div>
-      </div>
-      <div class="param-hints">
-        <span title="Higher = a few items dominate most orders (power-law distribution)">⚙ Demand skew: spread of item popularity</span>
-        <span title="Fraction of each order drawn from one product family (0 = random, 1 = all same family)">⚙ Affinity: how often items cluster by family</span>
-      </div>
-    </div>
-
-    <!-- Order parameters -->
-    <div class="section">
-      <div class="section-title">Orders</div>
-      <div class="param-grid">
-        <div class="param">
-          <span class="param-label">Number of orders</span>
-          <input type="number" id="input-orders" value="10" min="1" max="500" />
-        </div>
-        <div class="param">
-          <span class="param-label">Items per order</span>
-          <input type="number" id="input-per-order" value="4" min="1" max="20" />
-        </div>
-      </div>
-    </div>
-
-    <!-- Batching -->
-    <div class="section">
-      <div class="section-title">Batching</div>
-      <div class="param-grid">
-        <div class="param">
-          <span class="param-label">Strategy</span>
-          <select id="input-batch-strategy">
-            <option value="none">None (FIFO)</option>
-            <option value="zone">Zone overlap</option>
-            <option value="tsp">Nearest neighbor</option>
-          </select>
-        </div>
-        <div class="param" id="batch-size-param" style="display:none">
-          <span class="param-label">Batch size</span>
-          <input type="number" id="input-batch-size" value="2" min="2" max="6" title="Max 6 — larger batches cause heavy item overlap with small catalogs" />
-        </div>
-      </div>
-    </div>
-
-    <!-- Simulation controls -->
-    <div class="section">
-      <div class="section-title">Simulation</div>
-      <div class="input-row" style="margin-bottom:10px;">
-        <label>Speed</label>
-        <input type="range" id="speed-slider" min="10" max="500" value="80" />
-        <span class="speed-label" id="speed-label">80 ms</span>
-      </div>
-      <button class="primary" id="btn-run">▶ Run Simulation</button>
-      <div id="error-banner"></div>
-    </div>
-
-    <!-- Simulation grid -->
-    <div class="section">
-      <div class="section-title">Live View</div>
-      <div class="grid-scroll">
-        <table class="warehouse-grid" id="sim-grid"></table>
-      </div>
-    </div>
-
-    <!-- Status bar -->
-    <div class="section">
-      <div class="section-title">Agent Status</div>
-      <div id="status-bar">
-        <span class="label">Tick</span>
-        <span class="value" id="status-tick">—</span>
-        <span class="label">Order</span>
-        <span class="value" id="status-order">—</span>
-        <span class="label">State</span>
-        <span class="value" id="status-state">—</span>
-        <span class="label">Carrying</span>
-        <span class="value" id="status-carrying">—</span>
-      </div>
-    </div>
-
-    <!-- Order queue -->
-    <div class="section">
-      <div class="section-title">Order Queue</div>
-      <div class="order-list" id="order-list"></div>
-    </div>
-
-    <!-- Summary (shown on complete) -->
-    <div id="summary-box"></div>
-
-    <!-- Metrics table -->
-    <div class="section">
-      <div class="section-title">Order Metrics</div>
-      <table class="metrics-table">
-        <thead>
-          <tr>
-            <th>Order</th>
-            <th class="text-right">Items</th>
-            <th class="text-right">Distance</th>
-            <th class="text-right">Ticks</th>
-          </tr>
-        </thead>
-        <tbody id="metrics-tbody"></tbody>
-        <tfoot>
-          <tr id="metrics-footer" style="display:none">
-            <td>Total</td>
-            <td class="text-right" id="footer-items">—</td>
-            <td class="text-right" id="footer-dist">—</td>
-            <td class="text-right" id="footer-ticks">—</td>
-          </tr>
-        </tfoot>
-      </table>
-    </div>
-
-  </div><!-- /right-panel -->
-</div><!-- /content -->
-
-<script src="/static/editor.js"></script>
-</body>
-</html>
-
-```
-
-## editor\styles.css
-
-```css
-* { box-sizing: border-box; margin: 0; padding: 0; }
-
-body {
-    display: flex;
-    flex-direction: column;
-    height: 100vh;
-    background: #111;
-    color: #ddd;
-    font-family: monospace;
-    font-size: 13px;
-}
-
-/* ── Header ─────────────────────────────────────────── */
-header {
-    padding: 10px 16px;
-    background: #1a1a1a;
-    border-bottom: 1px solid #333;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-header h1 { font-size: 15px; color: #eee; letter-spacing: 1px; }
-header .subtitle { color: #666; font-size: 12px; }
-
-/* ── Two-panel content ───────────────────────────────── */
-#content {
-    display: grid;
-    grid-template-columns: 400px 1fr;
-    gap: 0;
-    flex: 1;
-    overflow: hidden;
-}
-
-#left-panel, #right-panel {
-    overflow-y: auto;
-    padding: 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-}
-#left-panel { border-right: 1px solid #2a2a2a; }
-
-/* ── Sections / cards ────────────────────────────────── */
-.section {
-    background: #1a1a1a;
-    border: 1px solid #2a2a2a;
-    border-radius: 4px;
-    padding: 10px;
-}
-.section-title {
+    padding: 7px 9px;
     font-size: 11px;
-    color: #888;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    margin-bottom: 8px;
-}
-
-/* ── Buttons ─────────────────────────────────────────── */
-button {
-    background: #2a2a2a;
-    color: #ccc;
-    border: 1px solid #444;
-    padding: 5px 10px;
-    border-radius: 3px;
-    cursor: pointer;
-    font-family: monospace;
-    font-size: 12px;
-    transition: background 0.15s, border-color 0.15s;
-}
-button:hover { background: #333; border-color: #666; }
-button.active { background: #1a4a7a; border-color: #4a9fd4; color: #fff; }
-button.primary {
-    background: #1a4a1a;
-    border-color: #2d8a2d;
-    color: #aee8ae;
-    width: 100%;
-    padding: 8px;
-    font-size: 13px;
-}
-button.primary:hover { background: #245a24; }
-button.primary:disabled { background: #1a1a1a; color: #555; border-color: #333; cursor: default; }
-button.primary[data-running="1"] { background: #4a1010; border-color: #8a2020; color: #ffaaaa; }
-
-/* ── Mode toggle ─────────────────────────────────────── */
-.mode-toggle { display: flex; gap: 6px; }
-.mode-toggle button { flex: 1; }
-
-/* ── Toolbar ─────────────────────────────────────────── */
-.toolbar { display: flex; gap: 6px; flex-wrap: wrap; }
-.brush-btn {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    padding: 5px 8px;
-}
-.brush-swatch {
-    width: 14px; height: 14px;
-    border-radius: 2px;
-    border: 1px solid #555;
+    color: #7ac87a;
+    display: none;
+    line-height: 1.6;
     flex-shrink: 0;
 }
-.swatch-rack    { background: #c76b00; }
-.swatch-aisle   { background: #1c1c1c; border-color: #555; }
-.swatch-pack    { background: #2d6a2d; }
-.swatch-empty   { background: #3a3a3a; }
-
-/* ── Inputs ──────────────────────────────────────────── */
-.input-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.input-row label { color: #888; min-width: 40px; }
-input[type="number"], input[type="range"] {
-    background: #222;
-    color: #ccc;
-    border: 1px solid #444;
-    border-radius: 3px;
-    padding: 4px 6px;
-    font-family: monospace;
-    font-size: 12px;
-    width: 60px;
-}
-input[type="range"] { width: 120px; padding: 2px; cursor: pointer; }
-.speed-label { color: #aaa; min-width: 36px; }
-
-/* ── Grid tables ─────────────────────────────────────── */
-.grid-scroll { overflow: auto; max-height: 420px; }
-.warehouse-grid {
-    border-collapse: collapse;
-    table-layout: fixed;
-    user-select: none;
-}
-.warehouse-grid td {
-    width: 24px; height: 24px;
-    border: 1px solid #0a0a0a;
-    cursor: pointer;
-    transition: filter 0.05s;
-}
-.warehouse-grid td:hover { filter: brightness(1.4); }
-#sim-grid td { cursor: default; }
-
-/* CellType colors */
-.cell-empty        { background: #3a3a3a; }
-.cell-rack         { background: #c76b00; }
-.cell-aisle        { background: #1c1c1c; }
-.cell-pack         { background: #2d6a2d; }
-.cell-agent        { background: #1a6fb5 !important; }
-.cell-agent-carry  { background: #4a9fd4 !important; }
-
-/* ── Status bar ──────────────────────────────────────── */
-#status-bar {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 4px 12px;
-    font-size: 12px;
-}
-#status-bar span.label { color: #666; }
-#status-bar span.value { color: #ccc; }
 
 /* ── Metrics table ───────────────────────────────────── */
 .metrics-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: 11px;
+    table-layout: fixed;
 }
+.metrics-table th:nth-child(1), .metrics-table td:nth-child(1) { width: auto; }
+.metrics-table th:nth-child(2), .metrics-table td:nth-child(2) { width: 40px; }
+.metrics-table th:nth-child(3), .metrics-table td:nth-child(3) { width: 44px; }
+.metrics-table th:nth-child(4), .metrics-table td:nth-child(4) { width: 44px; }
 .metrics-table th {
-    color: #888;
+    color: #444;
     text-align: left;
-    padding: 4px 8px;
-    border-bottom: 1px solid #333;
+    padding: 3px 6px;
+    border-bottom: 1px solid #1e1e1e;
     font-weight: normal;
     text-transform: uppercase;
-    font-size: 11px;
-    letter-spacing: 0.5px;
+    font-size: 10px;
+    letter-spacing: 0.4px;
 }
 .metrics-table td {
-    padding: 3px 8px;
-    border-bottom: 1px solid #1e1e1e;
-    color: #bbb;
+    padding: 2px 6px;
+    border-bottom: 1px solid #161616;
+    color: #888;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 .metrics-table tr:last-child td { border-bottom: none; }
 .metrics-table tfoot td {
-    color: #eee;
-    border-top: 1px solid #444;
-    padding-top: 5px;
+    color: #ccc;
+    border-top: 1px solid #2a2a2a;
+    padding-top: 4px;
     font-weight: bold;
 }
 .text-right { text-align: right; }
-
-/* ── Error banner ────────────────────────────────────── */
-#error-banner {
-    background: #4a1010;
-    border: 1px solid #8a2020;
-    color: #ffaaaa;
-    padding: 8px 10px;
-    border-radius: 3px;
-    font-size: 12px;
-    display: none;
-}
-
-/* ── Data generation param grid ──────────────────────── */
-.param-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px 12px;
-    margin-bottom: 8px;
-}
-.param {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-}
-.param-label {
-    font-size: 11px;
-    color: #888;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-.param input,
-.param select {
-    width: 100%;
-    background: #222;
-    color: #ccc;
-    border: 1px solid #444;
-    border-radius: 3px;
-    padding: 4px 6px;
-    font-family: monospace;
-    font-size: 12px;
-}
-.param select { cursor: pointer; }
-.param-hints {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    padding-top: 4px;
-    border-top: 1px solid #222;
-}
-.param-hints span {
-    font-size: 11px;
-    color: #555;
-    cursor: help;
-}
-.param-hints span:hover { color: #888; }
-
-/* ── Order queue list ────────────────────────────────── */
-.order-list {
-    max-height: 180px;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-}
-.order-row {
-    display: grid;
-    grid-template-columns: 14px 1fr auto auto;
-    gap: 0 8px;
-    align-items: center;
-    padding: 3px 4px;
-    border-radius: 2px;
-    font-size: 11px;
-    color: #555;
-    transition: background 0.1s, color 0.1s;
-}
-.order-status { text-align: center; font-size: 10px; }
-.order-row.active {
-    color: #4a9fd4;
-    background: rgba(26, 111, 181, 0.12);
-}
-.order-row.done { color: #333; }
-.order-row.done .order-status { color: #2d6a2d; }
-.order-batch-tag {
-    font-size: 10px;
-    color: #666;
-    background: #1e1e1e;
-    border: 1px solid #2a2a2a;
-    border-radius: 2px;
-    padding: 0 4px;
-}
+.metrics-scroll { max-height: 160px; overflow-y: auto; }
+.metrics-body-table { margin: 0; }
 
 /* ── File load hidden input ──────────────────────────── */
 #file-load-input { display: none; }
 
-/* ── Summary box ─────────────────────────────────────── */
-#summary-box {
-    background: #0e2a0e;
-    border: 1px solid #2d6a2d;
-    border-radius: 3px;
-    padding: 8px 10px;
-    font-size: 12px;
-    color: #aee8ae;
-    display: none;
-}
 
 ```
 
@@ -2128,11 +1353,11 @@ def orders(items, n=8, per_order=4, seed=42):
     return generate_orders(items, n_orders=n, items_per_order=per_order, seed=seed)
 
 
-def run_sim(grid, items, orders, strategy="none", batch_size=2, restock_delay=0):
+def run_sim(grid, items, orders, strategy="none", batch_size=2, restock_delay=0, n_agents=1):
     inventory = Inventory(grid)
     inventory.seed(items)
-    agent = PickAgent("A1", grid.pack_station_pos, grid)
-    sim = Simulation(grid, inventory, agent, restock_delay=restock_delay)
+    agents = [PickAgent(f"A{i+1}", grid.pack_station_pos, grid) for i in range(n_agents)]
+    sim = Simulation(grid, inventory, agents, restock_delay=restock_delay)
 
     if strategy == "zone":
         for b in ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders):
@@ -2243,13 +1468,17 @@ def test_zone_batcher_works_after_round_trip_serialisation():
     assert len(batches) < len(os), "ZoneBatcher produced no grouping on round-tripped grid"
 
 
-def test_batched_order_unified_ids_no_duplicates():
+def test_batched_order_pick_count_equals_items_across_orders():
+    """Each order's items all appear in unified_item_ids — no deduplication."""
     items = catalog()
     os = orders(items, n=6)
     inv = Inventory(DEFAULT); inv.seed(items)
     for b in GreedyTSPBatcher(inv, DEFAULT, max_batch_size=3).batch(os):
-        assert len(b.unified_item_ids) == len(set(b.unified_item_ids)), \
-            f"Batch {b.batch_id} has duplicate item IDs"
+        expected = sum(len(o.item_ids) for o in b.orders)
+        assert len(b.unified_item_ids) == expected, \
+            f"Batch {b.batch_id}: expected {expected} picks, got {len(b.unified_item_ids)}"
+        assert len(b.item_to_order) == expected, \
+            f"Batch {b.batch_id}: item_to_order length {len(b.item_to_order)} != {expected}"
 
 
 # ── simulation completion ─────────────────────────────────────────────────────
@@ -2268,11 +1497,18 @@ def test_all_orders_complete_quad(n_orders):
     assert len(sim.completed_metrics) == n_orders
 
 
-def test_fifo_picks_full_orders_no_restock_delay():
+@pytest.mark.parametrize("n_orders,per_order", [
+    (5,  4),
+    (10, 4),
+    (20, 3),
+])
+def test_fifo_total_items_equals_orders_times_per_order(n_orders, per_order):
     items = catalog()
-    sim = run_sim(DEFAULT, items, orders(items, n=10), restock_delay=0)
-    bad = [m for m in sim.completed_metrics if m.items_picked != 4]
-    assert not bad, f"Short picks with restock_delay=0: {[(m.order_id, m.items_picked) for m in bad]}"
+    os = orders(items, n=n_orders, per_order=per_order)
+    sim = run_sim(DEFAULT, items, os)
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order, \
+        f"Expected {n_orders * per_order} items total, got {total}"
 
 
 @pytest.mark.parametrize("strategy,batch_size", [
@@ -2282,11 +1518,16 @@ def test_fifo_picks_full_orders_no_restock_delay():
     ("tsp",  4),
 ])
 def test_all_orders_get_metrics(strategy, batch_size):
+    n_orders, per_order = 8, 4
     items = catalog()
-    os = orders(items, n=8)
+    os = orders(items, n=n_orders, per_order=per_order)
     sim = run_sim(DEFAULT, items, os, strategy=strategy, batch_size=batch_size, restock_delay=0)
-    assert len(sim.completed_metrics) == len(os), \
-        f"strategy={strategy} bs={batch_size}: {len(sim.completed_metrics)} metrics for {len(os)} orders"
+    assert len(sim.completed_metrics) == n_orders, \
+        f"strategy={strategy} bs={batch_size}: {len(sim.completed_metrics)} metrics for {n_orders} orders"
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    expected = n_orders * per_order
+    assert total == expected, \
+        f"strategy={strategy} bs={batch_size}: total items {total} != {expected}"
 
 
 def test_summary_totals_consistent():
@@ -2296,6 +1537,102 @@ def test_summary_totals_consistent():
     assert s.total_orders == len(sim.completed_metrics)
     assert s.total_items  == sum(m.items_picked for m in sim.completed_metrics)
     assert s.total_distance == sum(m.distance_traveled for m in sim.completed_metrics)
+
+
+# ── multi-agent ───────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("n_agents,n_orders", [(2, 10), (3, 15), (4, 20)])
+def test_multi_agent_all_orders_complete(n_agents, n_orders):
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=n_orders), n_agents=n_agents)
+    assert len(sim.completed_metrics) == n_orders, \
+        f"{n_agents} agents: {len(sim.completed_metrics)} metrics for {n_orders} orders"
+
+
+@pytest.mark.parametrize("n_agents", [2, 3, 4])
+def test_multi_agent_no_position_collision(n_agents):
+    """No two agents share the same cell in any tick."""
+    items = catalog()
+    os = orders(items, n=12)
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    from warehouse.agent import PickAgent
+    from warehouse.simulation import Simulation
+    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(n_agents)]
+    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0)
+    for o in os:
+        sim.enqueue_order(o)
+    pack_pos = DEFAULT.pack_station_pos
+    while sim.current_tick < 10_000:
+        positions = [a.pos for a in sim.agents if a.pos != pack_pos]
+        assert len(positions) == len(set(positions)), \
+            f"Tick {sim.current_tick}: collision outside pack station {[a.pos for a in sim.agents]}"
+        if not sim.step():
+            break
+
+
+@pytest.mark.parametrize("n_agents,batch_size,strategy", [
+    (2, 1, "none"),
+    (4, 1, "none"),
+    (2, 2, "tsp"),
+    (3, 2, "zone"),
+])
+def test_multi_agent_no_simultaneous_deposit(n_agents, batch_size, strategy):
+    """station_busy flag: at most one agent deposits per tick regardless of strategy."""
+    items = catalog()
+    os = orders(items, n=12)
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(n_agents)]
+    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0)
+
+    if strategy == "tsp":
+        for b in GreedyTSPBatcher(inventory, DEFAULT, max_batch_size=batch_size).batch(os):
+            sim.enqueue_batch(b)
+    elif strategy == "zone":
+        for b in ZoneBatcher(DEFAULT, inventory, max_batch_size=batch_size).batch(os):
+            sim.enqueue_batch(b)
+    else:
+        for o in os:
+            sim.enqueue_order(o)
+
+    depositing_agents_per_tick = []
+    prev_count = 0
+    while sim.current_tick < 10_000:
+        if not sim.step():
+            break
+        new_completions = len(sim.completed_metrics) - prev_count
+        if new_completions > 0:
+            # Count how many distinct agents just finished (station_busy allows max 1)
+            depositing_agents_per_tick.append(new_completions)
+        prev_count = len(sim.completed_metrics)
+
+    # Each deposit event may complete multiple orders (one per order in a batch),
+    # but only one agent may deposit per tick — so the max orders completed in
+    # a single tick is bounded by the largest batch size used.
+    assert all(d <= batch_size for d in depositing_agents_per_tick), \
+        f"A tick completed more orders than one batch allows: {depositing_agents_per_tick}"
+
+
+@pytest.mark.parametrize("n_agents", [2, 3])
+def test_multi_agent_total_items_correct(n_agents):
+    n_orders, per_order = 12, 4
+    items = catalog()
+    os = orders(items, n=n_orders, per_order=per_order)
+    sim = run_sim(DEFAULT, items, os, n_agents=n_agents)
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order, \
+        f"{n_agents} agents: total items {total} != {n_orders * per_order}"
+
+
+def test_multi_agent_faster_than_single():
+    """Two agents should complete the same orders in fewer ticks than one."""
+    items = catalog()
+    os = orders(items, n=20)
+    sim1 = run_sim(DEFAULT, items, os, n_agents=1)
+    sim2 = run_sim(DEFAULT, items, os, n_agents=2)
+    assert sim2.current_tick < sim1.current_tick, \
+        f"2 agents ({sim2.current_tick} ticks) not faster than 1 ({sim1.current_tick} ticks)"
 
 
 # ── server WebSocket messages ─────────────────────────────────────────────────
@@ -2347,6 +1684,145 @@ def test_server_tick_has_active_batch(strategy):
     assert ticks, "No tick messages received"
     assert all("active_batch" in t for t in ticks), "Some tick frames missing active_batch key"
 
+
+def test_server_tick_agents_array_shape():
+    """Tick messages must include an 'agents' array with correct per-agent keys."""
+    msgs = run_server(n_orders=4)
+    ticks = [m for m in msgs if m["type"] == "tick"]
+    assert ticks
+    required_keys = {"id", "row", "col", "state", "carrying", "active_batch"}
+    for t in ticks:
+        assert "agents" in t, "tick missing 'agents' key"
+        assert isinstance(t["agents"], list) and len(t["agents"]) >= 1
+        for a in t["agents"]:
+            missing = required_keys - a.keys()
+            assert not missing, f"agent entry missing keys {missing}"
+
+
+# ── restock ───────────────────────────────────────────────────────────────────
+
+def test_restock_delay_orders_complete():
+    """Orders blocked by stockout still complete once items are restocked."""
+    items = catalog(n_items=10, n_families=2, seed=7)
+    # Use more orders than stock can serve at once; restock_delay ensures
+    # the queue has to wait for replenishment.
+    os = orders(items, n=15, per_order=3, seed=7)
+    sim = run_sim(DEFAULT, items, os, restock_delay=5)
+    assert len(sim.completed_metrics) == 15, \
+        f"Expected 15 completed orders, got {len(sim.completed_metrics)}"
+
+
+def test_restock_delay_slows_throughput():
+    """A positive restock_delay should cause more ticks than delay=0 when stock is exhausted."""
+    items = catalog(n_items=10, n_families=2, seed=7)
+    os = orders(items, n=15, per_order=3, seed=7)
+
+    sim_fast = run_sim(DEFAULT, items, os, restock_delay=0)
+    sim_slow = run_sim(DEFAULT, items, os, restock_delay=30)
+
+    assert sim_slow.current_tick >= sim_fast.current_tick, (
+        f"restock_delay=30 finished in {sim_slow.current_tick} ticks, "
+        f"faster than delay=0 ({sim_fast.current_tick} ticks)"
+    )
+
+
+def test_restock_items_return_to_stock_after_deposit():
+    """After an agent deposits items, those items re-enter inventory after restock_delay ticks."""
+    items = catalog(n_items=10, n_families=2, seed=7)
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items, initial_stock=1)
+    restock_delay = 20
+
+    agent = PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)
+    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=restock_delay)
+
+    # One order per item so every slot gets drained exactly once
+    from warehouse.inventory import Order
+    first_order = orders(items, n=1, per_order=4, seed=7)[0]
+    sim.enqueue_order(first_order)
+
+    # Run until the first order completes (items deposited → restock queue populated)
+    while sim.current_tick < 10_000 and not sim.completed_metrics:
+        sim.step()
+
+    assert sim.completed_metrics, "First order never completed"
+    deposit_tick = sim.completed_metrics[0].completed_at_tick
+
+    # Immediately after deposit, picked items must be unavailable
+    for iid in first_order.item_ids:
+        assert inventory.stock_level(iid) == 0, \
+            f"Item {iid} already restocked before delay (tick {sim.current_tick})"
+
+    # Run until the restock delay has elapsed from the deposit tick
+    target_tick = deposit_tick + restock_delay + 1
+    while sim.current_tick < target_tick:
+        if not sim.step():
+            break
+
+    # Items should now be back in stock
+    for iid in first_order.item_ids:
+        assert inventory.stock_level(iid) > 0, \
+            f"Item {iid} not restocked after delay (tick {sim.current_tick}, deposit at {deposit_tick})"
+
+
+# ── multi-agent + batch strategies ───────────────────────────────────────────
+
+@pytest.mark.parametrize("strategy,batch_size,n_agents", [
+    ("zone", 2, 2),
+    ("zone", 3, 3),
+    ("tsp",  2, 2),
+    ("tsp",  3, 3),
+    ("tsp",  2, 4),
+])
+def test_multi_agent_batch_all_orders_complete(strategy, batch_size, n_agents):
+    n_orders, per_order = 12, 4
+    items = catalog()
+    os = orders(items, n=n_orders, per_order=per_order)
+    sim = run_sim(DEFAULT, items, os, strategy=strategy, batch_size=batch_size, n_agents=n_agents)
+    assert len(sim.completed_metrics) == n_orders, (
+        f"strategy={strategy} bs={batch_size} agents={n_agents}: "
+        f"{len(sim.completed_metrics)} metrics for {n_orders} orders"
+    )
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order, (
+        f"strategy={strategy} bs={batch_size} agents={n_agents}: "
+        f"total items {total} != {n_orders * per_order}"
+    )
+
+
+@pytest.mark.parametrize("n_agents", [2, 3])
+def test_multi_agent_summary_totals_consistent(n_agents):
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=12), n_agents=n_agents)
+    s = sim.get_summary()
+    assert s.total_orders == len(sim.completed_metrics)
+    assert s.total_items == sum(m.items_picked for m in sim.completed_metrics)
+    assert s.total_distance == sum(m.distance_traveled for m in sim.completed_metrics)
+    assert s.idle_ticks >= 0
+    assert s.idle_ticks <= s.total_ticks
+
+
+# ── wait ticks ────────────────────────────────────────────────────────────────
+
+def test_wait_ticks_nonzero_when_queue_backpressure():
+    """Orders that sit in queue behind a stockout should accumulate wait_ticks > 0."""
+    items = catalog(n_items=5, n_families=1, seed=3)
+    inventory = Inventory(DEFAULT)
+    # seed with stock=1 so each pick drains the slot; restock_delay creates a wait
+    inventory.seed(items, initial_stock=1)
+
+    agent = PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)
+    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=20)
+
+    os = orders(items, n=8, per_order=2, seed=3)
+    for o in os:
+        sim.enqueue_order(o)
+    sim.run(max_ticks=50_000)
+
+    wait_values = [m.wait_ticks for m in sim.completed_metrics]
+    assert any(w > 0 for w in wait_values), \
+        f"Expected some orders to have wait_ticks > 0; got {wait_values}"
+
 ```
 
 ## tests\test_sim.py
@@ -2384,11 +1860,11 @@ def orders(items, n=8, per_order=4, seed=42):
     return generate_orders(items, n_orders=n, items_per_order=per_order, seed=seed)
 
 
-def run_sim(grid, items, orders, strategy="none", batch_size=2, restock_delay=0):
+def run_sim(grid, items, orders, strategy="none", batch_size=2, restock_delay=0, n_agents=1):
     inventory = Inventory(grid)
     inventory.seed(items)
-    agent = PickAgent("A1", grid.pack_station_pos, grid)
-    sim = Simulation(grid, inventory, agent, restock_delay=restock_delay)
+    agents = [PickAgent(f"A{i+1}", grid.pack_station_pos, grid) for i in range(n_agents)]
+    sim = Simulation(grid, inventory, agents, restock_delay=restock_delay)
 
     if strategy == "zone":
         for b in ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders):
@@ -2499,13 +1975,17 @@ def test_zone_batcher_works_after_round_trip_serialisation():
     assert len(batches) < len(os), "ZoneBatcher produced no grouping on round-tripped grid"
 
 
-def test_batched_order_unified_ids_no_duplicates():
+def test_batched_order_pick_count_equals_items_across_orders():
+    """Each order's items all appear in unified_item_ids — no deduplication."""
     items = catalog()
     os = orders(items, n=6)
     inv = Inventory(DEFAULT); inv.seed(items)
     for b in GreedyTSPBatcher(inv, DEFAULT, max_batch_size=3).batch(os):
-        assert len(b.unified_item_ids) == len(set(b.unified_item_ids)), \
-            f"Batch {b.batch_id} has duplicate item IDs"
+        expected = sum(len(o.item_ids) for o in b.orders)
+        assert len(b.unified_item_ids) == expected, \
+            f"Batch {b.batch_id}: expected {expected} picks, got {len(b.unified_item_ids)}"
+        assert len(b.item_to_order) == expected, \
+            f"Batch {b.batch_id}: item_to_order length {len(b.item_to_order)} != {expected}"
 
 
 # ── simulation completion ─────────────────────────────────────────────────────
@@ -2524,11 +2004,18 @@ def test_all_orders_complete_quad(n_orders):
     assert len(sim.completed_metrics) == n_orders
 
 
-def test_fifo_picks_full_orders_no_restock_delay():
+@pytest.mark.parametrize("n_orders,per_order", [
+    (5,  4),
+    (10, 4),
+    (20, 3),
+])
+def test_fifo_total_items_equals_orders_times_per_order(n_orders, per_order):
     items = catalog()
-    sim = run_sim(DEFAULT, items, orders(items, n=10), restock_delay=0)
-    bad = [m for m in sim.completed_metrics if m.items_picked != 4]
-    assert not bad, f"Short picks with restock_delay=0: {[(m.order_id, m.items_picked) for m in bad]}"
+    os = orders(items, n=n_orders, per_order=per_order)
+    sim = run_sim(DEFAULT, items, os)
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order, \
+        f"Expected {n_orders * per_order} items total, got {total}"
 
 
 @pytest.mark.parametrize("strategy,batch_size", [
@@ -2538,11 +2025,16 @@ def test_fifo_picks_full_orders_no_restock_delay():
     ("tsp",  4),
 ])
 def test_all_orders_get_metrics(strategy, batch_size):
+    n_orders, per_order = 8, 4
     items = catalog()
-    os = orders(items, n=8)
+    os = orders(items, n=n_orders, per_order=per_order)
     sim = run_sim(DEFAULT, items, os, strategy=strategy, batch_size=batch_size, restock_delay=0)
-    assert len(sim.completed_metrics) == len(os), \
-        f"strategy={strategy} bs={batch_size}: {len(sim.completed_metrics)} metrics for {len(os)} orders"
+    assert len(sim.completed_metrics) == n_orders, \
+        f"strategy={strategy} bs={batch_size}: {len(sim.completed_metrics)} metrics for {n_orders} orders"
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    expected = n_orders * per_order
+    assert total == expected, \
+        f"strategy={strategy} bs={batch_size}: total items {total} != {expected}"
 
 
 def test_summary_totals_consistent():
@@ -2552,6 +2044,102 @@ def test_summary_totals_consistent():
     assert s.total_orders == len(sim.completed_metrics)
     assert s.total_items  == sum(m.items_picked for m in sim.completed_metrics)
     assert s.total_distance == sum(m.distance_traveled for m in sim.completed_metrics)
+
+
+# ── multi-agent ───────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("n_agents,n_orders", [(2, 10), (3, 15), (4, 20)])
+def test_multi_agent_all_orders_complete(n_agents, n_orders):
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=n_orders), n_agents=n_agents)
+    assert len(sim.completed_metrics) == n_orders, \
+        f"{n_agents} agents: {len(sim.completed_metrics)} metrics for {n_orders} orders"
+
+
+@pytest.mark.parametrize("n_agents", [2, 3, 4])
+def test_multi_agent_no_position_collision(n_agents):
+    """No two agents share the same cell in any tick."""
+    items = catalog()
+    os = orders(items, n=12)
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    from warehouse.agent import PickAgent
+    from warehouse.simulation import Simulation
+    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(n_agents)]
+    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0)
+    for o in os:
+        sim.enqueue_order(o)
+    pack_pos = DEFAULT.pack_station_pos
+    while sim.current_tick < 10_000:
+        positions = [a.pos for a in sim.agents if a.pos != pack_pos]
+        assert len(positions) == len(set(positions)), \
+            f"Tick {sim.current_tick}: collision outside pack station {[a.pos for a in sim.agents]}"
+        if not sim.step():
+            break
+
+
+@pytest.mark.parametrize("n_agents,batch_size,strategy", [
+    (2, 1, "none"),
+    (4, 1, "none"),
+    (2, 2, "tsp"),
+    (3, 2, "zone"),
+])
+def test_multi_agent_no_simultaneous_deposit(n_agents, batch_size, strategy):
+    """station_busy flag: at most one agent deposits per tick regardless of strategy."""
+    items = catalog()
+    os = orders(items, n=12)
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(n_agents)]
+    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0)
+
+    if strategy == "tsp":
+        for b in GreedyTSPBatcher(inventory, DEFAULT, max_batch_size=batch_size).batch(os):
+            sim.enqueue_batch(b)
+    elif strategy == "zone":
+        for b in ZoneBatcher(DEFAULT, inventory, max_batch_size=batch_size).batch(os):
+            sim.enqueue_batch(b)
+    else:
+        for o in os:
+            sim.enqueue_order(o)
+
+    depositing_agents_per_tick = []
+    prev_count = 0
+    while sim.current_tick < 10_000:
+        if not sim.step():
+            break
+        new_completions = len(sim.completed_metrics) - prev_count
+        if new_completions > 0:
+            # Count how many distinct agents just finished (station_busy allows max 1)
+            depositing_agents_per_tick.append(new_completions)
+        prev_count = len(sim.completed_metrics)
+
+    # Each deposit event may complete multiple orders (one per order in a batch),
+    # but only one agent may deposit per tick — so the max orders completed in
+    # a single tick is bounded by the largest batch size used.
+    assert all(d <= batch_size for d in depositing_agents_per_tick), \
+        f"A tick completed more orders than one batch allows: {depositing_agents_per_tick}"
+
+
+@pytest.mark.parametrize("n_agents", [2, 3])
+def test_multi_agent_total_items_correct(n_agents):
+    n_orders, per_order = 12, 4
+    items = catalog()
+    os = orders(items, n=n_orders, per_order=per_order)
+    sim = run_sim(DEFAULT, items, os, n_agents=n_agents)
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order, \
+        f"{n_agents} agents: total items {total} != {n_orders * per_order}"
+
+
+def test_multi_agent_faster_than_single():
+    """Two agents should complete the same orders in fewer ticks than one."""
+    items = catalog()
+    os = orders(items, n=20)
+    sim1 = run_sim(DEFAULT, items, os, n_agents=1)
+    sim2 = run_sim(DEFAULT, items, os, n_agents=2)
+    assert sim2.current_tick < sim1.current_tick, \
+        f"2 agents ({sim2.current_tick} ticks) not faster than 1 ({sim1.current_tick} ticks)"
 
 
 # ── server WebSocket messages ─────────────────────────────────────────────────
@@ -2602,6 +2190,145 @@ def test_server_tick_has_active_batch(strategy):
     ticks = [m for m in msgs if m["type"] == "tick"]
     assert ticks, "No tick messages received"
     assert all("active_batch" in t for t in ticks), "Some tick frames missing active_batch key"
+
+
+def test_server_tick_agents_array_shape():
+    """Tick messages must include an 'agents' array with correct per-agent keys."""
+    msgs = run_server(n_orders=4)
+    ticks = [m for m in msgs if m["type"] == "tick"]
+    assert ticks
+    required_keys = {"id", "row", "col", "state", "carrying", "active_batch"}
+    for t in ticks:
+        assert "agents" in t, "tick missing 'agents' key"
+        assert isinstance(t["agents"], list) and len(t["agents"]) >= 1
+        for a in t["agents"]:
+            missing = required_keys - a.keys()
+            assert not missing, f"agent entry missing keys {missing}"
+
+
+# ── restock ───────────────────────────────────────────────────────────────────
+
+def test_restock_delay_orders_complete():
+    """Orders blocked by stockout still complete once items are restocked."""
+    items = catalog(n_items=10, n_families=2, seed=7)
+    # Use more orders than stock can serve at once; restock_delay ensures
+    # the queue has to wait for replenishment.
+    os = orders(items, n=15, per_order=3, seed=7)
+    sim = run_sim(DEFAULT, items, os, restock_delay=5)
+    assert len(sim.completed_metrics) == 15, \
+        f"Expected 15 completed orders, got {len(sim.completed_metrics)}"
+
+
+def test_restock_delay_slows_throughput():
+    """A positive restock_delay should cause more ticks than delay=0 when stock is exhausted."""
+    items = catalog(n_items=10, n_families=2, seed=7)
+    os = orders(items, n=15, per_order=3, seed=7)
+
+    sim_fast = run_sim(DEFAULT, items, os, restock_delay=0)
+    sim_slow = run_sim(DEFAULT, items, os, restock_delay=30)
+
+    assert sim_slow.current_tick >= sim_fast.current_tick, (
+        f"restock_delay=30 finished in {sim_slow.current_tick} ticks, "
+        f"faster than delay=0 ({sim_fast.current_tick} ticks)"
+    )
+
+
+def test_restock_items_return_to_stock_after_deposit():
+    """After an agent deposits items, those items re-enter inventory after restock_delay ticks."""
+    items = catalog(n_items=10, n_families=2, seed=7)
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items, initial_stock=1)
+    restock_delay = 20
+
+    agent = PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)
+    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=restock_delay)
+
+    # One order per item so every slot gets drained exactly once
+    from warehouse.inventory import Order
+    first_order = orders(items, n=1, per_order=4, seed=7)[0]
+    sim.enqueue_order(first_order)
+
+    # Run until the first order completes (items deposited → restock queue populated)
+    while sim.current_tick < 10_000 and not sim.completed_metrics:
+        sim.step()
+
+    assert sim.completed_metrics, "First order never completed"
+    deposit_tick = sim.completed_metrics[0].completed_at_tick
+
+    # Immediately after deposit, picked items must be unavailable
+    for iid in first_order.item_ids:
+        assert inventory.stock_level(iid) == 0, \
+            f"Item {iid} already restocked before delay (tick {sim.current_tick})"
+
+    # Run until the restock delay has elapsed from the deposit tick
+    target_tick = deposit_tick + restock_delay + 1
+    while sim.current_tick < target_tick:
+        if not sim.step():
+            break
+
+    # Items should now be back in stock
+    for iid in first_order.item_ids:
+        assert inventory.stock_level(iid) > 0, \
+            f"Item {iid} not restocked after delay (tick {sim.current_tick}, deposit at {deposit_tick})"
+
+
+# ── multi-agent + batch strategies ───────────────────────────────────────────
+
+@pytest.mark.parametrize("strategy,batch_size,n_agents", [
+    ("zone", 2, 2),
+    ("zone", 3, 3),
+    ("tsp",  2, 2),
+    ("tsp",  3, 3),
+    ("tsp",  2, 4),
+])
+def test_multi_agent_batch_all_orders_complete(strategy, batch_size, n_agents):
+    n_orders, per_order = 12, 4
+    items = catalog()
+    os = orders(items, n=n_orders, per_order=per_order)
+    sim = run_sim(DEFAULT, items, os, strategy=strategy, batch_size=batch_size, n_agents=n_agents)
+    assert len(sim.completed_metrics) == n_orders, (
+        f"strategy={strategy} bs={batch_size} agents={n_agents}: "
+        f"{len(sim.completed_metrics)} metrics for {n_orders} orders"
+    )
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order, (
+        f"strategy={strategy} bs={batch_size} agents={n_agents}: "
+        f"total items {total} != {n_orders * per_order}"
+    )
+
+
+@pytest.mark.parametrize("n_agents", [2, 3])
+def test_multi_agent_summary_totals_consistent(n_agents):
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=12), n_agents=n_agents)
+    s = sim.get_summary()
+    assert s.total_orders == len(sim.completed_metrics)
+    assert s.total_items == sum(m.items_picked for m in sim.completed_metrics)
+    assert s.total_distance == sum(m.distance_traveled for m in sim.completed_metrics)
+    assert s.idle_ticks >= 0
+    assert s.idle_ticks <= s.total_ticks
+
+
+# ── wait ticks ────────────────────────────────────────────────────────────────
+
+def test_wait_ticks_nonzero_when_queue_backpressure():
+    """Orders that sit in queue behind a stockout should accumulate wait_ticks > 0."""
+    items = catalog(n_items=5, n_families=1, seed=3)
+    inventory = Inventory(DEFAULT)
+    # seed with stock=1 so each pick drains the slot; restock_delay creates a wait
+    inventory.seed(items, initial_stock=1)
+
+    agent = PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)
+    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=20)
+
+    os = orders(items, n=8, per_order=2, seed=3)
+    for o in os:
+        sim.enqueue_order(o)
+    sim.run(max_ticks=50_000)
+
+    wait_values = [m.wait_ticks for m in sim.completed_metrics]
+    assert any(w > 0 for w in wait_values), \
+        f"Expected some orders to have wait_ticks > 0; got {wait_values}"
 
 ```
 
@@ -2623,6 +2350,12 @@ class AgentState(Enum):
     MOVING_TO_STATION = "moving_to_station"
 
 
+class StepResult(Enum):
+    MOVED = "moved"
+    WAITING = "waiting"   # next cell occupied; stays in place
+    ARRIVED = "arrived"   # path exhausted
+
+
 class PickAgent:
     def __init__(self, agent_id: str, start_pos: tuple[int, int], grid: WarehouseGrid) -> None:
         self.agent_id = agent_id
@@ -2633,21 +2366,27 @@ class PickAgent:
         self.state = AgentState.IDLE
 
         self._path: list[tuple[int, int]] = []
-        self._task_queue: list[tuple[tuple[int, int], str]] = []  # (stand_pos, item_id)
+        self._task_queue: list[tuple[tuple[int, int], str, str]] = []  # (stand_pos, item_id, order_id)
+        self._carried_order_ids: list[str] = []
         self._pack_pos: tuple[int, int] = start_pos
         self._batch: BatchedOrder | None = None
+        self._wait_count: int = 0  # consecutive ticks blocked by another agent
 
     # ------------------------------------------------------------------
     # Pathfinding
     # ------------------------------------------------------------------
 
-    def find_path(self, goal: tuple[int, int]) -> list[tuple[int, int]]:
-        """A* returning list of positions from current pos to goal (exclusive of start)."""
+    def find_path(
+        self,
+        goal: tuple[int, int],
+        occupied_cells: set[tuple[int, int]] | None = None,
+    ) -> list[tuple[int, int]]:
+        """A* returning list of positions from current pos to goal (exclusive of start).
+        occupied_cells: positions to treat as blocked during planning."""
         start = self.pos
         if start == goal:
             return []
 
-        # heap: (f, g, pos, path)
         open_heap: list[tuple[int, int, tuple[int, int], list[tuple[int, int]]]] = []
         heapq.heappush(open_heap, (self._h(start, goal), 0, start, []))
         visited: set[tuple[int, int]] = set()
@@ -2665,9 +2404,14 @@ class PickAgent:
             for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 nr, nc = pos[0] + dr, pos[1] + dc
                 neighbor = (nr, nc)
-                if neighbor not in visited and self.grid.is_walkable(nr, nc):
-                    ng = g + 1
-                    heapq.heappush(open_heap, (ng + self._h(neighbor, goal), ng, neighbor, new_path))
+                if neighbor in visited:
+                    continue
+                if not self.grid.is_walkable(nr, nc):
+                    continue
+                if occupied_cells and neighbor in occupied_cells:
+                    continue
+                ng = g + 1
+                heapq.heappush(open_heap, (ng + self._h(neighbor, goal), ng, neighbor, new_path))
 
         return []  # no path found
 
@@ -2679,29 +2423,41 @@ class PickAgent:
     # Movement
     # ------------------------------------------------------------------
 
-    def step(self) -> bool:
-        """Advance one cell along _path. Returns True if moved, False if arrived."""
+    def step(self, occupied_cells: set[tuple[int, int]] | None = None) -> StepResult:
+        """Advance one cell along _path. Returns StepResult."""
         if not self._path:
-            return False
+            self._wait_count = 0
+            return StepResult.ARRIVED
+        next_cell = self._path[0]
+        if occupied_cells and next_cell in occupied_cells:
+            self._wait_count += 1
+            return StepResult.WAITING
+        self._wait_count = 0
         self.pos = self._path.pop(0)
         self.total_distance += 1
-        return True
+        return StepResult.MOVED
 
     # ------------------------------------------------------------------
     # Order execution
     # ------------------------------------------------------------------
 
-    def assign_batch(self, batch: BatchedOrder, inventory: Inventory, pack_pos: tuple[int, int]) -> None:
+    def assign_batch(
+        self,
+        batch: BatchedOrder,
+        inventory: Inventory,
+        pack_pos: tuple[int, int],
+        occupied_cells: set[tuple[int, int]] | None = None,
+    ) -> None:
         self._pack_pos = pack_pos
         self._batch = batch
 
-        targets: list[tuple[tuple[int, int], str]] = []
-        for item_id in batch.unified_item_ids:
+        targets: list[tuple[tuple[int, int], str, str]] = []
+        for item_id, order_id in zip(batch.unified_item_ids, batch.item_to_order):
             slot = inventory.get_slot(item_id)
-            targets.append((slot.stand_pos, item_id))
+            targets.append((slot.stand_pos, item_id, order_id))
 
         # Greedy nearest-neighbor ordering
-        ordered: list[tuple[tuple[int, int], str]] = []
+        ordered: list[tuple[tuple[int, int], str, str]] = []
         current = self.pos
         remaining = list(targets)
         while remaining:
@@ -2711,6 +2467,9 @@ class PickAgent:
             current = chosen[0]
 
         self._task_queue = ordered
+        # Path planning ignores other agents — step-level blocking handles collisions.
+        # Passing occupied_cells to A* can produce empty paths when all routes are
+        # temporarily blocked, causing agents to falsely "arrive" at wrong positions.
         self._advance_to_next_task()
 
     def assign_order(self, order: Order, inventory: Inventory, pack_pos: tuple[int, int]) -> None:
@@ -2719,41 +2478,61 @@ class PickAgent:
                 batch_id=order.order_id,
                 orders=[order],
                 unified_item_ids=list(order.item_ids),
-                item_to_order={iid: order.order_id for iid in order.item_ids},
+                item_to_order=[order.order_id for _ in order.item_ids],
             ),
             inventory,
             pack_pos,
         )
 
-    def _advance_to_next_task(self) -> None:
+    def _advance_to_next_task(
+        self, occupied_cells: set[tuple[int, int]] | None = None
+    ) -> None:
         if self._task_queue:
-            next_stand, _ = self._task_queue[0]
-            self._path = self.find_path(next_stand)
+            next_stand, _, _ = self._task_queue[0]
+            self._path = self.find_path(next_stand, occupied_cells)
             self.state = AgentState.MOVING_TO_RACK
         else:
-            self._path = self.find_path(self._pack_pos)
+            self._path = self.find_path(self._pack_pos, occupied_cells)
             self.state = AgentState.MOVING_TO_STATION
+
+    def replan(self, occupied_cells: set[tuple[int, int]] | None = None) -> None:
+        """Replan path to current target. Tries to route around occupied cells;
+        falls back to a free path if no detour exists."""
+        if self._task_queue:
+            goal, _, _ = self._task_queue[0]
+        elif self.state == AgentState.MOVING_TO_STATION:
+            goal = self._pack_pos
+        else:
+            return
+        if self.pos == goal:
+            self._path = []
+            return
+        new_path = self.find_path(goal, occupied_cells)
+        if not new_path:
+            new_path = self.find_path(goal)
+        self._path = new_path
 
     def execute_pick(self, inventory: Inventory) -> Item | None:
         """Called when agent arrives at a rack stand_pos. Picks item, advances queue."""
         if not self._task_queue:
             return None
-        _, item_id = self._task_queue.pop(0)
+        _, item_id, order_id = self._task_queue.pop(0)
         item = inventory.remove_item(item_id)
         self.carried_items.append(item)
+        self._carried_order_ids.append(order_id)
         self._advance_to_next_task()
         return item
 
     def execute_deposit(self) -> tuple[list[Item], dict[str, list[str]]]:
         """Called when agent arrives at pack station. Returns (items, order_id -> [item_ids])."""
         deposited = list(self.carried_items)
+        carried_oids = list(self._carried_order_ids)
         self.carried_items = []
+        self._carried_order_ids = []
         self.state = AgentState.IDLE
         order_breakdown: dict[str, list[str]] = {}
-        if self._batch is not None:
-            for item in deposited:
-                oid = self._batch.item_to_order.get(item.item_id, "unknown")
-                order_breakdown.setdefault(oid, []).append(item.item_id)
+        for item, oid in zip(deposited, carried_oids):
+            order_breakdown.setdefault(oid, []).append(item.item_id)
         self._batch = None
         return deposited, order_breakdown
 
@@ -2810,7 +2589,7 @@ def _run_scenario(
     inventory.seed(placement[:n], slot_order=sorted_slot_indices[:n])
 
     agent = PickAgent("A1", grid.pack_station_pos, grid)
-    sim = Simulation(grid, inventory, agent)
+    sim = Simulation(grid, inventory, [agent])
     for order in orders:
         sim.enqueue_order(order)
     return sim.run(max_ticks=max_ticks)
@@ -3019,7 +2798,7 @@ def run_batch_analysis(
 
                 batches = batcher.batch(orders)
                 agent = PickAgent("A1", grid.pack_station_pos, grid)
-                sim = Simulation(grid, inventory, agent)
+                sim = Simulation(grid, inventory, [agent])
                 for batch in batches:
                     sim.enqueue_batch(batch)
                 metrics = sim.run()
@@ -3056,8 +2835,8 @@ from warehouse.grid import WarehouseGrid
 class BatchedOrder:
     batch_id: str
     orders: list[Order]
-    unified_item_ids: list[str]    # pick list; duplicates preserved for multi-qty items
-    item_to_order: dict[str, str]  # item_id -> order_id
+    unified_item_ids: list[str]  # pick list; one entry per pick (duplicates allowed)
+    item_to_order: list[str]     # parallel to unified_item_ids: order_id for each pick
 
 
 class BatchStrategy(Protocol):
@@ -3065,16 +2844,15 @@ class BatchStrategy(Protocol):
 
 
 def _make_batch(orders: list[Order]) -> BatchedOrder:
+    if not orders:
+        raise ValueError("Cannot create a batch from an empty order list")
     batch_id = orders[0].order_id if len(orders) == 1 else f"B-{orders[0].order_id}"
-    seen: set[str] = set()
     unified: list[str] = []
-    item_to_order: dict[str, str] = {}
+    item_to_order: list[str] = []
     for order in orders:
         for iid in order.item_ids:
-            if iid not in seen:
-                seen.add(iid)
-                unified.append(iid)
-                item_to_order[iid] = order.order_id
+            unified.append(iid)
+            item_to_order.append(order.order_id)
     return BatchedOrder(
         batch_id=batch_id,
         orders=orders,
@@ -3092,7 +2870,7 @@ class FIFOBatcher:
                 batch_id=order.order_id,
                 orders=[order],
                 unified_item_ids=list(order.item_ids),
-                item_to_order={iid: order.order_id for iid in order.item_ids},
+                item_to_order=[order.order_id for _ in order.item_ids],
             )
             for order in orders
         ]
@@ -3255,6 +3033,11 @@ def generate_orders(
       - Fill remaining slots from the full catalog
       - Both draws are weighted by demand_weight
     """
+    if items_per_order > len(items):
+        raise ValueError(
+            f"items_per_order ({items_per_order}) exceeds catalog size ({len(items)})"
+        )
+
     rng = np.random.default_rng(seed)
 
     # Group items by family
@@ -3339,13 +3122,13 @@ class WarehouseGrid:
     def _fill_rack_bands(g: np.ndarray, row_start: int, row_end: int,
                          col_start: int, col_end: int) -> None:
         """Fill alternating 2-wide RACK bands within a rectangular region (exclusive end).
-        Bands are separated by 2-cell aisles to allow congestion modelling."""
-        col = col_start + 1
-        while col + 1 < col_end - 1:
-            for r in range(row_start + 1, row_end - 1):
+        2-cell outer walls on all sides; 3-cell corridors between bands so agents can pass."""
+        col = col_start + 2
+        while col + 1 < col_end - 2:
+            for r in range(row_start + 2, row_end - 2):
                 g[r, col] = CellType.RACK
                 g[r, col + 1] = CellType.RACK
-            col += 4
+            col += 5  # 2 rack + 3 corridor
 
     @staticmethod
     def _assign_zones(
@@ -3390,14 +3173,14 @@ class WarehouseGrid:
         }
 
     @staticmethod
-    def build_default(rows: int = 12, cols: int = 24) -> "WarehouseGrid":
+    def build_default(rows: int = 14, cols: int = 26) -> "WarehouseGrid":
         """
         Symmetrical standard layout:
           - All cells start as AISLE
-          - Alternating 2-wide RACK bands separated by 2-col aisles
-          - Outer rows and cols remain AISLE (corridors on all four sides)
+          - 2-wide RACK bands separated by 3-cell corridors (wide enough for agents to pass)
+          - 2-cell outer wall on all four sides
           - Pack station at bottom-left (rows-1, 0)
-        cols=24 gives 6 rack bands with 2-cell aisles between them.
+        cols=26 gives 5 rack bands; rows=14 gives 10 pick rows.
         """
         g = np.full((rows, cols), CellType.AISLE, dtype=np.uint8)
         WarehouseGrid._fill_rack_bands(g, 0, rows, 0, cols)
@@ -3408,7 +3191,7 @@ class WarehouseGrid:
                              pack_station_pos=pack_pos, zone_map=zone_map)
 
     @staticmethod
-    def build_quad(unit_rows: int = 12, unit_cols: int = 24) -> "WarehouseGrid":
+    def build_quad(unit_rows: int = 14, unit_cols: int = 26) -> "WarehouseGrid":
         """
         Four default layouts arranged in a 2×2 grid.
         Total size: (2*unit_rows) × (2*unit_cols).
@@ -3531,7 +3314,7 @@ class Inventory:
         self,
         items: list[Item],
         slot_order: list[int] | None = None,
-        initial_stock: int = 1,
+        initial_stock: int = 10,
     ) -> None:
         """
         Assign items to rack slots.
@@ -3545,9 +3328,14 @@ class Inventory:
             pairs = [(items[i], self._slots[slot_order[i]]) for i in range(len(items))]
         else:
             empty = [s for s in self._slots if s.item is None]
-            if len(items) > len(empty):
-                raise ValueError(f"More items ({len(items)}) than available slots ({len(empty)})")
-            pairs = [(items[i], empty[i]) for i in range(len(items))]
+            n = len(items)
+            if n > len(empty):
+                raise ValueError(f"More items ({n}) than available slots ({len(empty)})")
+            # Stride evenly so items spread across the whole warehouse,
+            # not just the first rows discovered top-to-bottom.
+            step = len(empty) / n if n < len(empty) else 1
+            indices = [int(i * step) for i in range(n)]
+            pairs = [(items[i], empty[indices[i]]) for i in range(n)]
 
         for item, slot in pairs:
             slot.item = item
@@ -3689,11 +3477,11 @@ def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
 
 ```python
 from __future__ import annotations
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from warehouse.grid import WarehouseGrid
 from warehouse.inventory import Inventory, Item, Order
-from warehouse.agent import PickAgent, AgentState
+from warehouse.agent import PickAgent, AgentState, StepResult
 from warehouse.batcher import BatchedOrder
 
 
@@ -3731,36 +3519,57 @@ class Simulation:
         self,
         grid: WarehouseGrid,
         inventory: Inventory,
-        agent: PickAgent,
+        agents: list[PickAgent],
         restock_delay: int = 10,
     ) -> None:
         self.grid = grid
         self.inventory = inventory
-        self.agent = agent
+        self.agents = agents
         self.order_queue: deque[Order] = deque()
         self.batch_queue: deque[BatchedOrder] = deque()
         self.completed_metrics: list[OrderMetrics] = []
         self.current_tick: int = 0
-        self._active_batch: BatchedOrder | None = None
-        self._order_start_tick: int = 0
-        self._order_start_distance: int = 0
 
-        # Restock queue (1b)
+        # Per-agent batch tracking
+        self._agent_batch: dict[str, BatchedOrder | None] = {a.agent_id: None for a in agents}
+        self._agent_start_tick: dict[str, int] = {a.agent_id: 0 for a in agents}
+        self._agent_start_dist: dict[str, int] = {a.agent_id: 0 for a in agents}
+
+        # Pack station contention
+        self.station_busy: bool = False
+
+        # Restock queue
         self.restock_delay = restock_delay
         self.restock_queue: list[RestockJob] = []
         self.stockout_count: int = 0
 
-        # Metrics tracking (1c)
+        # Metrics tracking
         self.idle_ticks: int = 0
         self._order_enqueue_tick: dict[str, int] = {}
         self._order_wait_ticks: dict[str, int] = {}
 
+    # ------------------------------------------------------------------
+    # Backward-compat properties (single-agent callers)
+    # ------------------------------------------------------------------
+
+    @property
+    def agent(self) -> PickAgent:
+        return self.agents[0]
+
+    @property
+    def _active_batch(self) -> BatchedOrder | None:
+        return self._agent_batch.get(self.agents[0].agent_id)
+
     @property
     def _active_order(self) -> Order | None:
-        """Compat shim for server.py which reads sim._active_order directly."""
-        if self._active_batch is None:
+        batch = self._active_batch
+        if batch is None:
             return None
-        return self._active_batch.orders[0] if self._active_batch.orders else None
+        return batch.orders[0] if batch.orders else None
+
+    # ------------------------------------------------------------------
+    # Queue management
+    # ------------------------------------------------------------------
 
     def enqueue_order(self, order: Order) -> None:
         self.order_queue.append(order)
@@ -3771,105 +3580,143 @@ class Simulation:
         for order in batch.orders:
             self._order_enqueue_tick[order.order_id] = self.current_tick
 
-    def step(self) -> bool:
-        """Advance simulation by one tick. Returns True while work remains."""
-        agent = self.agent
+    # ------------------------------------------------------------------
+    # Per-agent dispatch and deposit helpers
+    # ------------------------------------------------------------------
 
-        # Process restock queue — release items whose delay has elapsed
-        ready = [j for j in self.restock_queue if j.ready_at_tick <= self.current_tick]
-        for job in ready:
-            self.restock_queue.remove(job)
-            self.inventory.restock(job.item)
-
-        # Dispatch next work when idle
-        if agent.state == AgentState.IDLE:
-            dispatched = False
-
-            # batch_queue takes priority — peek without removing; defer if any item is out of stock
-            if self.batch_queue:
-                front = self.batch_queue[0]
-                if all(iid in self.inventory._item_to_slot for iid in front.unified_item_ids):
-                    self.batch_queue.popleft()
-                    for order in front.orders:
-                        wait = self.current_tick - self._order_enqueue_tick.get(
-                            order.order_id, self.current_tick
-                        )
-                        self._order_wait_ticks[order.order_id] = wait
-                    self._active_batch = front
-                    self._order_start_tick = self.current_tick
-                    self._order_start_distance = agent.total_distance
-                    agent.assign_batch(front, self.inventory, self.grid.pack_station_pos)
-                    dispatched = True
-
-            # Fall back to order_queue — try each order once; defer unavailable ones to the back
-            if not dispatched:
-                queue_size = len(self.order_queue)
-                skipped = 0
-                while self.order_queue and skipped < queue_size:
-                    order = self.order_queue.popleft()
-                    if not all(iid in self.inventory._item_to_slot for iid in order.item_ids):
-                        self.order_queue.append(order)
-                        skipped += 1
-                        continue
+    def _dispatch_agent(self, agent: PickAgent, occupied: set[tuple[int, int]]) -> bool:
+        """Try to assign the next available batch or order to an idle agent.
+        Returns True if something was dispatched."""
+        # batch_queue: peek without removing; defer if stock insufficient
+        if self.batch_queue:
+            front = self.batch_queue[0]
+            needed = Counter(front.unified_item_ids)
+            if all(self.inventory.stock_level(iid) >= cnt for iid, cnt in needed.items()):
+                self.batch_queue.popleft()
+                for order in front.orders:
                     wait = self.current_tick - self._order_enqueue_tick.get(
                         order.order_id, self.current_tick
                     )
                     self._order_wait_ticks[order.order_id] = wait
-                    batch = BatchedOrder(
-                        batch_id=order.order_id,
-                        orders=[order],
-                        unified_item_ids=list(order.item_ids),
-                        item_to_order={iid: order.order_id for iid in order.item_ids},
-                    )
-                    self._active_batch = batch
-                    self._order_start_tick = self.current_tick
-                    self._order_start_distance = agent.total_distance
-                    agent.assign_batch(batch, self.inventory, self.grid.pack_station_pos)
-                    dispatched = True
-                    break
-
-            if not dispatched:
-                has_pending = bool(self.restock_queue or self.order_queue or self.batch_queue)
-                if not has_pending:
-                    return False
-                # Waiting for items to restock; agent idles this tick
-                self.idle_ticks += 1
-                self.current_tick += 1
+                self._agent_batch[agent.agent_id] = front
+                self._agent_start_tick[agent.agent_id] = self.current_tick
+                self._agent_start_dist[agent.agent_id] = agent.total_distance
+                agent.assign_batch(front, self.inventory, self.grid.pack_station_pos, occupied)
                 return True
 
-        # Move agent one step
-        arrived = not agent.step()  # step() returns False when path exhausted
+        # order_queue: try each once; defer unavailable ones to the back
+        queue_size = len(self.order_queue)
+        skipped = 0
+        while self.order_queue and skipped < queue_size:
+            order = self.order_queue.popleft()
+            needed = Counter(order.item_ids)
+            if not all(self.inventory.stock_level(iid) >= cnt for iid, cnt in needed.items()):
+                self.order_queue.append(order)
+                skipped += 1
+                continue
+            wait = self.current_tick - self._order_enqueue_tick.get(
+                order.order_id, self.current_tick
+            )
+            self._order_wait_ticks[order.order_id] = wait
+            batch = BatchedOrder(
+                batch_id=order.order_id,
+                orders=[order],
+                unified_item_ids=list(order.item_ids),
+                item_to_order=[order.order_id for _ in order.item_ids],
+            )
+            self._agent_batch[agent.agent_id] = batch
+            self._agent_start_tick[agent.agent_id] = self.current_tick
+            self._agent_start_dist[agent.agent_id] = agent.total_distance
+            agent.assign_batch(batch, self.inventory, self.grid.pack_station_pos, occupied)
+            return True
 
-        # Handle arrival
-        if arrived:
-            if agent.state == AgentState.MOVING_TO_RACK:
-                agent.execute_pick(self.inventory)
-            elif agent.state == AgentState.MOVING_TO_STATION:
-                deposited, order_breakdown = agent.execute_deposit()
-                assert self._active_batch is not None
-                batch_distance = agent.total_distance - self._order_start_distance
-                batch_ticks = self.current_tick - self._order_start_tick
-                # Ensure every order in the batch gets a metrics entry even if all
-                # its items were deduplicated away (items_picked=0 rather than missing)
-                for order in self._active_batch.orders:
-                    if order.order_id not in order_breakdown:
-                        order_breakdown[order.order_id] = []
-                for oid, item_ids in order_breakdown.items():
-                    self.completed_metrics.append(OrderMetrics(
-                        order_id=oid,
-                        items_picked=len(item_ids),
-                        distance_traveled=batch_distance,
-                        ticks_taken=batch_ticks,
-                        completed_at_tick=self.current_tick,
-                        wait_ticks=self._order_wait_ticks.get(oid, 0),
-                    ))
-                self._active_batch = None
-                for item in deposited:
-                    self.restock_queue.append(RestockJob(
-                        item_id=item.item_id,
-                        item=item,
-                        ready_at_tick=self.current_tick + self.restock_delay,
-                    ))
+        return False
+
+    def _do_deposit(self, agent: PickAgent) -> None:
+        """Execute deposit for an agent that has arrived at the pack station."""
+        deposited, order_breakdown = agent.execute_deposit()
+        batch = self._agent_batch[agent.agent_id]
+        assert batch is not None
+        batch_distance = agent.total_distance - self._agent_start_dist[agent.agent_id]
+        batch_ticks = self.current_tick - self._agent_start_tick[agent.agent_id]
+        for oid, item_ids in order_breakdown.items():
+            self.completed_metrics.append(OrderMetrics(
+                order_id=oid,
+                items_picked=len(item_ids),
+                distance_traveled=batch_distance,
+                ticks_taken=batch_ticks,
+                completed_at_tick=self.current_tick,
+                wait_ticks=self._order_wait_ticks.pop(oid, 0),
+            ))
+            self._order_enqueue_tick.pop(oid, None)
+        self._agent_batch[agent.agent_id] = None
+        for item in deposited:
+            self.restock_queue.append(RestockJob(
+                item_id=item.item_id,
+                item=item,
+                ready_at_tick=self.current_tick + self.restock_delay,
+            ))
+
+    # ------------------------------------------------------------------
+    # Main simulation loop
+    # ------------------------------------------------------------------
+
+    def step(self) -> bool:
+        """Advance simulation by one tick. Returns True while work remains."""
+        # 1. Process restock queue
+        due, self.restock_queue = (
+            [j for j in self.restock_queue if j.ready_at_tick <= self.current_tick],
+            [j for j in self.restock_queue if j.ready_at_tick > self.current_tick],
+        )
+        for job in due:
+            self.inventory.restock(job.item)
+
+        # 2. Reset station contention flag for this tick
+        self.station_busy = False
+
+        # 3. Dispatch idle agents serially (serial order = implicit order lock)
+        occupied = {a.pos for a in self.agents}
+        for agent in self.agents:
+            if agent.state == AgentState.IDLE:
+                self._dispatch_agent(agent, occupied)
+
+        # 4. Move each active agent and handle arrivals.
+        # Recompute occupied before each agent so moves earlier in the loop
+        # are visible to agents later in the loop — prevents two agents
+        # stepping onto the same cell in the same tick.
+        # IDLE agents are excluded: they sit at the pack station and must not
+        # block a moving agent from arriving there to deposit.
+        for idx, agent in enumerate(self.agents):
+            if agent.state == AgentState.IDLE:
+                continue
+
+            occupied = {a.pos for a in self.agents if a.state != AgentState.IDLE}
+            result = agent.step(occupied - {agent.pos})
+
+            if result == StepResult.WAITING:
+                # Stagger replan threshold by agent index so lower-priority agents
+                # yield first, preventing simultaneous replans that cause new deadlocks.
+                threshold = 3 + 2 * idx
+                if agent._wait_count >= threshold:
+                    agent.replan(occupied - {agent.pos})
+            elif result == StepResult.ARRIVED:
+                if agent.state == AgentState.MOVING_TO_RACK:
+                    agent.execute_pick(self.inventory)
+                elif agent.state == AgentState.MOVING_TO_STATION:
+                    if self.station_busy:
+                        pass  # hold in MOVING_TO_STATION; retry next tick
+                    else:
+                        self.station_busy = True
+                        self._do_deposit(agent)
+
+        # 5. Termination and idle tracking
+        all_idle = all(a.state == AgentState.IDLE for a in self.agents)
+        has_pending = bool(self.restock_queue or self.order_queue or self.batch_queue)
+
+        if all_idle:
+            if not has_pending:
+                return False
+            self.idle_ticks += 1
 
         self.current_tick += 1
         return True
@@ -4108,7 +3955,7 @@ def main() -> None:
     inventory.seed(items)
 
     agent = PickAgent(agent_id="A1", start_pos=grid.pack_station_pos, grid=grid)
-    sim = Simulation(grid=grid, inventory=inventory, agent=agent)
+    sim = Simulation(grid=grid, inventory=inventory, agents=[agent])
 
     # Generate 10 orders for a visible live demo (items restock after each deposit)
     orders = generate_orders(items, n_orders=10, items_per_order=4, family_affinity=0.7, seed=42)
@@ -4159,6 +4006,7 @@ from warehouse.agent import PickAgent
 from warehouse.simulation import Simulation
 from warehouse.batcher import ZoneBatcher, GreedyTSPBatcher
 from warehouse.data_gen import generate_catalog, generate_orders
+from warehouse.optimizer import slot_distances, demand_placement, affinity_placement
 
 app = FastAPI()
 
@@ -4267,8 +4115,10 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     family_affinity = config.get("family_affinity", 0.7)
     seed = config.get("seed", 42)
     tick_delay_s = config.get("tick_delay_ms", 80) / 1000.0
+    steps_per_frame = max(1, int(config.get("steps_per_frame", 4)))
     batch_strategy = config.get("batch_strategy", "none")
     batch_size = int(config.get("batch_size", 2))
+    slot_strategy = config.get("slot_strategy", "spread")
 
     grid = WarehouseGrid.from_dict(layout_dict)
     inventory = Inventory(grid)
@@ -4281,14 +4131,25 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
         ))
         return
 
-    inventory.seed(items)
+    # Generate orders before seeding so affinity placement can use co-occurrence data
     orders = generate_orders(
         items, n_orders=n_orders, items_per_order=items_per_order,
         family_affinity=family_affinity, seed=seed
     )
 
-    agent = PickAgent(agent_id="A1", start_pos=grid.pack_station_pos, grid=grid)
-    sim = Simulation(grid=grid, inventory=inventory, agent=agent, restock_delay=0)
+    if slot_strategy in ("demand", "affinity"):
+        sorted_slot_order = [idx for idx, _ in slot_distances(grid, inventory)][:len(items)]
+        if slot_strategy == "demand":
+            ordered_items = demand_placement(items)
+        else:
+            ordered_items = affinity_placement(items, orders)
+        inventory.seed(ordered_items, slot_order=sorted_slot_order)
+    else:
+        inventory.seed(items)
+
+    n_agents = max(1, int(config.get("n_agents", 1)))
+    agents = [PickAgent(agent_id=f"A{i+1}", start_pos=grid.pack_station_pos, grid=grid) for i in range(n_agents)]
+    sim = Simulation(grid=grid, inventory=inventory, agents=agents, restock_delay=0)
 
     if batch_strategy == "zone":
         batches = ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders)
@@ -4322,7 +4183,13 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     prev_metrics_count = 0
 
     while True:
-        has_more = sim.step()
+        # Run steps_per_frame simulation ticks before sending one WebSocket frame.
+        # This lets the simulation appear faster without increasing message rate.
+        has_more = True
+        for _ in range(steps_per_frame):
+            has_more = sim.step()
+            if not has_more:
+                break
 
         # Emit one order_complete per completed order — a batch deposit adds multiple at once
         if len(sim.completed_metrics) > prev_metrics_count:
@@ -4341,6 +4208,19 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
         await websocket.send_text(json.dumps({
             "type": "tick",
             "tick": sim.current_tick,
+            "agents": [
+                {
+                    "id": a.agent_id,
+                    "row": a.pos[0],
+                    "col": a.pos[1],
+                    "state": a.state.value,
+                    "carrying": [item.item_id for item in a.carried_items],
+                    "active_batch": sim._agent_batch[a.agent_id].batch_id
+                        if sim._agent_batch[a.agent_id] else None,
+                }
+                for a in sim.agents
+            ],
+            # backward-compat single-agent fields
             "agent": {
                 "row": sim.agent.pos[0],
                 "col": sim.agent.pos[1],
@@ -4354,23 +4234,39 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
         if not has_more:
             break
 
-        # Wait tick_delay_s before next tick, processing any control messages
+        # Wait tick_delay_s before next frame, processing any control messages
         # that arrive mid-wait without accidentally advancing the simulation.
-        tick_start = asyncio.get_event_loop().time()
-        while True:
-            elapsed = asyncio.get_event_loop().time() - tick_start
-            remaining = tick_delay_s - elapsed
-            if remaining <= 0.005:
-                break
+        if tick_delay_s > 0:
+            tick_start = asyncio.get_event_loop().time()
+            while True:
+                elapsed = asyncio.get_event_loop().time() - tick_start
+                remaining = tick_delay_s - elapsed
+                if remaining <= 0.001:
+                    break
+                try:
+                    msg = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
+                    ctrl = json.loads(msg)
+                    if ctrl.get("type") == "set_speed":
+                        tick_delay_s = max(0, ctrl["tick_delay_ms"] / 1000.0)
+                    elif ctrl.get("type") == "set_steps":
+                        steps_per_frame = max(1, int(ctrl["steps_per_frame"]))
+                    elif ctrl.get("type") == "stop":
+                        return
+                except asyncio.TimeoutError:
+                    break
+        else:
+            # tick_delay_s == 0: still yield to the event loop so WS messages can arrive
             try:
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=0)
                 ctrl = json.loads(msg)
                 if ctrl.get("type") == "set_speed":
-                    tick_delay_s = max(0.01, ctrl["tick_delay_ms"] / 1000.0)
+                    tick_delay_s = max(0, ctrl["tick_delay_ms"] / 1000.0)
+                elif ctrl.get("type") == "set_steps":
+                    steps_per_frame = max(1, int(ctrl["steps_per_frame"]))
                 elif ctrl.get("type") == "stop":
                     return
-            except asyncio.TimeoutError:
-                break
+            except (asyncio.TimeoutError, Exception):
+                await asyncio.sleep(0)  # yield to event loop
 
     summary = sim.get_summary()
     metrics = sim.completed_metrics

@@ -29,11 +29,11 @@ def random_placement(items: list[Item], seed: int = 0) -> list[Item]:
 
 def demand_placement(items: list[Item]) -> list[Item]:
     """
-    Returns items sorted by demand_weight descending.
+    Returns items sorted by pick_rate descending.
     When passed to Inventory.seed() with slot_order from slot_distances(),
     the highest-demand items land in the closest slots to the pack station.
     """
-    return sorted(items, key=lambda i: i.demand_weight, reverse=True)
+    return sorted(items, key=lambda i: i.pick_rate, reverse=True)
 
 
 def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
@@ -42,7 +42,7 @@ def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
 
     1. Build co-occurrence matrix: co[id_a][id_b] = number of orders containing both
     2. Greedily fill slots closest-to-farthest:
-       - Score each unplaced item = demand_weight + alpha * co-occurrence with already-placed items
+       - Score each unplaced item = pick_rate + alpha * co-occurrence with already-placed items
        - Pick highest-scoring item for the current slot
     Returns items in placement order (item[0] → closest slot, item[-1] → farthest).
     """
@@ -57,7 +57,7 @@ def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
                 if a != b:
                     co[a][b] += 1
 
-    # Normalise co-occurrence so it's on a similar scale to demand_weight
+    # Normalise co-occurrence so it's on a similar scale to pick_rate
     max_co = max((v for inner in co.values() for v in inner.values()), default=1)
 
     unplaced = list(items)
@@ -73,7 +73,7 @@ def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
                 co[candidate.item_id].get(pid, 0) / max_co
                 for pid in placed_ids
             )
-            score = candidate.demand_weight + alpha * affinity_score
+            score = candidate.pick_rate + alpha * affinity_score
             if score > best_score:
                 best_score = score
                 best = candidate

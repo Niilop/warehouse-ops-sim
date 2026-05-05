@@ -32,7 +32,7 @@ def generate_catalog(
         items.append(Item(
             item_id=f"I{i:03d}",
             name=f"Product-{i:03d}",
-            demand_weight=float(weights[i]),
+            pick_rate=float(weights[i]),
             family=f"F{i % n_families}",
         ))
     return items
@@ -55,7 +55,7 @@ def generate_orders(
       - Pick a theme family weighted by total family demand sum
       - Sample ceil(items_per_order * family_affinity) items from that family
       - Fill remaining slots from the full catalog
-      - Both draws are weighted by demand_weight
+      - Both draws are weighted by pick_rate
     """
     if items_per_order > len(items):
         raise ValueError(
@@ -71,11 +71,11 @@ def generate_orders(
 
     family_names = list(families.keys())
     family_demand = np.array([
-        sum(i.demand_weight for i in families[f]) for f in family_names
+        sum(i.pick_rate for i in families[f]) for f in family_names
     ])
     family_probs = family_demand / family_demand.sum()
 
-    all_weights = np.array([i.demand_weight for i in items])
+    all_weights = np.array([i.pick_rate for i in items])
 
     orders: list[Order] = []
     for idx in range(n_orders):
@@ -89,7 +89,7 @@ def generate_orders(
         chosen: list[Item] = []
 
         # Sample from theme family
-        fam_weights = np.array([i.demand_weight for i in family_items])
+        fam_weights = np.array([i.pick_rate for i in family_items])
         fam_probs = fam_weights / fam_weights.sum()
         fam_indices = rng.choice(len(family_items), size=n_from_family, replace=False, p=fam_probs)
         chosen.extend(family_items[i] for i in fam_indices)
@@ -101,7 +101,7 @@ def generate_orders(
             chosen_ids = {i.item_id for i in chosen}
             remaining = [i for i in items if i.item_id not in chosen_ids]
             if remaining:
-                rem_weights = np.array([i.demand_weight for i in remaining])
+                rem_weights = np.array([i.pick_rate for i in remaining])
                 rem_probs = rem_weights / rem_weights.sum()
                 n_pick2 = min(n_from_rest, len(remaining))
                 rem_indices = rng.choice(len(remaining), size=n_pick2, replace=False, p=rem_probs)

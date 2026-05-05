@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import pathlib
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -108,6 +109,7 @@ async def ws_simulate(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     except Exception as e:
+        logging.exception(e)
         try:
             await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
         except Exception:

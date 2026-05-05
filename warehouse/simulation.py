@@ -183,9 +183,7 @@ class Simulation:
     # Main simulation loop
     # ------------------------------------------------------------------
 
-    def step(self) -> bool:
-        """Advance simulation by one tick. Returns True while work remains."""
-        # 1. Process restock queue
+    def _process_restocks(self) -> None:
         due, self.restock_queue = (
             [j for j in self.restock_queue if j.ready_at_tick <= self.current_tick],
             [j for j in self.restock_queue if j.ready_at_tick > self.current_tick],
@@ -193,21 +191,18 @@ class Simulation:
         for job in due:
             self.inventory.restock(job.item)
 
-        # 2. Reset station contention flag for this tick
-        self.station_busy = False
-
-        # 3. Dispatch idle agents serially (serial order = implicit order lock)
+    def _dispatch_idle_agents(self) -> None:
+        # Serial dispatch — queue item is popped before the next agent is considered,
+        # so two agents cannot claim the same batch/order in the same tick.
         occupied = {a.pos for a in self.agents}
         for agent in self.agents:
             if agent.state == AgentState.IDLE:
                 self._dispatch_agent(agent, occupied)
 
-        # 4. Move each active agent and handle arrivals.
-        # Recompute occupied before each agent so moves earlier in the loop
-        # are visible to agents later in the loop — prevents two agents
-        # stepping onto the same cell in the same tick.
-        # IDLE agents are excluded: they sit at the pack station and must not
-        # block a moving agent from arriving there to deposit.
+    def _handle_agent_movement(self) -> None:
+        # Recompute occupied before each agent so moves earlier in the loop are
+        # visible to later agents — prevents two agents stepping onto the same cell.
+        # IDLE agents are excluded so they don't block arrivals at the pack station.
         for idx, agent in enumerate(self.agents):
             if agent.state == AgentState.IDLE:
                 continue
@@ -225,16 +220,19 @@ class Simulation:
                 if agent.state == AgentState.MOVING_TO_RACK:
                     agent.execute_pick(self.inventory)
                 elif agent.state == AgentState.MOVING_TO_STATION:
-                    if self.station_busy:
-                        pass  # hold in MOVING_TO_STATION; retry next tick
-                    else:
+                    if not self.station_busy:
                         self.station_busy = True
                         self._do_deposit(agent)
 
-        # 5. Termination and idle tracking
+    def step(self) -> bool:
+        """Advance simulation by one tick. Returns True while work remains."""
+        self._process_restocks()
+        self.station_busy = False
+        self._dispatch_idle_agents()
+        self._handle_agent_movement()
+
         all_idle = all(a.state == AgentState.IDLE for a in self.agents)
         has_pending = bool(self.restock_queue or self.order_queue or self.batch_queue)
-
         if all_idle:
             if not has_pending:
                 return False
