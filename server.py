@@ -123,6 +123,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     family_affinity = config.get("family_affinity", 0.7)
     seed = config.get("seed", 42)
     tick_delay_s = config.get("tick_delay_ms", 80) / 1000.0
+    steps_per_frame = max(1, int(config.get("steps_per_frame", 4)))
     batch_strategy = config.get("batch_strategy", "none")
     batch_size = int(config.get("batch_size", 2))
 
@@ -179,7 +180,13 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     prev_metrics_count = 0
 
     while True:
-        has_more = sim.step()
+        # Run steps_per_frame simulation ticks before sending one WebSocket frame.
+        # This lets the simulation appear faster without increasing message rate.
+        has_more = True
+        for _ in range(steps_per_frame):
+            has_more = sim.step()
+            if not has_more:
+                break
 
         # Emit one order_complete per completed order — a batch deposit adds multiple at once
         if len(sim.completed_metrics) > prev_metrics_count:
@@ -224,23 +231,39 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
         if not has_more:
             break
 
-        # Wait tick_delay_s before next tick, processing any control messages
+        # Wait tick_delay_s before next frame, processing any control messages
         # that arrive mid-wait without accidentally advancing the simulation.
-        tick_start = asyncio.get_event_loop().time()
-        while True:
-            elapsed = asyncio.get_event_loop().time() - tick_start
-            remaining = tick_delay_s - elapsed
-            if remaining <= 0.005:
-                break
+        if tick_delay_s > 0:
+            tick_start = asyncio.get_event_loop().time()
+            while True:
+                elapsed = asyncio.get_event_loop().time() - tick_start
+                remaining = tick_delay_s - elapsed
+                if remaining <= 0.001:
+                    break
+                try:
+                    msg = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
+                    ctrl = json.loads(msg)
+                    if ctrl.get("type") == "set_speed":
+                        tick_delay_s = max(0, ctrl["tick_delay_ms"] / 1000.0)
+                    elif ctrl.get("type") == "set_steps":
+                        steps_per_frame = max(1, int(ctrl["steps_per_frame"]))
+                    elif ctrl.get("type") == "stop":
+                        return
+                except asyncio.TimeoutError:
+                    break
+        else:
+            # tick_delay_s == 0: still yield to the event loop so WS messages can arrive
             try:
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=0)
                 ctrl = json.loads(msg)
                 if ctrl.get("type") == "set_speed":
-                    tick_delay_s = max(0.01, ctrl["tick_delay_ms"] / 1000.0)
+                    tick_delay_s = max(0, ctrl["tick_delay_ms"] / 1000.0)
+                elif ctrl.get("type") == "set_steps":
+                    steps_per_frame = max(1, int(ctrl["steps_per_frame"]))
                 elif ctrl.get("type") == "stop":
                     return
-            except asyncio.TimeoutError:
-                break
+            except (asyncio.TimeoutError, Exception):
+                await asyncio.sleep(0)  # yield to event loop
 
     summary = sim.get_summary()
     metrics = sim.completed_metrics

@@ -21,66 +21,76 @@
     <!-- Mode toggle -->
     <div class="section">
       <div class="section-title">Layout Mode</div>
-      <div class="mode-toggle">
-        <button id="mode-default" class="active">Default (12×19)</button>
-        <button id="mode-quad">Quad (24×38)</button>
-        <button id="mode-custom">Custom</button>
+      <div class="section-body">
+        <div class="mode-toggle">
+          <button id="mode-default" class="active">Default (14×26)</button>
+          <button id="mode-quad">Quad (28×52)</button>
+          <button id="mode-custom">Custom</button>
+        </div>
       </div>
     </div>
 
     <!-- Custom size controls (hidden in default mode) -->
     <div class="section" id="custom-controls" style="display:none">
       <div class="section-title">Canvas Size</div>
-      <div class="input-row">
-        <label>Rows</label>
-        <input type="number" id="input-rows" value="10" min="3" max="40" />
-        <label>Cols</label>
-        <input type="number" id="input-cols" value="16" min="3" max="60" />
-        <button id="btn-apply-size">Apply</button>
+      <div class="section-body">
+        <div class="input-row">
+          <label>Rows</label>
+          <input type="number" id="input-rows" value="10" min="3" max="40" />
+          <label>Cols</label>
+          <input type="number" id="input-cols" value="16" min="3" max="60" />
+          <button id="btn-apply-size">Apply</button>
+        </div>
+        <p style="color:#666;font-size:11px;margin-top:6px;">
+          All cells start as Aisle. Paint Rack cells and place one Pack Station.
+        </p>
       </div>
-      <p style="color:#666;font-size:11px;margin-top:6px;">
-        All cells start as Aisle. Paint Rack cells and place one Pack Station.
-      </p>
     </div>
 
     <!-- Brush toolbar -->
     <div class="section">
       <div class="section-title">Brush</div>
-      <div class="toolbar">
-        <button class="brush-btn" id="brush-rack">
-          <span class="brush-swatch swatch-rack"></span>Rack
-        </button>
-        <button class="brush-btn" id="brush-aisle">
-          <span class="brush-swatch swatch-aisle"></span>Aisle
-        </button>
-        <button class="brush-btn active" id="brush-pack">
-          <span class="brush-swatch swatch-pack"></span>Pack Station
-        </button>
-        <button class="brush-btn" id="brush-empty">
-          <span class="brush-swatch swatch-empty"></span>Empty
-        </button>
+      <div class="section-body">
+        <div class="toolbar">
+          <button class="brush-btn" id="brush-rack">
+            <span class="brush-swatch swatch-rack"></span>Rack
+          </button>
+          <button class="brush-btn" id="brush-aisle">
+            <span class="brush-swatch swatch-aisle"></span>Aisle
+          </button>
+          <button class="brush-btn active" id="brush-pack">
+            <span class="brush-swatch swatch-pack"></span>Pack Station
+          </button>
+          <button class="brush-btn" id="brush-empty">
+            <span class="brush-swatch swatch-empty"></span>Empty
+          </button>
+        </div>
       </div>
     </div>
 
     <!-- Editor grid -->
     <div class="section">
       <div class="section-title">Editor</div>
-      <div class="grid-scroll">
-        <table class="warehouse-grid" id="editor-grid"></table>
+      <div class="section-body">
+        <div class="grid-scroll">
+          <table class="warehouse-grid" id="editor-grid"></table>
+        </div>
       </div>
     </div>
 
     <!-- Save / Load -->
-    <div class="section">
+    <div class="section collapsed">
       <div class="section-title">File</div>
-      <div style="display:flex;gap:8px;">
-        <button id="btn-save">Save JSON</button>
-        <label>
-          <button id="btn-load" onclick="document.getElementById('file-load-input').click()">
-            Load JSON
-          </button>
-          <input type="file" id="file-load-input" accept=".json" />
-        </label>
+      <div class="section-body">
+        <div style="display:flex;gap:8px;">
+          <button id="btn-save">Save JSON</button>
+          <label>
+            <button id="btn-load" onclick="document.getElementById('file-load-input').click()">
+              Load JSON
+            </button>
+            <input type="file" id="file-load-input" accept=".json" />
+          </label>
+        </div>
       </div>
     </div>
 
@@ -90,132 +100,163 @@
   <div id="right-panel">
 
     <!-- Catalog parameters -->
-    <div class="section">
+    <div class="section collapsed">
       <div class="section-title">Item Catalog</div>
-      <div class="param-grid">
-        <div class="param">
-          <span class="param-label">Items in catalog</span>
-          <input type="number" id="input-items" value="30" min="1" max="200" />
+      <div class="section-body">
+        <div class="param-grid">
+          <div class="param">
+            <span class="param-label">Items in catalog</span>
+            <input type="number" id="input-items" value="30" min="1" max="200" />
+          </div>
+          <div class="param">
+            <span class="param-label">Product families</span>
+            <input type="number" id="input-families" value="4" min="1" max="20" />
+          </div>
+          <div class="param">
+            <span class="param-label">Demand skew</span>
+            <input type="number" id="input-skew" value="2.0" min="0.1" max="10" step="0.1" />
+          </div>
+          <div class="param">
+            <span class="param-label">Family affinity</span>
+            <input type="number" id="input-affinity" value="0.7" min="0" max="1" step="0.05" />
+          </div>
         </div>
-        <div class="param">
-          <span class="param-label">Product families</span>
-          <input type="number" id="input-families" value="4" min="1" max="20" />
+        <div class="param-hints">
+          <span title="Higher = a few items dominate most orders (power-law distribution)">⚙ Demand skew: spread of item popularity</span>
+          <span title="Fraction of each order drawn from one product family (0 = random, 1 = all same family)">⚙ Affinity: how often items cluster by family</span>
         </div>
-        <div class="param">
-          <span class="param-label">Demand skew</span>
-          <input type="number" id="input-skew" value="2.0" min="0.1" max="10" step="0.1" />
-        </div>
-        <div class="param">
-          <span class="param-label">Family affinity</span>
-          <input type="number" id="input-affinity" value="0.7" min="0" max="1" step="0.05" />
-        </div>
-      </div>
-      <div class="param-hints">
-        <span title="Higher = a few items dominate most orders (power-law distribution)">⚙ Demand skew: spread of item popularity</span>
-        <span title="Fraction of each order drawn from one product family (0 = random, 1 = all same family)">⚙ Affinity: how often items cluster by family</span>
       </div>
     </div>
 
     <!-- Order parameters -->
     <div class="section">
       <div class="section-title">Orders</div>
-      <div class="param-grid">
-        <div class="param">
-          <span class="param-label">Number of orders</span>
-          <input type="number" id="input-orders" value="10" min="1" max="500" />
-        </div>
-        <div class="param">
-          <span class="param-label">Items per order</span>
-          <input type="number" id="input-per-order" value="4" min="1" max="20" />
+      <div class="section-body">
+        <div class="param-grid">
+          <div class="param">
+            <span class="param-label">Number of orders</span>
+            <input type="number" id="input-orders" value="10" min="1" max="500" />
+          </div>
+          <div class="param">
+            <span class="param-label">Items per order</span>
+            <input type="number" id="input-per-order" value="4" min="1" max="20" />
+          </div>
         </div>
       </div>
     </div>
 
     <!-- Batching -->
-    <div class="section">
+    <div class="section collapsed">
       <div class="section-title">Batching</div>
-      <div class="param-grid">
-        <div class="param">
-          <span class="param-label">Strategy</span>
-          <select id="input-batch-strategy">
-            <option value="none">None (FIFO)</option>
-            <option value="zone">Zone overlap</option>
-            <option value="tsp">Nearest neighbor</option>
-          </select>
-        </div>
-        <div class="param" id="batch-size-param" style="display:none">
-          <span class="param-label">Batch size</span>
-          <input type="number" id="input-batch-size" value="2" min="2" max="6" title="Max 6 — larger batches cause heavy item overlap with small catalogs" />
+      <div class="section-body">
+        <div class="param-grid">
+          <div class="param">
+            <span class="param-label">Strategy</span>
+            <select id="input-batch-strategy">
+              <option value="none">None (FIFO)</option>
+              <option value="zone">Zone overlap</option>
+              <option value="tsp">Nearest neighbor</option>
+            </select>
+          </div>
+          <div class="param" id="batch-size-param" style="display:none">
+            <span class="param-label">Batch size</span>
+            <input type="number" id="input-batch-size" value="2" min="2" max="6" title="Max 6 — larger batches cause heavy item overlap with small catalogs" />
+          </div>
         </div>
       </div>
     </div>
 
     <!-- Simulation controls -->
-    <div class="section">
+    <div class="section no-collapse">
       <div class="section-title">Simulation</div>
-      <div class="input-row" style="margin-bottom:10px;">
-        <label>Speed</label>
-        <input type="range" id="speed-slider" min="10" max="500" value="80" />
-        <span class="speed-label" id="speed-label">80 ms</span>
+      <div class="section-body">
+        <div class="param-grid" style="margin-bottom:10px;">
+          <div class="param">
+            <span class="param-label">Agents</span>
+            <input type="number" id="input-agents" value="1" min="1" max="4" />
+          </div>
+          <div class="param">
+            <span class="param-label">Random seed</span>
+            <input type="number" id="input-seed" value="42" min="0" max="9999" />
+          </div>
+        </div>
+        <div class="input-row" style="margin-bottom:6px;">
+          <label>Delay</label>
+          <input type="range" id="speed-slider" min="0" max="500" value="80" />
+          <span class="speed-label" id="speed-label">80 ms</span>
+        </div>
+        <div class="input-row" style="margin-bottom:10px;">
+          <label>Steps</label>
+          <input type="range" id="steps-slider" min="1" max="20" value="4" />
+          <span class="speed-label" id="steps-label">×4</span>
+        </div>
+        <button class="primary" id="btn-run">▶ Run Simulation</button>
+        <div id="error-banner"></div>
       </div>
-      <button class="primary" id="btn-run">▶ Run Simulation</button>
-      <div id="error-banner"></div>
     </div>
 
     <!-- Simulation grid -->
     <div class="section">
       <div class="section-title">Live View</div>
-      <div class="grid-scroll">
-        <table class="warehouse-grid" id="sim-grid"></table>
+      <div class="section-body">
+        <div class="grid-scroll">
+          <table class="warehouse-grid" id="sim-grid"></table>
+        </div>
       </div>
     </div>
 
     <!-- Status bar -->
-    <div class="section">
-      <div class="section-title">Agent Status</div>
-      <div id="status-bar">
-        <span class="label">Tick</span>
-        <span class="value" id="status-tick">—</span>
-        <span class="label">Order</span>
-        <span class="value" id="status-order">—</span>
-        <span class="label">State</span>
-        <span class="value" id="status-state">—</span>
-        <span class="label">Carrying</span>
-        <span class="value" id="status-carrying">—</span>
+    <div class="section no-collapse">
+      <div class="section-title">
+        Agent Status
+        <span id="status-tick-label">tick —</span>
+      </div>
+      <div class="section-body">
+        <div id="agents-status"></div>
       </div>
     </div>
 
     <!-- Order queue -->
-    <div class="section">
+    <div class="section no-collapse">
       <div class="section-title">Order Queue</div>
-      <div class="order-list" id="order-list"></div>
+      <div class="section-body">
+        <div class="order-list" id="order-list"></div>
+      </div>
     </div>
 
     <!-- Summary (shown on complete) -->
     <div id="summary-box"></div>
 
     <!-- Metrics table -->
-    <div class="section">
+    <div class="section no-collapse">
       <div class="section-title">Order Metrics</div>
-      <table class="metrics-table">
-        <thead>
-          <tr>
-            <th>Order</th>
-            <th class="text-right">Items</th>
-            <th class="text-right">Distance</th>
-            <th class="text-right">Ticks</th>
-          </tr>
-        </thead>
-        <tbody id="metrics-tbody"></tbody>
-        <tfoot>
-          <tr id="metrics-footer" style="display:none">
-            <td>Total</td>
-            <td class="text-right" id="footer-items">—</td>
-            <td class="text-right" id="footer-dist">—</td>
-            <td class="text-right" id="footer-ticks">—</td>
-          </tr>
-        </tfoot>
-      </table>
+      <div class="section-body">
+        <table class="metrics-table">
+          <thead>
+            <tr>
+              <th>Order</th>
+              <th class="text-right">Items</th>
+              <th class="text-right">Distance</th>
+              <th class="text-right">Ticks</th>
+            </tr>
+          </thead>
+        </table>
+        <div class="metrics-scroll">
+          <table class="metrics-table metrics-body-table">
+            <tbody id="metrics-tbody"></tbody>
+          </table>
+        </div>
+        <table class="metrics-table">
+          <tfoot>
+            <tr id="metrics-footer" style="display:none">
+              <td>Total</td>
+              <td class="text-right" id="footer-items">—</td>
+              <td class="text-right" id="footer-dist">—</td>
+              <td class="text-right" id="footer-ticks">—</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
     </div>
 
   </div><!-- /right-panel -->

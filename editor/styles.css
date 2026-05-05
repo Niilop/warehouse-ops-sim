@@ -53,6 +53,41 @@ header .subtitle { color: #666; font-size: 12px; }
     text-transform: uppercase;
     letter-spacing: 1px;
     margin-bottom: 8px;
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.section-title::before {
+    content: '▾';
+    font-size: 10px;
+    color: #555;
+    transition: transform 0.15s;
+    flex-shrink: 0;
+}
+.section.no-collapse .section-title {
+    cursor: default;
+}
+.section.no-collapse .section-title::before {
+    content: '';
+}
+.section.collapsed .section-title::before {
+    transform: rotate(-90deg);
+}
+.section.collapsed .section-title {
+    margin-bottom: 0;
+}
+.section-body {
+    display: block;
+}
+.section.collapsed .section-body {
+    display: none;
+}
+/* The tick label sits at the far right of Agent Status title */
+#status-tick-label {
+    margin-left: auto;
+    font-weight: normal;
 }
 
 /* ── Buttons ─────────────────────────────────────────── */
@@ -141,25 +176,66 @@ input[type="range"] { width: 120px; padding: 2px; cursor: pointer; }
 .cell-rack         { background: #c76b00; }
 .cell-aisle        { background: #1c1c1c; }
 .cell-pack         { background: #2d6a2d; }
+
+/* Agent colors — one per agent index (idle = dim, carrying = bright) */
+.cell-agent-0       { background: #1a6fb5 !important; }
+.cell-agent-0-carry { background: #4a9fd4 !important; }
+.cell-agent-1       { background: #a04000 !important; }
+.cell-agent-1-carry { background: #f07020 !important; }
+.cell-agent-2       { background: #1a7a5a !important; }
+.cell-agent-2-carry { background: #30c890 !important; }
+.cell-agent-3       { background: #6a2090 !important; }
+.cell-agent-3-carry { background: #b060e0 !important; }
+
+/* Legacy single-agent classes (keep for safety) */
 .cell-agent        { background: #1a6fb5 !important; }
 .cell-agent-carry  { background: #4a9fd4 !important; }
 
-/* ── Status bar ──────────────────────────────────────── */
-#status-bar {
+/* ── Agent status list ───────────────────────────────── */
+#agents-status { display: flex; flex-direction: column; gap: 4px; }
+
+.agent-status-row {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 4px 12px;
+    grid-template-columns: 14px 32px 1fr auto;
+    gap: 0 8px;
+    align-items: center;
     font-size: 12px;
+    padding: 3px 4px;
+    border-radius: 3px;
+    background: #111;
 }
-#status-bar span.label { color: #666; }
-#status-bar span.value { color: #ccc; }
+.agent-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.agent-id   { color: #888; font-size: 11px; }
+.agent-info { color: #bbb; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agent-carry-tag {
+    font-size: 10px; color: #666;
+    background: #1e1e1e; border: 1px solid #2a2a2a;
+    border-radius: 2px; padding: 0 4px;
+    white-space: nowrap;
+}
 
 /* ── Metrics table ───────────────────────────────────── */
 .metrics-table {
     width: 100%;
     border-collapse: collapse;
     font-size: 12px;
+    table-layout: fixed;
 }
+
+/* Fixed column widths shared across header/body/footer tables */
+.metrics-table th:nth-child(1),
+.metrics-table td:nth-child(1) { width: auto; }
+.metrics-table th:nth-child(2),
+.metrics-table td:nth-child(2) { width: 52px; }
+.metrics-table th:nth-child(3),
+.metrics-table td:nth-child(3) { width: 68px; }
+.metrics-table th:nth-child(4),
+.metrics-table td:nth-child(4) { width: 52px; }
+
 .metrics-table th {
     color: #888;
     text-align: left;
@@ -174,6 +250,9 @@ input[type="range"] { width: 120px; padding: 2px; cursor: pointer; }
     padding: 3px 8px;
     border-bottom: 1px solid #1e1e1e;
     color: #bbb;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 .metrics-table tr:last-child td { border-bottom: none; }
 .metrics-table tfoot td {
@@ -183,6 +262,12 @@ input[type="range"] { width: 120px; padding: 2px; cursor: pointer; }
     font-weight: bold;
 }
 .text-right { text-align: right; }
+
+.metrics-scroll {
+    max-height: 180px;
+    overflow-y: auto;
+}
+.metrics-body-table { margin: 0; }
 
 /* ── Error banner ────────────────────────────────────── */
 #error-banner {

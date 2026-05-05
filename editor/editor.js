@@ -107,23 +107,25 @@ class GridEditor {
   }
 }
 
+// Agent index → CSS color token (matches styles.css .cell-agent-N / .cell-agent-N-carry)
+const AGENT_COLORS = ["#1a6fb5", "#a04000", "#1a7a5a", "#6a2090"];
+
 // ─────────────────────────────────────────────────────────────────
-// SimulationViewer — read-only grid with agent overlay
+// SimulationViewer — read-only grid with multi-agent overlay
 // ─────────────────────────────────────────────────────────────────
 class SimulationViewer {
   constructor(tableEl) {
     this.tableEl = tableEl;
     this.rows = 0;
     this.cols = 0;
-    this.agentRow = -1;
-    this.agentCol = -1;
+    // agentPositions: Map<agentId, {row, col, idx}>
+    this.agentPositions = new Map();
   }
 
   build(dict) {
     this.rows = dict.rows;
     this.cols = dict.cols;
-    this.agentRow = -1;
-    this.agentCol = -1;
+    this.agentPositions.clear();
     this.tableEl.innerHTML = "";
     for (let r = 0; r < this.rows; r++) {
       const tr = document.createElement("tr");
@@ -137,30 +139,52 @@ class SimulationViewer {
   }
 
   applyTick(frame) {
-    const { row, col, state, carrying } = frame.agent;
+    // Clear all previous agent cells
+    for (const { row, col, idx } of this.agentPositions.values()) {
+      const td = this.tableEl.rows[row]?.cells[col];
+      if (td) td.classList.remove(`cell-agent-${idx}`, `cell-agent-${idx}-carry`);
+    }
+    this.agentPositions.clear();
 
-    // Clear previous agent cell
-    if (this.agentRow >= 0) {
-      const prev = this.tableEl.rows[this.agentRow]?.cells[this.agentCol];
-      if (prev) {
-        prev.classList.remove("cell-agent", "cell-agent-carry");
+    // Paint new positions
+    const agents = frame.agents || [{ ...frame.agent, id: "A1", active_batch: frame.active_batch }];
+    for (let idx = 0; idx < agents.length; idx++) {
+      const a = agents[idx];
+      const td = this.tableEl.rows[a.row]?.cells[a.col];
+      if (td) {
+        td.classList.add(a.carrying.length > 0 ? `cell-agent-${idx}-carry` : `cell-agent-${idx}`);
       }
+      this.agentPositions.set(a.id, { row: a.row, col: a.col, idx });
     }
 
-    // Set new agent cell
-    const td = this.tableEl.rows[row]?.cells[col];
-    if (td) {
-      td.classList.add(carrying.length > 0 ? "cell-agent-carry" : "cell-agent");
-    }
-    this.agentRow = row;
-    this.agentCol = col;
+    // Update tick label
+    document.getElementById("status-tick-label").textContent = `tick ${frame.tick}`;
 
-    // Update status bar
-    document.getElementById("status-tick").textContent = frame.tick;
-    document.getElementById("status-order").textContent = frame.active_order ?? "—";
-    document.getElementById("status-state").textContent = state.replace(/_/g, " ");
-    document.getElementById("status-carrying").textContent =
-      carrying.length ? carrying.join(", ") : "nothing";
+    // Update per-agent status rows
+    const container = document.getElementById("agents-status");
+    // Reuse or create rows
+    while (container.children.length < agents.length) {
+      container.appendChild(document.createElement("div"));
+    }
+    while (container.children.length > agents.length) {
+      container.removeChild(container.lastChild);
+    }
+    for (let idx = 0; idx < agents.length; idx++) {
+      const a = agents[idx];
+      const row = container.children[idx];
+      row.className = "agent-status-row";
+
+      const stateText = a.state.replace(/_/g, " ");
+      const carryText = a.carrying.length ? a.carrying.join(", ") : "empty";
+      const batchText = a.active_batch ? `batch ${a.active_batch}` : "idle";
+
+      row.innerHTML = `
+        <span class="agent-dot" style="background:${AGENT_COLORS[idx % AGENT_COLORS.length]}"></span>
+        <span class="agent-id">${a.id}</span>
+        <span class="agent-info">${stateText} — ${batchText}</span>
+        <span class="agent-carry-tag">${carryText}</span>
+      `;
+    }
   }
 }
 
@@ -177,12 +201,18 @@ class SimulationClient {
     this.orderList = orderList;
     this.ws = null;
     this.orderRows = new Map();  // order_id -> { el, batchId }
-    this.activeBatchId = null;
+    this._activeBatchKey = "";
   }
 
   sendSpeedUpdate(ms) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "set_speed", tick_delay_ms: ms }));
+    }
+  }
+
+  sendStepsUpdate(steps) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "set_steps", steps_per_frame: steps }));
     }
   }
 
@@ -208,7 +238,7 @@ class SimulationClient {
       const frame = JSON.parse(event.data);
       switch (frame.type) {
         case "orders_ready":   this._onOrdersReady(frame); break;
-        case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.active_batch); break;
+        case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.agents || []); break;
         case "order_complete": this._appendMetricsRow(frame); this._markOrderDone(frame.order_id); break;
         case "complete":       this._onComplete(frame); break;
         case "error":          this._showError(frame.message); break;
@@ -230,7 +260,7 @@ class SimulationClient {
   _onOrdersReady(frame) {
     this.orderList.innerHTML = "";
     this.orderRows.clear();
-    this.activeBatchId = null;
+    this._activeBatchKey = "";
 
     for (const o of frame.orders) {
       const row = document.createElement("div");
@@ -257,25 +287,33 @@ class SimulationClient {
     }
   }
 
-  _updateActiveOrders(batchId) {
-    if (batchId === this.activeBatchId) return;
+  _updateActiveOrders(agents) {
+    // Collect all batch IDs currently being worked by any agent
+    const activeBatches = new Set(
+      agents.map(a => a.active_batch).filter(Boolean)
+    );
+
+    // Stringify for cheap change detection
+    const key = [...activeBatches].sort().join(",");
+    if (key === this._activeBatchKey) return;
+    this._activeBatchKey = key;
 
     for (const [, info] of this.orderRows) {
-      if (info.el.classList.contains("active")) {
+      const inActive = activeBatches.has(info.batchId) && !info.el.classList.contains("done");
+      if (inActive) {
+        info.el.classList.add("active");
+        info.el.querySelector(".order-status").textContent = "●";
+        const list = info.el.parentElement;
+        if (list) {
+          const elBottom = info.el.offsetTop + info.el.offsetHeight;
+          if (info.el.offsetTop < list.scrollTop) list.scrollTop = info.el.offsetTop;
+          else if (elBottom > list.scrollTop + list.clientHeight) list.scrollTop = elBottom - list.clientHeight;
+        }
+      } else if (info.el.classList.contains("active")) {
         info.el.classList.remove("active");
         info.el.querySelector(".order-status").textContent = "·";
       }
     }
-    if (batchId) {
-      for (const [, info] of this.orderRows) {
-        if (info.batchId === batchId && !info.el.classList.contains("done")) {
-          info.el.classList.add("active");
-          info.el.querySelector(".order-status").textContent = "●";
-          info.el.scrollIntoView({ block: "nearest" });
-        }
-      }
-    }
-    this.activeBatchId = batchId;
   }
 
   _markOrderDone(orderId) {
@@ -295,7 +333,9 @@ class SimulationClient {
       <td class="text-right">${frame.ticks_taken}</td>
     `;
     this.metricsTbody.appendChild(tr);
-    tr.scrollIntoView({ block: "nearest" });
+    // Scroll the metrics container, not the page
+    const scroll = this.metricsTbody.closest(".metrics-scroll");
+    if (scroll) scroll.scrollTop = scroll.scrollHeight;
   }
 
   _onComplete(frame) {
@@ -413,6 +453,18 @@ document.addEventListener("DOMContentLoaded", () => {
     e.target.value = "";
   });
 
+  // ── Collapsible sections ─────────────────────────────
+  document.querySelectorAll(".section-title").forEach(title => {
+    title.addEventListener("click", () => {
+      const section = title.closest(".section");
+      if (section.id === "custom-controls" || section.classList.contains("no-collapse")) return;
+      section.classList.toggle("collapsed");
+    });
+  });
+
+  // Auto-expand Order Metrics when simulation completes
+  // (handled in _onComplete — section is collapsed by default)
+
   // ── Batch strategy — show/hide batch size ────────────
   document.getElementById("input-batch-strategy").addEventListener("change", (e) => {
     document.getElementById("batch-size-param").style.display =
@@ -421,8 +473,16 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // ── Speed slider — updates live if simulation is running ─────────
   document.getElementById("speed-slider").addEventListener("input", (e) => {
-    document.getElementById("speed-label").textContent = e.target.value + " ms";
-    if (client) client.sendSpeedUpdate(parseInt(e.target.value));
+    const ms = parseInt(e.target.value);
+    document.getElementById("speed-label").textContent = ms === 0 ? "max" : ms + " ms";
+    if (client) client.sendSpeedUpdate(ms);
+  });
+
+  // ── Steps slider ─────────────────────────────────────
+  document.getElementById("steps-slider").addEventListener("input", (e) => {
+    const steps = parseInt(e.target.value);
+    document.getElementById("steps-label").textContent = "×" + steps;
+    if (client) client.sendStepsUpdate(steps);
   });
 
   // ── Run / Stop button ─────────────────────────
@@ -492,8 +552,10 @@ document.addEventListener("DOMContentLoaded", () => {
       family_affinity: parseFloat(document.getElementById("input-affinity").value),
       batch_strategy: document.getElementById("input-batch-strategy").value,
       batch_size: parseInt(document.getElementById("input-batch-size").value),
-      seed: 42,
+      n_agents: parseInt(document.getElementById("input-agents").value),
+      seed: parseInt(document.getElementById("input-seed").value),
       tick_delay_ms: parseInt(document.getElementById("speed-slider").value),
+      steps_per_frame: parseInt(document.getElementById("steps-slider").value),
     });
   });
 });
