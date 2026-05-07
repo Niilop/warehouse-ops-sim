@@ -2,11 +2,11 @@
 
 const API_BASE = "http://localhost:8000";
 
-const CT = { EMPTY: 0, RACK: 1, AISLE: 2, PACK: 3 };
-const CELL_CLASS = { 0: "cell-empty", 1: "cell-rack", 2: "cell-aisle", 3: "cell-pack" };
+const CT = { EMPTY: 0, RACK: 1, AISLE: 2, PACK: 3, DOCK: 4 };
+const CELL_CLASS = { 0: "cell-empty", 1: "cell-rack", 2: "cell-aisle", 3: "cell-pack", 4: "cell-dock" };
 
 // Canvas cell colors (sim viewer)
-const CANVAS_COLORS   = { 0: "#2a2a2a", 1: "#b06010", 2: "#181818", 3: "#276027" };
+const CANVAS_COLORS   = { 0: "#2a2a2a", 1: "#b06010", 2: "#181818", 3: "#276027", 4: "#8a6500" };
 const AGENT_IDLE      = ["#1a6fb5", "#a04000", "#1a7a5a", "#6a2090"];
 const AGENT_CARRY     = ["#4a9fd4", "#f07020", "#30c890", "#b060e0"];
 
@@ -21,6 +21,7 @@ class GridEditor {
     this.brush = CT.RACK;
     this.painting = false;
     this.packPos = null;
+    this.dockPos = null;
     document.addEventListener("mouseup", () => { this.painting = false; });
   }
 
@@ -28,6 +29,7 @@ class GridEditor {
     this.rows = rows; this.cols = cols;
     this.cells = Array.from({ length: rows }, () => new Array(cols).fill(CT.AISLE));
     this.packPos = null;
+    this.dockPos = null;
     this._render();
   }
 
@@ -35,15 +37,18 @@ class GridEditor {
     this.rows = dict.rows; this.cols = dict.cols;
     this.cells = dict.grid.map(row => [...row]);
     this.packPos = dict.pack_station_pos ? [...dict.pack_station_pos] : null;
+    this.dockPos = dict.dock_pos ? [...dict.dock_pos] : null;
     this._render();
   }
 
   toDict() {
-    return {
+    const d = {
       rows: this.rows, cols: this.cols,
       grid: this.cells.map(row => [...row]),
       pack_station_pos: this.packPos ? [...this.packPos] : [0, 0],
     };
+    if (this.dockPos) d.dock_pos = [...this.dockPos];
+    return d;
   }
 
   setBrush(type) { this.brush = type; }
@@ -59,6 +64,16 @@ class GridEditor {
       this.packPos = [row, col];
     } else if (this.packPos && this.packPos[0] === row && this.packPos[1] === col) {
       this.packPos = null;
+    }
+    if (type === CT.DOCK) {
+      if (this.dockPos) {
+        const [dr, dc] = this.dockPos;
+        this.cells[dr][dc] = CT.AISLE;
+        this._updateTd(dr, dc);
+      }
+      this.dockPos = [row, col];
+    } else if (this.dockPos && this.dockPos[0] === row && this.dockPos[1] === col) {
+      this.dockPos = null;
     }
     this.cells[row][col] = type;
     this._updateTd(row, col);
@@ -606,7 +621,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   // ── Brushes ──────────────────────────────────
-  const brushMap = { "brush-rack": CT.RACK, "brush-aisle": CT.AISLE, "brush-pack": CT.PACK, "brush-empty": CT.EMPTY };
+  const brushMap = { "brush-rack": CT.RACK, "brush-aisle": CT.AISLE, "brush-pack": CT.PACK, "brush-dock": CT.DOCK, "brush-empty": CT.EMPTY };
   Object.entries(brushMap).forEach(([id, type]) => {
     document.getElementById(id).addEventListener("click", () => {
       editor.setBrush(type);

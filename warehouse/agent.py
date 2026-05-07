@@ -11,6 +11,8 @@ class AgentState(Enum):
     IDLE = "idle"
     MOVING_TO_RACK = "moving_to_rack"
     MOVING_TO_STATION = "moving_to_station"
+    MOVING_TO_DOCK = "moving_to_dock"
+    MOVING_FROM_DOCK = "moving_from_dock"
 
 
 class StepResult(Enum):
@@ -33,8 +35,15 @@ class PickAgent:
         self._carried_order_ids: list[str] = []
         self._pack_pos: tuple[int, int] = start_pos
         self._batch: BatchedOrder | None = None
-        self._wait_count: int = 0  # consecutive ticks blocked by another agent
-        self._replan_cooldown: int = 0  # ticks until next replan is allowed
+        self._wait_count: int = 0
+        self._replan_cooldown: int = 0
+
+        # Replenishment state (dock → slot journey)
+        self._repl_item: Item | None = None
+        self._repl_qty: int = 0
+        self._repl_slot_pos: tuple[int, int] | None = None
+        self._repl_dock_pos: tuple[int, int] | None = None
+        self._repl_task_id: str | None = None
 
     # ------------------------------------------------------------------
     # Pathfinding
@@ -173,6 +182,10 @@ class PickAgent:
             goal, _, _ = self._task_queue[0]
         elif self.state == AgentState.MOVING_TO_STATION:
             goal = self._pack_pos
+        elif self.state == AgentState.MOVING_TO_DOCK and self._repl_dock_pos:
+            goal = self._repl_dock_pos
+        elif self.state == AgentState.MOVING_FROM_DOCK and self._repl_slot_pos:
+            goal = self._repl_slot_pos
         else:
             return
         if self.pos == goal:
@@ -207,3 +220,40 @@ class PickAgent:
             order_breakdown.setdefault(oid, []).append(item.item_id)
         self._batch = None
         return deposited, order_breakdown
+
+    # ------------------------------------------------------------------
+    # Replenishment (dock → slot)
+    # ------------------------------------------------------------------
+
+    def assign_replenishment(
+        self,
+        item: Item,
+        qty: int,
+        slot_stand_pos: tuple[int, int],
+        dock_pos: tuple[int, int],
+        task_id: str,
+    ) -> None:
+        self._repl_item     = item
+        self._repl_qty      = qty
+        self._repl_slot_pos = slot_stand_pos
+        self._repl_dock_pos = dock_pos
+        self._repl_task_id  = task_id
+        self._path = self.find_path(dock_pos)
+        self.state = AgentState.MOVING_TO_DOCK
+
+    def execute_dock_pickup(self) -> None:
+        """Agent has arrived at the dock. Load stock instantly and head to the slot."""
+        self.state = AgentState.MOVING_FROM_DOCK
+        self._path = self.find_path(self._repl_slot_pos)
+
+    def execute_restock(self, inventory: Inventory) -> Item:
+        """Agent has arrived at the slot stand-pos. Deposit replenishment stock."""
+        item = self._repl_item
+        inventory.restock_bulk(item, self._repl_qty)
+        self._repl_item     = None
+        self._repl_qty      = 0
+        self._repl_slot_pos = None
+        self._repl_dock_pos = None
+        self._repl_task_id  = None
+        self.state = AgentState.IDLE
+        return item  # type: ignore[return-value]

@@ -38,12 +38,12 @@ async def serve_editor() -> FileResponse:
 
 @app.get("/api/default-layout")
 async def get_default_layout() -> JSONResponse:
-    return JSONResponse(WarehouseGrid.build_default().to_dict())
+    return JSONResponse(WarehouseGrid.build_default(dock=True).to_dict())
 
 
 @app.get("/api/quad-layout")
 async def get_quad_layout() -> JSONResponse:
-    return JSONResponse(WarehouseGrid.build_quad().to_dict())
+    return JSONResponse(WarehouseGrid.build_quad(dock=True).to_dict())
 
 
 class LayoutPayload(BaseModel):

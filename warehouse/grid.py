@@ -9,6 +9,7 @@ class CellType(IntEnum):
     RACK = 1
     AISLE = 2
     PACK_STATION = 3
+    DOCK = 4
 
 
 @dataclass
@@ -18,6 +19,7 @@ class WarehouseGrid:
     grid: np.ndarray  # shape (rows, cols), dtype=np.uint8
     pack_station_pos: tuple[int, int]
     zone_map: dict[tuple[int, int], str] = field(default_factory=dict)
+    dock_pos: tuple[int, int] | None = None
     # zone_map: rack_pos (row, col) -> zone label ("A", "B", ...) ordered by distance from pack station
 
     @staticmethod
@@ -75,25 +77,31 @@ class WarehouseGrid:
         }
 
     @staticmethod
-    def build_default(rows: int = 14, cols: int = 26) -> "WarehouseGrid":
+    def build_default(rows: int = 14, cols: int = 26, dock: bool = False) -> "WarehouseGrid":
         """
         Symmetrical standard layout:
           - All cells start as AISLE
           - 2-wide RACK bands separated by 3-cell corridors (wide enough for agents to pass)
           - 2-cell outer wall on all four sides
           - Pack station at bottom-left (rows-1, 0)
+          - Dock at top-right (0, cols-1) when dock=True
         cols=26 gives 5 rack bands; rows=14 gives 10 pick rows.
         """
         g = np.full((rows, cols), CellType.AISLE, dtype=np.uint8)
         WarehouseGrid._fill_rack_bands(g, 0, rows, 0, cols)
         pack_pos = (rows - 1, 0)
         g[pack_pos[0], pack_pos[1]] = CellType.PACK_STATION
+        dock_pos = None
+        if dock:
+            dock_pos = (0, cols - 1)
+            g[dock_pos[0], dock_pos[1]] = CellType.DOCK
         zone_map = WarehouseGrid._assign_zones(g, pack_pos)
         return WarehouseGrid(rows=rows, cols=cols, grid=g,
-                             pack_station_pos=pack_pos, zone_map=zone_map)
+                             pack_station_pos=pack_pos, zone_map=zone_map,
+                             dock_pos=dock_pos)
 
     @staticmethod
-    def build_quad(unit_rows: int = 14, unit_cols: int = 26) -> "WarehouseGrid":
+    def build_quad(unit_rows: int = 14, unit_cols: int = 26, dock: bool = False) -> "WarehouseGrid":
         """
         Four default layouts arranged in a 2×2 grid.
         Total size: (2*unit_rows) × (2*unit_cols).
@@ -113,9 +121,14 @@ class WarehouseGrid:
 
         pack_pos = (rows - 1, 0)
         g[pack_pos[0], pack_pos[1]] = CellType.PACK_STATION
+        dock_pos = None
+        if dock:
+            dock_pos = (0, cols - 1)
+            g[dock_pos[0], dock_pos[1]] = CellType.DOCK
         zone_map = WarehouseGrid._assign_zones(g, pack_pos)
         return WarehouseGrid(rows=rows, cols=cols, grid=g,
-                             pack_station_pos=pack_pos, zone_map=zone_map)
+                             pack_station_pos=pack_pos, zone_map=zone_map,
+                             dock_pos=dock_pos)
 
     def in_bounds(self, row: int, col: int) -> bool:
         return 0 <= row < self.rows and 0 <= col < self.cols
@@ -124,7 +137,7 @@ class WarehouseGrid:
         if not self.in_bounds(row, col):
             return False
         ct = self.grid[row, col]
-        return ct == CellType.AISLE or ct == CellType.PACK_STATION
+        return ct in (CellType.AISLE, CellType.PACK_STATION, CellType.DOCK)
 
     def get_rack_neighbors(self, row: int, col: int) -> list[tuple[int, int]]:
         """Returns walkable cells adjacent to a RACK cell."""
@@ -136,13 +149,16 @@ class WarehouseGrid:
         return neighbors
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "rows": self.rows,
             "cols": self.cols,
             "grid": self.grid.tolist(),
             "pack_station_pos": list(self.pack_station_pos),
             "zone_map_list": [[r, c, z] for (r, c), z in self.zone_map.items()],
         }
+        if self.dock_pos is not None:
+            d["dock_pos"] = list(self.dock_pos)
+        return d
 
     @staticmethod
     def from_dict(data: dict) -> "WarehouseGrid":
@@ -154,10 +170,13 @@ class WarehouseGrid:
         }
         if not zone_map:
             zone_map = WarehouseGrid._assign_zones(g, pack_pos)
+        raw_dock = data.get("dock_pos")
+        dock_pos = tuple(raw_dock) if raw_dock is not None else None
         return WarehouseGrid(
             rows=data["rows"],
             cols=data["cols"],
             grid=g,
             pack_station_pos=pack_pos,
             zone_map=zone_map,
+            dock_pos=dock_pos,
         )

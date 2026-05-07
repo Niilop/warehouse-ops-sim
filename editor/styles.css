@@ -279,6 +279,7 @@ button.primary[data-running="1"] { background: #2e0e0e; border-color: #5a1d1d; c
 .swatch-rack  { background: #9a5200; }
 .swatch-aisle { background: #141414; border-color: #333; }
 .swatch-pack  { background: #1d4d1d; }
+.swatch-dock  { background: #6a4e00; }
 .swatch-empty { background: #2a2a2a; }
 
 /* ── Inputs ──────────────────────────────────────────── */
@@ -317,6 +318,7 @@ input[type="range"] { width: 100px; padding: 2px; cursor: pointer; }
 .cell-rack  { background: #9a5200; }
 .cell-aisle { background: #0d0d0d; }
 .cell-pack  { background: #1d4d1d; }
+.cell-dock  { background: #6a4e00; }
 
 /* ── Params grid ─────────────────────────────────────── */
 .param-grid {

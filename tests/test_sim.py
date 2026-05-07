@@ -552,6 +552,72 @@ def test_enqueue_order_creates_order_pick_task():
     assert all(len(t.payload["batch"].orders) == 1 for t in sim.task_queue)
 
 
+# ── dock / replenishment ─────────────────────────────────────────────────────
+
+def _grid_with_dock():
+    """Default grid with a dock cell added at the top-right corner."""
+    from warehouse.grid import CellType
+    g = WarehouseGrid.build_default()
+    dock = (0, g.cols - 1)
+    g.grid[dock[0], dock[1]] = CellType.DOCK
+    g.dock_pos = dock
+    return g
+
+
+def test_dock_pos_round_trips_serialisation():
+    g = _grid_with_dock()
+    d = g.to_dict()
+    assert "dock_pos" in d
+    g2 = WarehouseGrid.from_dict(d)
+    assert g2.dock_pos == g.dock_pos
+
+
+def test_replenishment_restocks_slot():
+    """With a dock, items depleted below reorder_point are physically restocked."""
+    grid = _grid_with_dock()
+    items = catalog(n_items=10, n_families=2, seed=5)
+    inventory = Inventory(grid)
+    inventory.seed(items, initial_stock=2)
+    agents = [PickAgent(f"A{i+1}", grid.pack_station_pos, grid) for i in range(2)]
+    sim = Simulation(grid, inventory, agents, restock_delay=0)
+
+    os = orders(items, n=6, per_order=2, seed=5)
+    for o in os:
+        sim.enqueue_order(o)
+    sim.run(max_ticks=50_000)
+
+    assert len(sim.completed_metrics) == 6, (
+        f"Only {len(sim.completed_metrics)}/6 orders completed with dock replenishment"
+    )
+
+
+def test_replenishment_urgent_preempts_order_pick():
+    """A REPLENISHMENT_URGENT task in the queue is dispatched before ORDER_PICK."""
+    import heapq
+    from warehouse.task import Task, TaskType
+    grid = _grid_with_dock()
+    items = catalog()
+    inventory = Inventory(grid)
+    inventory.seed(items)
+    agent = PickAgent("A1", grid.pack_station_pos, grid)
+    sim = Simulation(grid, inventory, [agent], restock_delay=0)
+
+    # Push an ORDER_PICK then a higher-priority URGENT task
+    os = orders(items, n=1)
+    sim.enqueue_order(os[0])
+    dummy_item = items[0]
+    slot = inventory._original_slot_for[dummy_item.item_id]
+    heapq.heappush(sim.task_queue, Task(
+        priority=TaskType.REPLENISHMENT_URGENT,
+        created_at=0,
+        task_id="repl-test",
+        payload={"item": dummy_item, "qty": 1, "slot_stand_pos": slot.stand_pos},
+    ))
+
+    top = heapq.heappop(sim.task_queue)
+    assert top.priority == TaskType.REPLENISHMENT_URGENT
+
+
 # ── large-scale stress tests ──────────────────────────────────────────────────
 
 @pytest.mark.parametrize("n_agents,n_orders,n_items,per_order,seed", [

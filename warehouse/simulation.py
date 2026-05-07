@@ -97,6 +97,9 @@ class Simulation:
         self.epoch_length: int = epoch_length
         self._last_epoch_tick: int = 0
 
+        # Dock replenishment tracking — item_ids with an in-flight replenishment task
+        self._pending_replenishment: set[str] = set()
+
         # Streaming / Poisson arrivals (order_arrival_rate=0 means batch-upfront mode)
         self.order_arrival_rate: float = order_arrival_rate
         self.order_generator: Callable[[], Order] | None = order_generator
@@ -174,6 +177,21 @@ class Simulation:
 
         while self.task_queue and not dispatched:
             task = heapq.heappop(self.task_queue)
+
+            if task.priority in (TaskType.REPLENISHMENT_URGENT, TaskType.REPLENISHMENT_SCHEDULED):
+                if self.grid.dock_pos is None:
+                    continue  # dock removed mid-run; discard stale task
+                p = task.payload
+                agent.assign_replenishment(
+                    item=p["item"],
+                    qty=p["qty"],
+                    slot_stand_pos=p["slot_stand_pos"],
+                    dock_pos=self.grid.dock_pos,
+                    task_id=task.task_id,
+                )
+                dispatched = True
+                continue
+
             batch: BatchedOrder = task.payload["batch"]
             needed = Counter(batch.unified_item_ids)
             if not all(available(iid, cnt) for iid, cnt in needed.items()):
@@ -214,12 +232,14 @@ class Simulation:
             ))
             self._order_enqueue_tick.pop(oid, None)
         self._agent_batch[agent.agent_id] = None
-        for item in deposited:
-            self.restock_queue.append(RestockJob(
-                item_id=item.item_id,
-                item=item,
-                ready_at_tick=self.current_tick + self.restock_delay,
-            ))
+        if self.grid.dock_pos is None:
+            # No dock: teleport items back after restock_delay (legacy batch mode).
+            for item in deposited:
+                self.restock_queue.append(RestockJob(
+                    item_id=item.item_id,
+                    item=item,
+                    ready_at_tick=self.current_tick + self.restock_delay,
+                ))
 
     # ------------------------------------------------------------------
     # Main simulation loop
@@ -350,6 +370,22 @@ class Simulation:
         for job in due:
             self.inventory.restock(job.item)
 
+        # With a dock, check whether any slot has dropped below its reorder point
+        # and queue a physical replenishment task if not already pending.
+        if self.grid.dock_pos is not None:
+            for item_id, item, order_qty, urgent in self.inventory.check_reorder_triggers(
+                self._pending_replenishment
+            ):
+                priority = TaskType.REPLENISHMENT_URGENT if urgent else TaskType.REPLENISHMENT_SCHEDULED
+                slot = self.inventory._original_slot_for[item_id]
+                heapq.heappush(self.task_queue, Task(
+                    priority=priority,
+                    created_at=self.current_tick,
+                    task_id=f"repl-{item_id}",
+                    payload={"item": item, "qty": order_qty, "slot_stand_pos": slot.stand_pos},
+                ))
+                self._pending_replenishment.add(item_id)
+
     def _dispatch_idle_agents(self) -> None:
         # Serial dispatch — queue item is popped before the next agent is considered,
         # so two agents cannot claim the same batch/order in the same tick.
@@ -416,16 +452,23 @@ class Simulation:
                         agent.replan()
                 elif agent.state == AgentState.MOVING_TO_STATION:
                     if agent.pos != self.grid.pack_station_pos:
-                        # Path exhausted before reaching the station — replan.
                         agent.replan()
                     elif not self.station_busy:
                         self.station_busy = True
                         self._do_deposit(agent)
                     else:
-                        # At the station but it is busy this tick.  Count as
-                        # waiting so wait_count accumulates and the escape step
-                        # can push the agent aside if the queue grows large.
                         agent._wait_count += 1
+                elif agent.state == AgentState.MOVING_TO_DOCK:
+                    if agent.pos == self.grid.dock_pos:
+                        agent.execute_dock_pickup()
+                    else:
+                        agent.replan()
+                elif agent.state == AgentState.MOVING_FROM_DOCK:
+                    if agent.pos == agent._repl_slot_pos:
+                        item = agent.execute_restock(self.inventory)
+                        self._pending_replenishment.discard(item.item_id)
+                    else:
+                        agent.replan()
 
     def step(self) -> bool:
         """Advance simulation by one tick. Returns True while work remains.

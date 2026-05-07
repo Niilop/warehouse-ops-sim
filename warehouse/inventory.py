@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 import time
 from dataclasses import dataclass, field
 from warehouse.grid import WarehouseGrid
@@ -18,8 +19,11 @@ class RackSlot:
     rack_pos: tuple[int, int]
     stand_pos: tuple[int, int]  # walkable cell the agent stands at to pick
     item: Item | None = None
-    stock: int = 0      # units currently in this slot
-    max_stock: int = 1  # slot capacity (for future stock-level optimisation)
+    stock: int = 0
+    max_stock: int = 1
+    reorder_point: int = 0   # trigger replenishment when stock falls below this
+    order_qty: int = 1       # units to fetch per replenishment run
+    lead_time: int = 50      # estimated dock→slot travel ticks (informational)
 
 
 @dataclass
@@ -33,7 +37,8 @@ class Inventory:
     def __init__(self, grid: WarehouseGrid) -> None:
         self._slots: list[RackSlot] = []
         self._item_to_slot: dict[str, RackSlot] = {}
-        self._original_slot_for: dict[str, RackSlot] = {}  # for restock
+        self._original_slot_for: dict[str, RackSlot] = {}
+        self._all_items: dict[str, Item] = {}  # item registry — survives stockout
 
         from warehouse.grid import CellType
         for r in range(grid.rows):
@@ -74,8 +79,13 @@ class Inventory:
             slot.item = item
             slot.stock = initial_stock
             slot.max_stock = initial_stock
+            # Reorder parameters scaled by pick_rate and initial_stock.
+            # Trigger replenishment at ~40% stock; fetch ~50% of initial stock per run.
+            slot.reorder_point = max(1, math.ceil(initial_stock * item.pick_rate * 0.4))
+            slot.order_qty     = max(1, math.ceil(initial_stock * item.pick_rate * 0.5))
             self._item_to_slot[item.item_id] = slot
             self._original_slot_for[item.item_id] = slot
+            self._all_items[item.item_id] = item
 
     def get_slot(self, item_id: str) -> RackSlot:
         return self._item_to_slot[item_id]
@@ -136,6 +146,34 @@ class Inventory:
             old_slot.stock = 0
             return item, units
         return None, 0
+
+    def restock_bulk(self, item: Item, qty: int) -> None:
+        """Deposit `qty` units of an item into its original slot (used by dock replenishment)."""
+        slot = self._original_slot_for[item.item_id]
+        for _ in range(qty):
+            was_empty = slot.stock == 0
+            slot.stock = min(slot.stock + 1, slot.max_stock)
+            if was_empty:
+                slot.item = item
+                self._item_to_slot[item.item_id] = slot
+
+    def check_reorder_triggers(
+        self, pending: set[str]
+    ) -> list[tuple[str, "Item", int, bool]]:
+        """Scan all seeded slots and return replenishment triggers.
+
+        Returns list of (item_id, item, order_qty, urgent) for items whose
+        stock is below their reorder_point and not already pending replenishment.
+        urgent=True when stock is zero (slot is completely empty).
+        """
+        triggers = []
+        for item_id, slot in self._original_slot_for.items():
+            if item_id in pending or slot.reorder_point == 0:
+                continue
+            if slot.stock < slot.reorder_point:
+                item = self._all_items[item_id]
+                triggers.append((item_id, item, slot.order_qty, slot.stock == 0))
+        return triggers
 
     def available_slots(self) -> list[RackSlot]:
         return [s for s in self._slots if s.item is not None]
