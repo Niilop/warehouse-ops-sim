@@ -100,6 +100,14 @@ class Simulation:
         # Dock replenishment tracking — item_ids with an in-flight replenishment task
         self._pending_replenishment: set[str] = set()
 
+        # Wave replenishment: POs accumulate between truck arrivals
+        # 0 = immediate dispatch (backward compat); > 0 = batch by truck schedule
+        self.truck_interval_ticks: int = 0
+        self._pending_po: list[tuple[Item, int]] = []  # (item, qty) awaiting next truck
+
+        # Waiting queue: ORDER_PICK tasks deferred due to genuine stockout (stock == 0)
+        self._waiting_tasks: list[Task] = []
+
         # Streaming / Poisson arrivals (order_arrival_rate=0 means batch-upfront mode)
         self.order_arrival_rate: float = order_arrival_rate
         self.order_generator: Callable[[], Order] | None = order_generator
@@ -195,7 +203,13 @@ class Simulation:
             batch: BatchedOrder = task.payload["batch"]
             needed = Counter(batch.unified_item_ids)
             if not all(available(iid, cnt) for iid, cnt in needed.items()):
-                deferred.append(task)
+                # Genuine stockout (aggregate stock == 0): park in waiting queue.
+                # Contention only (another agent claimed the units): defer on heap.
+                if any(self.inventory.stock_level(iid) == 0 for iid in needed):
+                    self._waiting_tasks.append(task)
+                    self.stockout_count += 1
+                else:
+                    deferred.append(task)
                 continue
             for order in batch.orders:
                 wait = self.current_tick - self._order_enqueue_tick.get(
@@ -359,6 +373,20 @@ class Simulation:
                         ready_at_tick=self.current_tick + reslot_delay,
                     ))
 
+    def _unblock_waiting_tasks(self) -> None:
+        """Re-queue waiting tasks whose items all have aggregate stock > 0."""
+        still_waiting: list[Task] = []
+        for task in self._waiting_tasks:
+            batch: BatchedOrder = task.payload["batch"]
+            if all(
+                self.inventory.stock_level(iid) > 0
+                for iid in set(batch.unified_item_ids)
+            ):
+                heapq.heappush(self.task_queue, task)
+            else:
+                still_waiting.append(task)
+        self._waiting_tasks = still_waiting
+
     def _process_arrivals(self) -> None:
         if self.order_arrival_rate <= 0 or self.order_generator is None:
             return
@@ -373,22 +401,45 @@ class Simulation:
         )
         for job in due:
             self.inventory.restock(job.item)
+        if due:
+            self._unblock_waiting_tasks()
 
-        # With a dock, check whether any slot has dropped below its reorder point
-        # and queue a physical replenishment task if not already pending.
+        # With a dock, check whether any slot has dropped below its reorder point.
         if self.grid.dock_pos is not None:
+            # Drain accumulated PO on truck arrival.
+            if (
+                self.truck_interval_ticks > 0
+                and self.current_tick > 0
+                and self.current_tick % self.truck_interval_ticks == 0
+            ):
+                for item, qty in self._pending_po:
+                    homes = self.inventory._original_slots_for[item.item_id]
+                    target = min(homes, key=lambda s: s.stock / max(1, s.fill_to))
+                    heapq.heappush(self.task_queue, Task(
+                        priority=TaskType.REPLENISHMENT_SCHEDULED,
+                        created_at=self.current_tick,
+                        task_id=f"repl-{item.item_id}",
+                        payload={"item": item, "qty": qty, "slot_stand_pos": target.stand_pos},
+                    ))
+                self._pending_po.clear()
+
             for item_id, item, order_qty, urgent in self.inventory.check_reorder_triggers(
                 self._pending_replenishment
             ):
-                priority = TaskType.REPLENISHMENT_URGENT if urgent else TaskType.REPLENISHMENT_SCHEDULED
-                homes = self.inventory._original_slots_for[item_id]
-                target = min(homes, key=lambda s: s.stock / max(1, s.fill_to))
-                heapq.heappush(self.task_queue, Task(
-                    priority=priority,
-                    created_at=self.current_tick,
-                    task_id=f"repl-{item_id}",
-                    payload={"item": item, "qty": order_qty, "slot_stand_pos": target.stand_pos},
-                ))
+                if urgent or self.truck_interval_ticks == 0:
+                    # Urgent restocks and immediate-mode always bypass the truck schedule.
+                    priority = TaskType.REPLENISHMENT_URGENT if urgent else TaskType.REPLENISHMENT_SCHEDULED
+                    homes = self.inventory._original_slots_for[item_id]
+                    target = min(homes, key=lambda s: s.stock / max(1, s.fill_to))
+                    heapq.heappush(self.task_queue, Task(
+                        priority=priority,
+                        created_at=self.current_tick,
+                        task_id=f"repl-{item_id}",
+                        payload={"item": item, "qty": order_qty, "slot_stand_pos": target.stand_pos},
+                    ))
+                else:
+                    # Non-urgent: accumulate in the pending PO for next truck delivery.
+                    self._pending_po.append((item, order_qty))
                 self._pending_replenishment.add(item_id)
 
     def _dispatch_idle_agents(self) -> None:
@@ -472,6 +523,7 @@ class Simulation:
                     if agent.pos == agent._repl_slot_pos:
                         item = agent.execute_restock(self.inventory)
                         self._pending_replenishment.discard(item.item_id)
+                        self._unblock_waiting_tasks()
                     else:
                         agent.replan()
 
@@ -492,7 +544,9 @@ class Simulation:
         self._handle_agent_movement()
 
         all_idle = all(a.state == AgentState.IDLE for a in self.agents)
-        has_pending = bool(self.restock_queue or self.task_queue)
+        # _waiting_tasks alone (no restock or PO in flight) means stuck on stockout with
+        # no replenishment coming — terminate rather than spin forever.
+        has_pending = bool(self.restock_queue or self.task_queue or self._pending_po)
         if all_idle:
             if not has_pending and self.order_arrival_rate <= 0:
                 return False

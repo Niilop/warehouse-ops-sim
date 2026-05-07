@@ -134,6 +134,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     target_dos = max(1, int(config.get("target_dos", 5)))
     reorder_trigger_days = max(1, int(config.get("reorder_trigger_days", 2)))
     target_fill_pct = max(0.1, min(1.0, float(config.get("target_fill_pct", 0.8))))
+    truck_interval_ticks = max(0, int(config.get("truck_interval_ticks", 0)))
     order_arrival_rate = float(config.get("order_arrival_rate", 0.0))
     orders_per_day: int | None = config.get("orders_per_day", None)
     if orders_per_day is None and order_arrival_rate > 0:
@@ -202,6 +203,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
             grid=grid, inventory=inventory, agents=agents, restock_delay=0,
             order_arrival_rate=order_arrival_rate, order_generator=_make_order,
         )
+        sim.truck_interval_ticks = truck_interval_ticks
         await websocket.send_text(json.dumps({
             "type": "orders_ready",
             "orders": [],
@@ -211,6 +213,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     else:
         # Batch mode: all orders generated and enqueued upfront.
         sim = Simulation(grid=grid, inventory=inventory, agents=agents, restock_delay=0)
+        sim.truck_interval_ticks = truck_interval_ticks
 
         if batch_strategy == "zone":
             batches = ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders)
