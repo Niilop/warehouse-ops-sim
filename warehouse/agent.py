@@ -128,7 +128,7 @@ class PickAgent:
 
         targets: list[tuple[tuple[int, int], str, str]] = []
         for item_id, order_id in zip(batch.unified_item_ids, batch.item_to_order):
-            slot = inventory.get_slot(item_id)
+            slot = inventory.get_slot(item_id, agent_pos=self.pos)
             targets.append((slot.stand_pos, item_id, order_id))
 
         # Greedy nearest-neighbor ordering
@@ -202,7 +202,7 @@ class PickAgent:
         if not self._task_queue:
             return None
         _, item_id, order_id = self._task_queue.pop(0)
-        item = inventory.remove_item(item_id)
+        item = inventory.remove_item(item_id, agent_pos=self.pos)
         self.carried_items.append(item)
         self._carried_order_ids.append(order_id)
         self._advance_to_next_task()
@@ -249,7 +249,7 @@ class PickAgent:
     def execute_restock(self, inventory: Inventory) -> Item:
         """Agent has arrived at the slot stand-pos. Deposit replenishment stock."""
         item = self._repl_item
-        inventory.restock_bulk(item, self._repl_qty)
+        inventory.restock_bulk(item, self._repl_qty, target_stand_pos=self._repl_slot_pos)
         self._repl_item     = None
         self._repl_qty      = 0
         self._repl_slot_pos = None

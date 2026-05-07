@@ -69,8 +69,7 @@ class ZoneBatcher:
     def _order_zones(self, order: Order) -> set[str]:
         zones: set[str] = set()
         for iid in order.item_ids:
-            if iid in self.inventory._item_to_slot:
-                slot = self.inventory._item_to_slot[iid]
+            for slot in self.inventory._original_slots_for.get(iid, []):
                 zone = self.grid.zone_map.get(slot.rack_pos)
                 if zone:
                     zones.add(zone)
@@ -109,9 +108,9 @@ class GreedyTSPBatcher:
 
     def _centroid(self, order: Order) -> tuple[float, float]:
         positions = [
-            self.inventory._item_to_slot[iid].stand_pos
+            slot.stand_pos
             for iid in order.item_ids
-            if iid in self.inventory._item_to_slot
+            for slot in self.inventory._original_slots_for.get(iid, [])[:1]
         ]
         if not positions:
             return (float(self._pack_pos[0]), float(self._pack_pos[1]))

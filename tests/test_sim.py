@@ -606,7 +606,7 @@ def test_replenishment_urgent_preempts_order_pick():
     os = orders(items, n=1)
     sim.enqueue_order(os[0])
     dummy_item = items[0]
-    slot = inventory._original_slot_for[dummy_item.item_id]
+    slot = inventory._original_slots_for[dummy_item.item_id][0]
     heapq.heappush(sim.task_queue, Task(
         priority=TaskType.REPLENISHMENT_URGENT,
         created_at=0,

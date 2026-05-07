@@ -130,6 +130,14 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     batch_strategy = config.get("batch_strategy", "none")
     batch_size = int(config.get("batch_size", 2))
     slot_strategy = config.get("slot_strategy", "spread")
+    max_facings_per_sku = max(1, int(config.get("max_facings_per_sku", 1)))
+    target_dos = max(1, int(config.get("target_dos", 5)))
+    reorder_trigger_days = max(1, int(config.get("reorder_trigger_days", 2)))
+    target_fill_pct = max(0.1, min(1.0, float(config.get("target_fill_pct", 0.8))))
+    order_arrival_rate = float(config.get("order_arrival_rate", 0.0))
+    orders_per_day: int | None = config.get("orders_per_day", None)
+    if orders_per_day is None and order_arrival_rate > 0:
+        orders_per_day = max(1, int(order_arrival_rate * 480))
 
     grid = WarehouseGrid.from_dict(layout_dict)
     inventory = Inventory(grid)
@@ -148,17 +156,30 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
         family_affinity=family_affinity, seed=seed
     )
 
-    if slot_strategy in ("demand", "affinity"):
+    seed_kwargs: dict = dict(
+        orders_per_day=orders_per_day,
+        items_per_order=items_per_order,
+        target_dos=target_dos,
+        reorder_trigger_days=reorder_trigger_days,
+        target_fill_pct=target_fill_pct,
+        max_facings_per_sku=max_facings_per_sku,
+    )
+
+    if slot_strategy in ("demand", "affinity") and max_facings_per_sku <= 1:
         sorted_slot_order = [idx for idx, _ in slot_distances(grid, inventory)][:len(items)]
         if slot_strategy == "demand":
             ordered_items = demand_placement(items)
         else:
             ordered_items = affinity_placement(items, orders)
-        inventory.seed(ordered_items, slot_order=sorted_slot_order)
+        inventory.seed(ordered_items, slot_order=sorted_slot_order, **seed_kwargs)
     else:
-        inventory.seed(items)
-
-    order_arrival_rate = float(config.get("order_arrival_rate", 0.0))
+        if slot_strategy == "demand":
+            seeded_items = demand_placement(items)
+        elif slot_strategy == "affinity":
+            seeded_items = affinity_placement(items, orders)
+        else:
+            seeded_items = items
+        inventory.seed(seeded_items, **seed_kwargs)
 
     n_agents = max(1, int(config.get("n_agents", 1)))
     agents = [PickAgent(agent_id=f"A{i+1}", start_pos=grid.pack_station_pos, grid=grid) for i in range(n_agents)]

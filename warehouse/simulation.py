@@ -266,8 +266,11 @@ class Simulation:
 
         pack_r, pack_c = self.grid.pack_station_pos
         current_distances: dict[str, int] = {
-            iid: abs(slot.stand_pos[0] - pack_r) + abs(slot.stand_pos[1] - pack_c)
-            for iid, slot in self.inventory._original_slot_for.items()
+            iid: min(
+                abs(s.stand_pos[0] - pack_r) + abs(s.stand_pos[1] - pack_c)
+                for s in slots
+            )
+            for iid, slots in self.inventory._original_slots_for.items()
         }
         if not current_distances:
             return
@@ -293,13 +296,11 @@ class Simulation:
 
         protected_rack_pos: set[tuple[int, int]] = set()
         for iid in in_flight:
-            home = self.inventory._original_slot_for.get(iid)
-            if home is not None:
-                protected_rack_pos.add(home.rack_pos)
+            for s in self.inventory._original_slots_for.get(iid, []):
+                protected_rack_pos.add(s.rack_pos)
         for job in self.restock_queue:
-            home = self.inventory._original_slot_for.get(job.item_id)
-            if home is not None:
-                protected_rack_pos.add(home.rack_pos)
+            for s in self.inventory._original_slots_for.get(job.item_id, []):
+                protected_rack_pos.add(s.rack_pos)
 
         sorted_slots = slot_distances(self.grid, self.inventory)
         sorted_items = sorted(
@@ -333,7 +334,10 @@ class Simulation:
         # call finds was_empty=False, silently skips _item_to_slot registration, and F is lost.
         # Guard: skip any relocation whose target slot has such a non-relocated occupant.
         slot_id_to_item: dict[int, str] = {
-            id(slot): iid for iid, slot in self.inventory._item_to_slot.items()
+            id(slot): iid
+            for iid, slots in self.inventory._original_slots_for.items()
+            for slot in slots
+            if slot.stock > 0
         }
 
         reslot_delay = max(self.restock_delay, 5)
@@ -341,7 +345,7 @@ class Simulation:
             if iid in in_flight:
                 continue
             new_slot = self.inventory._slots[new_slot_idx]
-            if self.inventory._original_slot_for.get(iid) is new_slot:
+            if any(s is new_slot for s in self.inventory._original_slots_for.get(iid, [])):
                 continue
             occupant = slot_id_to_item.get(id(new_slot))
             if occupant is not None and occupant not in item_to_new_slot:
@@ -377,12 +381,13 @@ class Simulation:
                 self._pending_replenishment
             ):
                 priority = TaskType.REPLENISHMENT_URGENT if urgent else TaskType.REPLENISHMENT_SCHEDULED
-                slot = self.inventory._original_slot_for[item_id]
+                homes = self.inventory._original_slots_for[item_id]
+                target = min(homes, key=lambda s: s.stock / max(1, s.fill_to))
                 heapq.heappush(self.task_queue, Task(
                     priority=priority,
                     created_at=self.current_tick,
                     task_id=f"repl-{item_id}",
-                    payload={"item": item, "qty": order_qty, "slot_stand_pos": slot.stand_pos},
+                    payload={"item": item, "qty": order_qty, "slot_stand_pos": target.stand_pos},
                 ))
                 self._pending_replenishment.add(item_id)
 
