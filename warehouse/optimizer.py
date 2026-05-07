@@ -83,3 +83,37 @@ def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
         unplaced.remove(best)
 
     return placed
+
+
+def reorg_cost(
+    current_distances: dict[str, int],
+    proposed_distances: dict[str, int],
+    restock_delay: int,
+    items_pick_rate: dict[str, float],
+) -> dict:
+    """Estimate the cost/benefit of a proposed item reslotting.
+
+    disruption_ticks  = moved_items × restock_delay   (items briefly unavailable)
+    expected_savings  = Σ pick_rate[i] × (cur_dist[i] - prop_dist[i]) for moved i
+    payback_period    = disruption / savings  (inf when savings ≤ 0)
+
+    Returns dict with keys: moved_items, disruption_ticks,
+    expected_savings_per_tick, payback_period_ticks.
+    """
+    moved = {
+        iid for iid in current_distances
+        if proposed_distances.get(iid, current_distances[iid]) != current_distances[iid]
+    }
+    disruption_ticks = len(moved) * restock_delay
+    expected_savings = sum(
+        items_pick_rate.get(iid, 0.0)
+        * (current_distances[iid] - proposed_distances.get(iid, current_distances[iid]))
+        for iid in moved
+    )
+    payback = disruption_ticks / expected_savings if expected_savings > 0 else float("inf")
+    return {
+        "moved_items": len(moved),
+        "disruption_ticks": disruption_ticks,
+        "expected_savings_per_tick": round(expected_savings, 4),
+        "payback_period_ticks": round(payback, 1),
+    }

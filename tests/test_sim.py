@@ -499,3 +499,84 @@ def test_wait_ticks_nonzero_when_queue_backpressure():
     wait_values = [m.wait_ticks for m in sim.completed_metrics]
     assert any(w > 0 for w in wait_values), \
         f"Expected some orders to have wait_ticks > 0; got {wait_values}"
+
+
+# ── large-scale stress tests ──────────────────────────────────────────────────
+
+@pytest.mark.parametrize("n_agents,n_orders,n_items,per_order,seed", [
+    (2, 40,  30, 4, 11),
+    (3, 60,  40, 4, 22),
+    (4, 80,  50, 5, 33),
+    (6, 100, 60, 4, 44),
+])
+def test_large_scale_completion(n_agents, n_orders, n_items, per_order, seed):
+    """All orders complete regardless of agent count or catalog size."""
+    items = generate_catalog(n_items=n_items, n_families=6, demand_skew=2.5, seed=seed)
+    os = generate_orders(items, n_orders=n_orders, items_per_order=per_order, seed=seed)
+    sim = run_sim(QUAD, items, os, n_agents=n_agents)
+    assert len(sim.completed_metrics) == n_orders, (
+        f"{n_agents}A/{n_orders}O/{n_items}I: "
+        f"{len(sim.completed_metrics)} completed"
+    )
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order
+
+
+@pytest.mark.parametrize("strategy,batch_size,n_agents", [
+    ("zone", 3, 4),
+    ("tsp",  3, 4),
+    ("tsp",  4, 6),
+])
+def test_large_batch_multi_agent(strategy, batch_size, n_agents):
+    """Batch strategies complete all orders under multi-agent contention."""
+    n_orders, per_order = 60, 4
+    items = generate_catalog(n_items=40, n_families=6, demand_skew=2.0, seed=77)
+    os = generate_orders(items, n_orders=n_orders, items_per_order=per_order, seed=77)
+    sim = run_sim(QUAD, items, os, strategy=strategy, batch_size=batch_size, n_agents=n_agents)
+    assert len(sim.completed_metrics) == n_orders
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order
+
+
+def test_epoch_reslotting_no_item_loss():
+    """Active epoch reslotting must never lose items — all orders complete correctly."""
+    n_orders, per_order = 50, 4
+    items = generate_catalog(n_items=30, n_families=4, demand_skew=2.0, seed=42)
+    os = generate_orders(items, n_orders=n_orders, items_per_order=per_order, seed=42)
+
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(3)]
+    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0, epoch_length=50)
+    for o in os:
+        sim.enqueue_order(o)
+    sim.run(max_ticks=500_000)
+
+    assert len(sim.completed_metrics) == n_orders, (
+        f"epoch reslotting lost orders: {len(sim.completed_metrics)}/{n_orders} completed"
+    )
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order, (
+        f"epoch reslotting lost items: {total} picked, expected {n_orders * per_order}"
+    )
+
+
+def test_epoch_reslotting_with_batching():
+    """Epoch reslotting + batch picking together must not lose items."""
+    n_orders, per_order = 40, 4
+    items = generate_catalog(n_items=30, n_families=4, demand_skew=2.0, seed=55)
+    os = generate_orders(items, n_orders=n_orders, items_per_order=per_order, seed=55)
+
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(3)]
+    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0, epoch_length=60)
+
+    from warehouse.batcher import GreedyTSPBatcher
+    for b in GreedyTSPBatcher(inventory, DEFAULT, max_batch_size=3).batch(os):
+        sim.enqueue_batch(b)
+    sim.run(max_ticks=500_000)
+
+    assert len(sim.completed_metrics) == n_orders
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order

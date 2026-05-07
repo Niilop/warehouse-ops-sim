@@ -103,6 +103,7 @@ class SimulationViewer {
     this.dict = null;
     this.agents = [];
     this._zoom = 1.0;
+    this._heatmapData = null;  // normalized "r,c" -> 0–1 intensity
 
     // Wheel zoom — zoom toward cursor
     canvas.addEventListener("wheel", (e) => {
@@ -136,6 +137,16 @@ class SimulationViewer {
 
   resetZoom() { this._zoom = 0.78; this._draw(); }
   zoomBy(f)   { this._zoom = Math.max(0.1, Math.min(12, this._zoom * f)); this._draw(); }
+
+  setHeatmap(rawData) {
+    if (!rawData || !Object.keys(rawData).length) { this._heatmapData = null; this._draw(); return; }
+    const maxVal = Math.max(...Object.values(rawData), 1e-9);
+    this._heatmapData = {};
+    for (const [k, v] of Object.entries(rawData)) this._heatmapData[k] = v / maxVal;
+    this._draw();
+  }
+
+  clearHeatmap() { this._heatmapData = null; this._draw(); }
 
   // ── Internal ────────────────────────────────────────
 
@@ -190,6 +201,18 @@ class SimulationViewer {
       }
     }
 
+    // Heatmap overlay — drawn over grid cells, under agents
+    if (this._heatmapData) {
+      for (const [key, intensity] of Object.entries(this._heatmapData)) {
+        const [hr, hc] = key.split(",").map(Number);
+        if (hr < 0 || hr >= rows || hc < 0 || hc >= cols) continue;
+        const rc = Math.round(intensity * 255);
+        const gc = Math.round((1 - intensity) * 80);
+        ctx.fillStyle = `rgba(${rc},${gc},20,0.55)`;
+        ctx.fillRect(ox + hc * cs + gap, oy + hr * cs + gap, cs - gap, cs - gap);
+      }
+    }
+
     // Agents — slightly inset square
     const pad = Math.max(1, cs * 0.12);
     for (let i = 0; i < this.agents.length; i++) {
@@ -235,15 +258,16 @@ class SimulationViewer {
 // SimulationClient — WebSocket lifecycle
 // ─────────────────────────────────────────────────────────────────
 class SimulationClient {
-  constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner, orderList) {
-    this.viewer       = viewer;
-    this.metricsTbody = metricsTbody;
+  constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner, orderList, dashboard) {
+    this.viewer        = viewer;
+    this.metricsTbody  = metricsTbody;
     this.metricsFooter = metricsFooter;
-    this.summaryBox   = summaryBox;
-    this.errorBanner  = errorBanner;
-    this.orderList    = orderList;
-    this.ws           = null;
-    this.orderRows    = new Map();
+    this.summaryBox    = summaryBox;
+    this.errorBanner   = errorBanner;
+    this.orderList     = orderList;
+    this.dashboard     = dashboard;
+    this.ws            = null;
+    this.orderRows     = new Map();
     this._activeBatchKey = "";
   }
 
@@ -267,6 +291,7 @@ class SimulationClient {
     this.errorBanner.style.display = "none";
     this.summaryBox.style.display  = "none";
     document.getElementById("hud-summary").style.display = "none";
+    if (this.dashboard) this.dashboard.reset();
 
     const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws/simulate";
     this.ws = new WebSocket(wsUrl);
@@ -284,11 +309,26 @@ class SimulationClient {
 
   _onMessage(frame) {
     switch (frame.type) {
-      case "orders_ready":   this._onOrdersReady(frame); break;
-      case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.agents || []); break;
-      case "order_complete": this._appendMetricsRow(frame); this._markOrderDone(frame.order_id); break;
-      case "complete":       this._onComplete(frame); break;
-      case "error":          this._showError(frame.message); break;
+      case "orders_ready":
+        this._onOrdersReady(frame);
+        if (this.dashboard) this.dashboard.onOrdersReady(frame);
+        break;
+      case "tick":
+        this.viewer.applyTick(frame);
+        this._updateActiveOrders(frame.agents || []);
+        if (this.dashboard) this.dashboard.onTick(frame);
+        break;
+      case "order_complete":
+        this._appendMetricsRow(frame);
+        this._markOrderDone(frame.order_id);
+        break;
+      case "complete":
+        this._onComplete(frame);
+        if (this.dashboard) this.dashboard.onComplete(frame);
+        break;
+      case "error":
+        this._showError(frame.message);
+        break;
     }
   }
 
@@ -392,12 +432,88 @@ class SimulationClient {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Dashboard — heatmap toggle, rolling throughput, agent utilization
+// ─────────────────────────────────────────────────────────────────
+class Dashboard {
+  constructor(viewer) {
+    this.viewer        = viewer;
+    this._mode         = "off";   // "off" | "visits" | "slotting"
+    this._visitData    = null;    // "r,c" -> count  (arrives in complete frame)
+    this._slottingData = null;    // "r,c" -> pick_rate (arrives in orders_ready frame)
+  }
+
+  onOrdersReady(frame) {
+    this._slottingData = frame.slot_pick_rates || null;
+    if (this._mode === "slotting") this._applyHeatmap();
+  }
+
+  onTick(frame) {
+    const el = document.getElementById("dash-throughput");
+    if (el && frame.lines_per_hour_rolling != null)
+      el.textContent = `${frame.lines_per_hour_rolling} lines/hr`;
+    this._updateAgentUtil(frame.agents || []);
+  }
+
+  onComplete(frame) {
+    this._visitData = frame.heatmap || null;
+    if (this._mode === "visits") this._applyHeatmap();
+  }
+
+  setMode(mode) {
+    this._mode = mode;
+    if (mode === "off") this.viewer.clearHeatmap();
+    else                this._applyHeatmap();
+  }
+
+  reset() {
+    this._visitData = null;
+    this.viewer.clearHeatmap();
+    const el = document.getElementById("dash-throughput");
+    if (el) el.textContent = "— lines/hr";
+    const util = document.getElementById("dash-util");
+    if (util) util.innerHTML = "";
+  }
+
+  _applyHeatmap() {
+    const data = this._mode === "slotting" ? this._slottingData : this._visitData;
+    this.viewer.setHeatmap(data || null);
+  }
+
+  _updateAgentUtil(agents) {
+    const el = document.getElementById("dash-util");
+    if (!el) return;
+    while (el.children.length < agents.length) el.appendChild(document.createElement("div"));
+    while (el.children.length > agents.length) el.removeChild(el.lastChild);
+    for (let i = 0; i < agents.length; i++) {
+      const a   = agents[i];
+      const row = el.children[i];
+      row.className = "util-row";
+      const pct = a.util_pct ?? 0;
+      row.innerHTML =
+        `<span class="util-label">${a.id}</span>` +
+        `<div class="util-bar-bg"><div class="util-bar-fill" style="width:${pct}%;background:${AGENT_IDLE[i % 4]}"></div></div>` +
+        `<span class="util-pct">${pct}%</span>`;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Module wiring
 // ─────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
-  const editor = new GridEditor(document.getElementById("editor-grid"));
-  const viewer = new SimulationViewer(document.getElementById("sim-canvas"));
+  const editor    = new GridEditor(document.getElementById("editor-grid"));
+  const viewer    = new SimulationViewer(document.getElementById("sim-canvas"));
+  const dashboard = new Dashboard(viewer);
   let client = null;
+
+  // ── Heatmap mode toggle ──────────────────────────
+  document.querySelectorAll(".heatmap-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".heatmap-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      dashboard.setMode(btn.dataset.mode);
+    });
+  });
 
   // Load default layout on startup
   fetch(API_BASE + "/api/default-layout")
@@ -559,6 +675,7 @@ document.addEventListener("DOMContentLoaded", () => {
       document.getElementById("summary-box"),
       errorBanner,
       document.getElementById("order-list"),
+      dashboard,
     );
 
     client.connect({

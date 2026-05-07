@@ -34,6 +34,7 @@ class PickAgent:
         self._pack_pos: tuple[int, int] = start_pos
         self._batch: BatchedOrder | None = None
         self._wait_count: int = 0  # consecutive ticks blocked by another agent
+        self._replan_cooldown: int = 0  # ticks until next replan is allowed
 
     # ------------------------------------------------------------------
     # Pathfinding
@@ -88,6 +89,8 @@ class PickAgent:
 
     def step(self, occupied_cells: set[tuple[int, int]] | None = None) -> StepResult:
         """Advance one cell along _path. Returns StepResult."""
+        if self._replan_cooldown > 0:
+            self._replan_cooldown -= 1
         if not self._path:
             self._wait_count = 0
             return StepResult.ARRIVED
@@ -158,9 +161,14 @@ class PickAgent:
             self._path = self.find_path(self._pack_pos, occupied_cells)
             self.state = AgentState.MOVING_TO_STATION
 
-    def replan(self, occupied_cells: set[tuple[int, int]] | None = None) -> None:
-        """Replan path to current target. Tries to route around occupied cells;
-        falls back to a free path if no detour exists."""
+    def replan(self, occupied_cells: set[tuple[int, int]] | None = None, *, force: bool = False) -> None:
+        """Replan path to current target.
+
+        Tries to route around occupied_cells. Falls back to an unblocked path
+        only when force=True (used for the high-wait-count escape hatch) or
+        when the agent has no path at all. Staying put is better than choosing
+        the same conflicting path again in a livelock situation.
+        """
         if self._task_queue:
             goal, _, _ = self._task_queue[0]
         elif self.state == AgentState.MOVING_TO_STATION:
@@ -171,9 +179,10 @@ class PickAgent:
             self._path = []
             return
         new_path = self.find_path(goal, occupied_cells)
-        if not new_path:
+        if not new_path and (force or not self._path):
             new_path = self.find_path(goal)
-        self._path = new_path
+        if new_path:
+            self._path = new_path
 
     def execute_pick(self, inventory: Inventory) -> Item | None:
         """Called when agent arrives at a rack stand_pos. Picks item, advances queue."""

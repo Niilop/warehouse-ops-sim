@@ -200,6 +200,25 @@
 <!-- ══════════════ RIGHT PANEL ══════════════ -->
 <div id="right-panel">
 
+  <!-- Dashboard -->
+  <div class="section no-collapse" style="flex:0 0 auto;">
+    <div class="section-title">Dashboard</div>
+    <div class="section-body">
+      <div class="input-row" style="margin-bottom:6px;">
+        <span class="param-label" style="min-width:52px;">Heatmap</span>
+        <div class="mode-toggle" style="flex:1;">
+          <button class="heatmap-btn active" data-mode="off">Off</button>
+          <button class="heatmap-btn" data-mode="slotting">Slot</button>
+          <button class="heatmap-btn" data-mode="visits">Traffic</button>
+        </div>
+      </div>
+      <div class="param-label" style="margin-bottom:2px;">Throughput</div>
+      <div id="dash-throughput" style="color:#7ac87a;font-size:12px;margin-bottom:6px;">— lines/hr</div>
+      <div class="param-label" style="margin-bottom:4px;">Agent Utilization</div>
+      <div id="dash-util"></div>
+    </div>
+  </div>
+
   <!-- Order queue -->
   <div class="section no-collapse" style="flex:0 0 auto;">
     <div class="section-title">Order Queue</div>

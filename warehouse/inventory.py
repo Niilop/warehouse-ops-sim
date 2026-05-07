@@ -99,8 +99,8 @@ class Inventory:
             self._item_to_slot[item.item_id] = slot
 
     def stock_level(self, item_id: str) -> int:
-        """Current on-hand units for an item (0 if picked out)."""
-        slot = self._original_slot_for.get(item_id)
+        """Current on-hand units for an item (0 if picked out or in transit)."""
+        slot = self._item_to_slot.get(item_id)
         return slot.stock if slot else 0
 
     def reset(self) -> None:
@@ -109,6 +109,33 @@ class Inventory:
             slot.item = None
         self._item_to_slot.clear()
         self._original_slot_for.clear()
+
+    def relocate(self, item_id: str, new_slot_idx: int) -> tuple[Item | None, int]:
+        """Reassign the home slot for item_id to _slots[new_slot_idx].
+
+        Updates _original_slot_for immediately so the next restock() call sends
+        the item to its new home. If the item is currently in stock, drains it
+        from its physical slot and returns (item, units) so the caller can
+        requeue it for restocking; returns (None, 0) if the item is in transit.
+        """
+        new_slot = self._slots[new_slot_idx]
+        # Propagate slot capacity: unassigned slots default to max_stock=1, which
+        # would cap the item's circulation to 1 unit permanently. Carry the old
+        # capacity forward so the item's full initial_stock remains in circulation.
+        old_home = self._original_slot_for.get(item_id)
+        if old_home is not None and old_home.max_stock > new_slot.max_stock:
+            new_slot.max_stock = old_home.max_stock
+        self._original_slot_for[item_id] = new_slot
+        if item_id in self._item_to_slot:
+            old_slot = self._item_to_slot.pop(item_id)
+            item = old_slot.item
+            units = old_slot.stock
+            if old_slot.max_stock > new_slot.max_stock:
+                new_slot.max_stock = old_slot.max_stock
+            old_slot.item = None
+            old_slot.stock = 0
+            return item, units
+        return None, 0
 
     def available_slots(self) -> list[RackSlot]:
         return [s for s in self._slots if s.item is not None]

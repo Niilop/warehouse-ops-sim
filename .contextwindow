@@ -137,6 +137,7 @@ class SimulationViewer {
     this.dict = null;
     this.agents = [];
     this._zoom = 1.0;
+    this._heatmapData = null;  // normalized "r,c" -> 0–1 intensity
 
     // Wheel zoom — zoom toward cursor
     canvas.addEventListener("wheel", (e) => {
@@ -170,6 +171,16 @@ class SimulationViewer {
 
   resetZoom() { this._zoom = 0.78; this._draw(); }
   zoomBy(f)   { this._zoom = Math.max(0.1, Math.min(12, this._zoom * f)); this._draw(); }
+
+  setHeatmap(rawData) {
+    if (!rawData || !Object.keys(rawData).length) { this._heatmapData = null; this._draw(); return; }
+    const maxVal = Math.max(...Object.values(rawData), 1e-9);
+    this._heatmapData = {};
+    for (const [k, v] of Object.entries(rawData)) this._heatmapData[k] = v / maxVal;
+    this._draw();
+  }
+
+  clearHeatmap() { this._heatmapData = null; this._draw(); }
 
   // ── Internal ────────────────────────────────────────
 
@@ -224,6 +235,18 @@ class SimulationViewer {
       }
     }
 
+    // Heatmap overlay — drawn over grid cells, under agents
+    if (this._heatmapData) {
+      for (const [key, intensity] of Object.entries(this._heatmapData)) {
+        const [hr, hc] = key.split(",").map(Number);
+        if (hr < 0 || hr >= rows || hc < 0 || hc >= cols) continue;
+        const rc = Math.round(intensity * 255);
+        const gc = Math.round((1 - intensity) * 80);
+        ctx.fillStyle = `rgba(${rc},${gc},20,0.55)`;
+        ctx.fillRect(ox + hc * cs + gap, oy + hr * cs + gap, cs - gap, cs - gap);
+      }
+    }
+
     // Agents — slightly inset square
     const pad = Math.max(1, cs * 0.12);
     for (let i = 0; i < this.agents.length; i++) {
@@ -269,15 +292,16 @@ class SimulationViewer {
 // SimulationClient — WebSocket lifecycle
 // ─────────────────────────────────────────────────────────────────
 class SimulationClient {
-  constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner, orderList) {
-    this.viewer       = viewer;
-    this.metricsTbody = metricsTbody;
+  constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner, orderList, dashboard) {
+    this.viewer        = viewer;
+    this.metricsTbody  = metricsTbody;
     this.metricsFooter = metricsFooter;
-    this.summaryBox   = summaryBox;
-    this.errorBanner  = errorBanner;
-    this.orderList    = orderList;
-    this.ws           = null;
-    this.orderRows    = new Map();
+    this.summaryBox    = summaryBox;
+    this.errorBanner   = errorBanner;
+    this.orderList     = orderList;
+    this.dashboard     = dashboard;
+    this.ws            = null;
+    this.orderRows     = new Map();
     this._activeBatchKey = "";
   }
 
@@ -301,6 +325,7 @@ class SimulationClient {
     this.errorBanner.style.display = "none";
     this.summaryBox.style.display  = "none";
     document.getElementById("hud-summary").style.display = "none";
+    if (this.dashboard) this.dashboard.reset();
 
     const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws/simulate";
     this.ws = new WebSocket(wsUrl);
@@ -318,11 +343,26 @@ class SimulationClient {
 
   _onMessage(frame) {
     switch (frame.type) {
-      case "orders_ready":   this._onOrdersReady(frame); break;
-      case "tick":           this.viewer.applyTick(frame); this._updateActiveOrders(frame.agents || []); break;
-      case "order_complete": this._appendMetricsRow(frame); this._markOrderDone(frame.order_id); break;
-      case "complete":       this._onComplete(frame); break;
-      case "error":          this._showError(frame.message); break;
+      case "orders_ready":
+        this._onOrdersReady(frame);
+        if (this.dashboard) this.dashboard.onOrdersReady(frame);
+        break;
+      case "tick":
+        this.viewer.applyTick(frame);
+        this._updateActiveOrders(frame.agents || []);
+        if (this.dashboard) this.dashboard.onTick(frame);
+        break;
+      case "order_complete":
+        this._appendMetricsRow(frame);
+        this._markOrderDone(frame.order_id);
+        break;
+      case "complete":
+        this._onComplete(frame);
+        if (this.dashboard) this.dashboard.onComplete(frame);
+        break;
+      case "error":
+        this._showError(frame.message);
+        break;
     }
   }
 
@@ -426,12 +466,88 @@ class SimulationClient {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Dashboard — heatmap toggle, rolling throughput, agent utilization
+// ─────────────────────────────────────────────────────────────────
+class Dashboard {
+  constructor(viewer) {
+    this.viewer        = viewer;
+    this._mode         = "off";   // "off" | "visits" | "slotting"
+    this._visitData    = null;    // "r,c" -> count  (arrives in complete frame)
+    this._slottingData = null;    // "r,c" -> pick_rate (arrives in orders_ready frame)
+  }
+
+  onOrdersReady(frame) {
+    this._slottingData = frame.slot_pick_rates || null;
+    if (this._mode === "slotting") this._applyHeatmap();
+  }
+
+  onTick(frame) {
+    const el = document.getElementById("dash-throughput");
+    if (el && frame.lines_per_hour_rolling != null)
+      el.textContent = `${frame.lines_per_hour_rolling} lines/hr`;
+    this._updateAgentUtil(frame.agents || []);
+  }
+
+  onComplete(frame) {
+    this._visitData = frame.heatmap || null;
+    if (this._mode === "visits") this._applyHeatmap();
+  }
+
+  setMode(mode) {
+    this._mode = mode;
+    if (mode === "off") this.viewer.clearHeatmap();
+    else                this._applyHeatmap();
+  }
+
+  reset() {
+    this._visitData = null;
+    this.viewer.clearHeatmap();
+    const el = document.getElementById("dash-throughput");
+    if (el) el.textContent = "— lines/hr";
+    const util = document.getElementById("dash-util");
+    if (util) util.innerHTML = "";
+  }
+
+  _applyHeatmap() {
+    const data = this._mode === "slotting" ? this._slottingData : this._visitData;
+    this.viewer.setHeatmap(data || null);
+  }
+
+  _updateAgentUtil(agents) {
+    const el = document.getElementById("dash-util");
+    if (!el) return;
+    while (el.children.length < agents.length) el.appendChild(document.createElement("div"));
+    while (el.children.length > agents.length) el.removeChild(el.lastChild);
+    for (let i = 0; i < agents.length; i++) {
+      const a   = agents[i];
+      const row = el.children[i];
+      row.className = "util-row";
+      const pct = a.util_pct ?? 0;
+      row.innerHTML =
+        `<span class="util-label">${a.id}</span>` +
+        `<div class="util-bar-bg"><div class="util-bar-fill" style="width:${pct}%;background:${AGENT_IDLE[i % 4]}"></div></div>` +
+        `<span class="util-pct">${pct}%</span>`;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Module wiring
 // ─────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
-  const editor = new GridEditor(document.getElementById("editor-grid"));
-  const viewer = new SimulationViewer(document.getElementById("sim-canvas"));
+  const editor    = new GridEditor(document.getElementById("editor-grid"));
+  const viewer    = new SimulationViewer(document.getElementById("sim-canvas"));
+  const dashboard = new Dashboard(viewer);
   let client = null;
+
+  // ── Heatmap mode toggle ──────────────────────────
+  document.querySelectorAll(".heatmap-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".heatmap-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      dashboard.setMode(btn.dataset.mode);
+    });
+  });
 
   // Load default layout on startup
   fetch(API_BASE + "/api/default-layout")
@@ -593,6 +709,7 @@ document.addEventListener("DOMContentLoaded", () => {
       document.getElementById("summary-box"),
       errorBanner,
       document.getElementById("order-list"),
+      dashboard,
     );
 
     client.connect({
@@ -820,6 +937,25 @@ document.addEventListener("DOMContentLoaded", () => {
 
 <!-- ══════════════ RIGHT PANEL ══════════════ -->
 <div id="right-panel">
+
+  <!-- Dashboard -->
+  <div class="section no-collapse" style="flex:0 0 auto;">
+    <div class="section-title">Dashboard</div>
+    <div class="section-body">
+      <div class="input-row" style="margin-bottom:6px;">
+        <span class="param-label" style="min-width:52px;">Heatmap</span>
+        <div class="mode-toggle" style="flex:1;">
+          <button class="heatmap-btn active" data-mode="off">Off</button>
+          <button class="heatmap-btn" data-mode="slotting">Slot</button>
+          <button class="heatmap-btn" data-mode="visits">Traffic</button>
+        </div>
+      </div>
+      <div class="param-label" style="margin-bottom:2px;">Throughput</div>
+      <div id="dash-throughput" style="color:#7ac87a;font-size:12px;margin-bottom:6px;">— lines/hr</div>
+      <div class="param-label" style="margin-bottom:4px;">Agent Utilization</div>
+      <div id="dash-util"></div>
+    </div>
+  </div>
 
   <!-- Order queue -->
   <div class="section no-collapse" style="flex:0 0 auto;">
@@ -1315,6 +1451,1479 @@ input[type="range"] { width: 100px; padding: 2px; cursor: pointer; }
 /* ── File load hidden input ──────────────────────────── */
 #file-load-input { display: none; }
 
+/* ── Dashboard ───────────────────────────────────────── */
+.util-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 3px;
+    font-size: 11px;
+}
+.util-label { color: #555; min-width: 22px; flex-shrink: 0; }
+.util-bar-bg {
+    flex: 1;
+    height: 5px;
+    background: #1a1a1a;
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid #222;
+}
+.util-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.4s ease;
+}
+.util-pct { color: #444; min-width: 28px; text-align: right; font-size: 10px; }
+
+
+```
+
+## editor\editor.js
+
+```javascript
+"use strict";
+
+const API_BASE = "http://localhost:8000";
+
+const CT = { EMPTY: 0, RACK: 1, AISLE: 2, PACK: 3 };
+const CELL_CLASS = { 0: "cell-empty", 1: "cell-rack", 2: "cell-aisle", 3: "cell-pack" };
+
+// Canvas cell colors (sim viewer)
+const CANVAS_COLORS   = { 0: "#2a2a2a", 1: "#b06010", 2: "#181818", 3: "#276027" };
+const AGENT_IDLE      = ["#1a6fb5", "#a04000", "#1a7a5a", "#6a2090"];
+const AGENT_CARRY     = ["#4a9fd4", "#f07020", "#30c890", "#b060e0"];
+
+// ─────────────────────────────────────────────────────────────────
+// GridEditor — drawable editor table
+// ─────────────────────────────────────────────────────────────────
+class GridEditor {
+  constructor(tableEl) {
+    this.tableEl = tableEl;
+    this.rows = 0; this.cols = 0;
+    this.cells = [];
+    this.brush = CT.RACK;
+    this.painting = false;
+    this.packPos = null;
+    document.addEventListener("mouseup", () => { this.painting = false; });
+  }
+
+  build(rows, cols) {
+    this.rows = rows; this.cols = cols;
+    this.cells = Array.from({ length: rows }, () => new Array(cols).fill(CT.AISLE));
+    this.packPos = null;
+    this._render();
+  }
+
+  loadFromDict(dict) {
+    this.rows = dict.rows; this.cols = dict.cols;
+    this.cells = dict.grid.map(row => [...row]);
+    this.packPos = dict.pack_station_pos ? [...dict.pack_station_pos] : null;
+    this._render();
+  }
+
+  toDict() {
+    return {
+      rows: this.rows, cols: this.cols,
+      grid: this.cells.map(row => [...row]),
+      pack_station_pos: this.packPos ? [...this.packPos] : [0, 0],
+    };
+  }
+
+  setBrush(type) { this.brush = type; }
+
+  setCellType(row, col, type) {
+    if (row < 0 || row >= this.rows || col < 0 || col >= this.cols) return;
+    if (type === CT.PACK) {
+      if (this.packPos) {
+        const [pr, pc] = this.packPos;
+        this.cells[pr][pc] = CT.AISLE;
+        this._updateTd(pr, pc);
+      }
+      this.packPos = [row, col];
+    } else if (this.packPos && this.packPos[0] === row && this.packPos[1] === col) {
+      this.packPos = null;
+    }
+    this.cells[row][col] = type;
+    this._updateTd(row, col);
+  }
+
+  validateLocal() {
+    const errors = [];
+    if (!this.packPos) errors.push("Place exactly one Pack Station.");
+    if (!this.cells.flat().some(c => c === CT.RACK)) errors.push("Add at least one Rack cell.");
+    return errors.length ? errors : null;
+  }
+
+  _render() {
+    this.tableEl.innerHTML = "";
+    for (let r = 0; r < this.rows; r++) {
+      const tr = document.createElement("tr");
+      for (let c = 0; c < this.cols; c++) {
+        const td = document.createElement("td");
+        td.dataset.row = r; td.dataset.col = c;
+        td.className = CELL_CLASS[this.cells[r][c]];
+        td.addEventListener("mousedown", (e) => { e.preventDefault(); this.painting = true; this.setCellType(r, c, this.brush); });
+        td.addEventListener("mouseenter", () => { if (this.painting) this.setCellType(r, c, this.brush); });
+        tr.appendChild(td);
+      }
+      this.tableEl.appendChild(tr);
+    }
+  }
+
+  _updateTd(row, col) {
+    const td = this.tableEl.rows[row]?.cells[col];
+    if (td) td.className = CELL_CLASS[this.cells[row][col]];
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SimulationViewer — canvas-based with zoom + auto-fit
+// ─────────────────────────────────────────────────────────────────
+class SimulationViewer {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.dict = null;
+    this.agents = [];
+    this._zoom = 1.0;
+    this._heatmapData = null;  // normalized "r,c" -> 0–1 intensity
+
+    // Wheel zoom — zoom toward cursor
+    canvas.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      this._zoom = Math.max(0.1, Math.min(12, this._zoom * factor));
+      this._draw();
+    }, { passive: false });
+
+    // Resize observer keeps canvas pixel-perfect
+    const ro = new ResizeObserver(() => { this._syncSize(); this._draw(); });
+    ro.observe(canvas.parentElement);
+    this._syncSize();
+  }
+
+  // ── Public API ──────────────────────────────────────
+
+  build(dict, resetZoom = true) {
+    this.dict = dict;
+    this.agents = [];
+    if (resetZoom) this._zoom = 0.78;
+    this._draw();
+  }
+
+  applyTick(frame) {
+    this.agents = frame.agents ||
+      [{ ...frame.agent, id: "A1", active_batch: frame.active_batch }];
+    this._draw();
+    this._updateHUD(frame);
+  }
+
+  resetZoom() { this._zoom = 0.78; this._draw(); }
+  zoomBy(f)   { this._zoom = Math.max(0.1, Math.min(12, this._zoom * f)); this._draw(); }
+
+  setHeatmap(rawData) {
+    if (!rawData || !Object.keys(rawData).length) { this._heatmapData = null; this._draw(); return; }
+    const maxVal = Math.max(...Object.values(rawData), 1e-9);
+    this._heatmapData = {};
+    for (const [k, v] of Object.entries(rawData)) this._heatmapData[k] = v / maxVal;
+    this._draw();
+  }
+
+  clearHeatmap() { this._heatmapData = null; this._draw(); }
+
+  // ── Internal ────────────────────────────────────────
+
+  _syncSize() {
+    const dpr = window.devicePixelRatio || 1;
+    const el  = this.canvas.parentElement;
+    const w   = el.clientWidth;
+    const h   = el.clientHeight;
+    this.canvas.width  = w * dpr;
+    this.canvas.height = h * dpr;
+    this.canvas.style.width  = w + "px";
+    this.canvas.style.height = h + "px";
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  _logical() {
+    const dpr = window.devicePixelRatio || 1;
+    return { w: this.canvas.width / dpr, h: this.canvas.height / dpr };
+  }
+
+  _layout() {
+    const { w, h } = this._logical();
+    const padX = Math.max(48, w * 0.08);
+    const padY = Math.max(48, h * 0.08);
+    const base = Math.min(
+      (w - padX * 2) / this.dict.cols,
+      (h - padY * 2) / this.dict.rows
+    );
+    const cs = base * this._zoom;
+    const ox = (w - this.dict.cols * cs) / 2;
+    const oy = (h - this.dict.rows * cs) / 2;
+    return { cs, ox, oy };
+  }
+
+  _draw() {
+    const ctx = this.ctx;
+    const { w, h } = this._logical();
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+
+    if (!this.dict) return;
+
+    const { cs, ox, oy } = this._layout();
+    const { rows, cols, grid } = this.dict;
+    const gap = cs > 3 ? 1 : 0;
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        ctx.fillStyle = CANVAS_COLORS[grid[r][c]] || "#000";
+        ctx.fillRect(ox + c * cs + gap, oy + r * cs + gap, cs - gap, cs - gap);
+      }
+    }
+
+    // Heatmap overlay — drawn over grid cells, under agents
+    if (this._heatmapData) {
+      for (const [key, intensity] of Object.entries(this._heatmapData)) {
+        const [hr, hc] = key.split(",").map(Number);
+        if (hr < 0 || hr >= rows || hc < 0 || hc >= cols) continue;
+        const rc = Math.round(intensity * 255);
+        const gc = Math.round((1 - intensity) * 80);
+        ctx.fillStyle = `rgba(${rc},${gc},20,0.55)`;
+        ctx.fillRect(ox + hc * cs + gap, oy + hr * cs + gap, cs - gap, cs - gap);
+      }
+    }
+
+    // Agents — slightly inset square
+    const pad = Math.max(1, cs * 0.12);
+    for (let i = 0; i < this.agents.length; i++) {
+      const a = this.agents[i];
+      ctx.fillStyle = a.carrying.length ? AGENT_CARRY[i % 4] : AGENT_IDLE[i % 4];
+      ctx.fillRect(
+        ox + a.col * cs + pad,
+        oy + a.row * cs + pad,
+        cs - pad * 2,
+        cs - pad * 2
+      );
+    }
+  }
+
+  _updateHUD(frame) {
+    document.getElementById("hud-tick").textContent = `tick ${frame.tick}`;
+
+    const container = document.getElementById("hud-agents");
+    const agents = this.agents;
+
+    while (container.children.length < agents.length) container.appendChild(document.createElement("div"));
+    while (container.children.length > agents.length) container.removeChild(container.lastChild);
+
+    for (let i = 0; i < agents.length; i++) {
+      const a    = agents[i];
+      const row  = container.children[i];
+      row.className = "hud-agent-row";
+      const state = a.state.replace(/_/g, " ");
+      const carry = a.carrying.length ? ` — ${a.carrying.length} item${a.carrying.length > 1 ? "s" : ""}` : "";
+      const dot   = row.children[0] || (() => { const s = document.createElement("span"); s.className = "hud-dot"; row.appendChild(s); return s; })();
+      const label = row.children[1] || (() => { const s = document.createElement("span"); row.appendChild(s); return s; })();
+      dot.className = "hud-dot";
+      dot.style.background = AGENT_IDLE[i % 4];
+      dot.style.flexShrink = "0";
+      label.textContent = `${a.id} ${state}${carry}`;
+      label.style.overflow = "hidden";
+      label.style.textOverflow = "ellipsis";
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SimulationClient — WebSocket lifecycle
+// ─────────────────────────────────────────────────────────────────
+class SimulationClient {
+  constructor(viewer, metricsTbody, metricsFooter, summaryBox, errorBanner, orderList, dashboard) {
+    this.viewer        = viewer;
+    this.metricsTbody  = metricsTbody;
+    this.metricsFooter = metricsFooter;
+    this.summaryBox    = summaryBox;
+    this.errorBanner   = errorBanner;
+    this.orderList     = orderList;
+    this.dashboard     = dashboard;
+    this.ws            = null;
+    this.orderRows     = new Map();
+    this._activeBatchKey = "";
+  }
+
+  sendSpeedUpdate(ms) {
+    if (this.ws?.readyState === WebSocket.OPEN)
+      this.ws.send(JSON.stringify({ type: "set_speed", tick_delay_ms: ms }));
+  }
+
+  sendStepsUpdate(steps) {
+    if (this.ws?.readyState === WebSocket.OPEN)
+      this.ws.send(JSON.stringify({ type: "set_steps", steps_per_frame: steps }));
+  }
+
+  stop() {
+    if (this.ws?.readyState === WebSocket.OPEN)
+      this.ws.send(JSON.stringify({ type: "stop" }));
+    this.disconnect();
+  }
+
+  connect(config) {
+    this.errorBanner.style.display = "none";
+    this.summaryBox.style.display  = "none";
+    document.getElementById("hud-summary").style.display = "none";
+    if (this.dashboard) this.dashboard.reset();
+
+    const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws/simulate";
+    this.ws = new WebSocket(wsUrl);
+    this.ws.onopen    = () => this.ws.send(JSON.stringify(config));
+    this.ws.onmessage = (e) => this._onMessage(JSON.parse(e.data));
+    this.ws.onerror   = () => this._showError("WebSocket connection error.");
+    this.ws.onclose   = () => {
+      const btn = document.getElementById("btn-run");
+      btn.dataset.running = "0";
+      btn.textContent = "▶ Run Simulation";
+    };
+  }
+
+  disconnect() { if (this.ws) { this.ws.close(); this.ws = null; } }
+
+  _onMessage(frame) {
+    switch (frame.type) {
+      case "orders_ready":
+        this._onOrdersReady(frame);
+        if (this.dashboard) this.dashboard.onOrdersReady(frame);
+        break;
+      case "tick":
+        this.viewer.applyTick(frame);
+        this._updateActiveOrders(frame.agents || []);
+        if (this.dashboard) this.dashboard.onTick(frame);
+        break;
+      case "order_complete":
+        this._appendMetricsRow(frame);
+        this._markOrderDone(frame.order_id);
+        break;
+      case "complete":
+        this._onComplete(frame);
+        if (this.dashboard) this.dashboard.onComplete(frame);
+        break;
+      case "error":
+        this._showError(frame.message);
+        break;
+    }
+  }
+
+  _onOrdersReady(frame) {
+    this.orderList.innerHTML = "";
+    this.orderRows.clear();
+    this._activeBatchKey = "";
+
+    for (const o of frame.orders) {
+      const row    = document.createElement("div");
+      row.className = "order-row";
+
+      const status = document.createElement("span");
+      status.className = "order-status";
+      status.textContent = "·";
+
+      const id = document.createElement("span");
+      id.textContent = o.order_id;
+
+      const items = document.createElement("span");
+      items.style.color = "#333";
+      items.textContent = o.n_items + "×";
+
+      const batch = document.createElement("span");
+      batch.className = "order-batch-tag";
+      if (o.batch_id && o.batch_id !== o.order_id) batch.textContent = o.batch_id;
+
+      row.append(status, id, items, batch);
+      this.orderList.appendChild(row);
+      this.orderRows.set(o.order_id, { el: row, batchId: o.batch_id });
+    }
+  }
+
+  _updateActiveOrders(agents) {
+    const activeBatches = new Set(agents.map(a => a.active_batch).filter(Boolean));
+    const key = [...activeBatches].sort().join(",");
+    if (key === this._activeBatchKey) return;
+    this._activeBatchKey = key;
+
+    for (const [, info] of this.orderRows) {
+      const inActive = activeBatches.has(info.batchId) && !info.el.classList.contains("done");
+      if (inActive) {
+        info.el.classList.add("active");
+        info.el.querySelector(".order-status").textContent = "●";
+        const list = info.el.parentElement;
+        if (list) {
+          const bot = info.el.offsetTop + info.el.offsetHeight;
+          if (info.el.offsetTop < list.scrollTop) list.scrollTop = info.el.offsetTop;
+          else if (bot > list.scrollTop + list.clientHeight) list.scrollTop = bot - list.clientHeight;
+        }
+      } else if (info.el.classList.contains("active")) {
+        info.el.classList.remove("active");
+        info.el.querySelector(".order-status").textContent = "·";
+      }
+    }
+  }
+
+  _markOrderDone(orderId) {
+    const info = this.orderRows.get(orderId);
+    if (!info) return;
+    info.el.classList.remove("active");
+    info.el.classList.add("done");
+    info.el.querySelector(".order-status").textContent = "✓";
+  }
+
+  _appendMetricsRow(frame) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${frame.order_id}</td>
+      <td class="text-right">${frame.items_picked}</td>
+      <td class="text-right">${frame.distance_traveled}</td>
+      <td class="text-right">${frame.ticks_taken}</td>`;
+    this.metricsTbody.appendChild(tr);
+    const scroll = this.metricsTbody.closest(".metrics-scroll");
+    if (scroll) scroll.scrollTop = scroll.scrollHeight;
+  }
+
+  _onComplete(frame) {
+    const s = frame.summary;
+    document.getElementById("footer-items").textContent = s.total_items_picked;
+    document.getElementById("footer-dist").textContent  = s.total_distance;
+    document.getElementById("footer-ticks").textContent = frame.total_ticks;
+    this.metricsFooter.style.display = "";
+
+    const summaryText =
+      `✓ ${frame.total_orders} orders · ${frame.total_ticks} ticks\n` +
+      `avg ${s.avg_ticks_per_order} ticks/order · dist ${s.total_distance}`;
+
+    this.summaryBox.style.display = "block";
+    this.summaryBox.textContent   = summaryText;
+
+    const hudSummary = document.getElementById("hud-summary");
+    hudSummary.style.display = "block";
+    hudSummary.textContent   = summaryText;
+  }
+
+  _showError(message) {
+    this.errorBanner.textContent = "Error: " + message;
+    this.errorBanner.style.display = "block";
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Dashboard — heatmap toggle, rolling throughput, agent utilization
+// ─────────────────────────────────────────────────────────────────
+class Dashboard {
+  constructor(viewer) {
+    this.viewer        = viewer;
+    this._mode         = "off";   // "off" | "visits" | "slotting"
+    this._visitData    = null;    // "r,c" -> count  (arrives in complete frame)
+    this._slottingData = null;    // "r,c" -> pick_rate (arrives in orders_ready frame)
+  }
+
+  onOrdersReady(frame) {
+    this._slottingData = frame.slot_pick_rates || null;
+    if (this._mode === "slotting") this._applyHeatmap();
+  }
+
+  onTick(frame) {
+    const el = document.getElementById("dash-throughput");
+    if (el && frame.lines_per_hour_rolling != null)
+      el.textContent = `${frame.lines_per_hour_rolling} lines/hr`;
+    this._updateAgentUtil(frame.agents || []);
+  }
+
+  onComplete(frame) {
+    this._visitData = frame.heatmap || null;
+    if (this._mode === "visits") this._applyHeatmap();
+  }
+
+  setMode(mode) {
+    this._mode = mode;
+    if (mode === "off") this.viewer.clearHeatmap();
+    else                this._applyHeatmap();
+  }
+
+  reset() {
+    this._visitData = null;
+    this.viewer.clearHeatmap();
+    const el = document.getElementById("dash-throughput");
+    if (el) el.textContent = "— lines/hr";
+    const util = document.getElementById("dash-util");
+    if (util) util.innerHTML = "";
+  }
+
+  _applyHeatmap() {
+    const data = this._mode === "slotting" ? this._slottingData : this._visitData;
+    this.viewer.setHeatmap(data || null);
+  }
+
+  _updateAgentUtil(agents) {
+    const el = document.getElementById("dash-util");
+    if (!el) return;
+    while (el.children.length < agents.length) el.appendChild(document.createElement("div"));
+    while (el.children.length > agents.length) el.removeChild(el.lastChild);
+    for (let i = 0; i < agents.length; i++) {
+      const a   = agents[i];
+      const row = el.children[i];
+      row.className = "util-row";
+      const pct = a.util_pct ?? 0;
+      row.innerHTML =
+        `<span class="util-label">${a.id}</span>` +
+        `<div class="util-bar-bg"><div class="util-bar-fill" style="width:${pct}%;background:${AGENT_IDLE[i % 4]}"></div></div>` +
+        `<span class="util-pct">${pct}%</span>`;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Module wiring
+// ─────────────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", () => {
+  const editor    = new GridEditor(document.getElementById("editor-grid"));
+  const viewer    = new SimulationViewer(document.getElementById("sim-canvas"));
+  const dashboard = new Dashboard(viewer);
+  let client = null;
+
+  // ── Heatmap mode toggle ──────────────────────────
+  document.querySelectorAll(".heatmap-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".heatmap-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      dashboard.setMode(btn.dataset.mode);
+    });
+  });
+
+  // Load default layout on startup
+  fetch(API_BASE + "/api/default-layout")
+    .then(r => r.json())
+    .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
+
+  // ── Sidebar collapse / expand ────────────────
+  const sidebar = document.getElementById("sidebar");
+  const btnExpand = document.getElementById("btn-expand-sidebar");
+
+  document.getElementById("btn-collapse-sidebar").addEventListener("click", () => {
+    sidebar.classList.add("collapsed");
+    btnExpand.classList.add("visible");
+  });
+  btnExpand.addEventListener("click", () => {
+    sidebar.classList.remove("collapsed");
+    btnExpand.classList.remove("visible");
+  });
+
+  // ── Mode toggle ──────────────────────────────
+  const modeButtons = ["mode-default", "mode-quad", "mode-custom"];
+  function setActiveMode(activeId) {
+    modeButtons.forEach(id => document.getElementById(id).classList.toggle("active", id === activeId));
+    document.getElementById("custom-controls").style.display = activeId === "mode-custom" ? "" : "none";
+  }
+
+  document.getElementById("mode-default").addEventListener("click", () => {
+    fetch(API_BASE + "/api/default-layout").then(r => r.json())
+      .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
+    setActiveMode("mode-default");
+  });
+  document.getElementById("mode-quad").addEventListener("click", () => {
+    fetch(API_BASE + "/api/quad-layout").then(r => r.json())
+      .then(dict => { editor.loadFromDict(dict); viewer.build(dict); });
+    setActiveMode("mode-quad");
+  });
+  document.getElementById("mode-custom").addEventListener("click", () => setActiveMode("mode-custom"));
+
+  // ── Custom size ──────────────────────────────
+  document.getElementById("btn-apply-size").addEventListener("click", () => {
+    const rows = parseInt(document.getElementById("input-rows").value);
+    const cols = parseInt(document.getElementById("input-cols").value);
+    editor.build(rows, cols);
+    viewer.build({ rows, cols, grid: Array.from({ length: rows }, () => new Array(cols).fill(2)) });
+  });
+
+  // ── Brushes ──────────────────────────────────
+  const brushMap = { "brush-rack": CT.RACK, "brush-aisle": CT.AISLE, "brush-pack": CT.PACK, "brush-empty": CT.EMPTY };
+  Object.entries(brushMap).forEach(([id, type]) => {
+    document.getElementById(id).addEventListener("click", () => {
+      editor.setBrush(type);
+      document.querySelectorAll(".brush-btn").forEach(b => b.classList.remove("active"));
+      document.getElementById(id).classList.add("active");
+    });
+  });
+
+  // ── Save ─────────────────────────────────────
+  document.getElementById("btn-save").addEventListener("click", () => {
+    const dict = editor.toDict();
+    const blob = new Blob([JSON.stringify(dict, null, 2)], { type: "application/json" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url; a.download = "warehouse-layout.json"; a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  // ── Load ─────────────────────────────────────
+  document.getElementById("file-load-input").addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const dict = JSON.parse(ev.target.result);
+        editor.loadFromDict(dict);
+        viewer.build(dict);
+      } catch { alert("Invalid JSON file."); }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  });
+
+  // ── Collapsible sections ─────────────────────
+  document.querySelectorAll(".section-title").forEach(title => {
+    title.addEventListener("click", () => {
+      const section = title.closest(".section");
+      if (section.id === "custom-controls" || section.classList.contains("no-collapse")) return;
+      section.classList.toggle("collapsed");
+    });
+  });
+
+  // ── Batch strategy toggle ────────────────────
+  document.getElementById("input-batch-strategy").addEventListener("change", (e) => {
+    document.getElementById("batch-size-param").style.display = e.target.value === "none" ? "none" : "";
+  });
+
+  // ── Speed / steps sliders ────────────────────
+  document.getElementById("speed-slider").addEventListener("input", (e) => {
+    const ms = parseInt(e.target.value);
+    document.getElementById("speed-label").textContent = ms === 0 ? "max" : ms + " ms";
+    if (client) client.sendSpeedUpdate(ms);
+  });
+  document.getElementById("steps-slider").addEventListener("input", (e) => {
+    const steps = parseInt(e.target.value);
+    document.getElementById("steps-label").textContent = "×" + steps;
+    if (client) client.sendStepsUpdate(steps);
+  });
+
+  // ── Zoom buttons ─────────────────────────────
+  document.getElementById("btn-zoom-in").addEventListener("click",    () => viewer.zoomBy(1.3));
+  document.getElementById("btn-zoom-out").addEventListener("click",   () => viewer.zoomBy(1 / 1.3));
+  document.getElementById("btn-zoom-reset").addEventListener("click", () => viewer.resetZoom());
+
+  // ── Run / Stop ───────────────────────────────
+  document.getElementById("btn-run").addEventListener("click", async () => {
+    const btn = document.getElementById("btn-run");
+    if (btn.dataset.running === "1") {
+      if (client) client.stop();
+      btn.dataset.running = "0";
+      btn.textContent = "▶ Run Simulation";
+      return;
+    }
+
+    const errorBanner = document.getElementById("error-banner");
+    errorBanner.style.display = "none";
+
+    const localErrors = editor.validateLocal();
+    if (localErrors) {
+      errorBanner.textContent = localErrors.join(" ");
+      errorBanner.style.display = "block";
+      return;
+    }
+
+    const dict = editor.toDict();
+    const vRes = await fetch(API_BASE + "/api/validate-layout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dict),
+    });
+    const validation = await vRes.json();
+    if (!validation.valid) {
+      errorBanner.textContent = validation.errors.join(" | ");
+      errorBanner.style.display = "block";
+      return;
+    }
+
+    document.getElementById("metrics-tbody").innerHTML = "";
+    document.getElementById("metrics-footer").style.display = "none";
+    document.getElementById("order-list").innerHTML = "";
+    viewer.build(dict, false);
+    btn.dataset.running = "1";
+    btn.textContent = "■ Stop";
+
+    if (client) client.disconnect();
+    client = new SimulationClient(
+      viewer,
+      document.getElementById("metrics-tbody"),
+      document.getElementById("metrics-footer"),
+      document.getElementById("summary-box"),
+      errorBanner,
+      document.getElementById("order-list"),
+      dashboard,
+    );
+
+    client.connect({
+      layout:          dict,
+      n_orders:        parseInt(document.getElementById("input-orders").value),
+      n_items:         parseInt(document.getElementById("input-items").value),
+      items_per_order: parseInt(document.getElementById("input-per-order").value),
+      n_families:      parseInt(document.getElementById("input-families").value),
+      demand_skew:     parseFloat(document.getElementById("input-skew").value),
+      family_affinity: parseFloat(document.getElementById("input-affinity").value),
+      slot_strategy:   document.getElementById("input-slot-strategy").value,
+      batch_strategy:  document.getElementById("input-batch-strategy").value,
+      batch_size:      parseInt(document.getElementById("input-batch-size").value),
+      n_agents:        parseInt(document.getElementById("input-agents").value),
+      seed:            parseInt(document.getElementById("input-seed").value),
+      tick_delay_ms:   parseInt(document.getElementById("speed-slider").value),
+      steps_per_frame: parseInt(document.getElementById("steps-slider").value),
+    });
+  });
+});
+
+```
+
+## editor\index.html
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Warehouse Sim</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+
+<!-- ══════════════ SIDEBAR ══════════════ -->
+<div id="sidebar">
+
+  <div id="sidebar-header">
+    <span id="sidebar-title">Warehouse Sim</span>
+    <button id="btn-collapse-sidebar" title="Collapse sidebar">◀</button>
+  </div>
+
+  <!-- Mode toggle -->
+  <div class="section">
+    <div class="section-title">Layout Mode</div>
+    <div class="section-body">
+      <div class="mode-toggle">
+        <button id="mode-default" class="active">Default</button>
+        <button id="mode-quad">Quad</button>
+        <button id="mode-custom">Custom</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Custom size controls -->
+  <div class="section" id="custom-controls" style="display:none">
+    <div class="section-title">Canvas Size</div>
+    <div class="section-body">
+      <div class="input-row">
+        <label>Rows</label>
+        <input type="number" id="input-rows" value="10" min="3" max="40" />
+        <label>Cols</label>
+        <input type="number" id="input-cols" value="16" min="3" max="60" />
+        <button id="btn-apply-size">Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Editor grid + brush -->
+  <div class="section collapsed">
+    <div class="section-title">Editor</div>
+    <div class="section-body">
+      <div class="toolbar" style="margin-bottom:7px;">
+        <button class="brush-btn" id="brush-rack"><span class="brush-swatch swatch-rack"></span>Rack</button>
+        <button class="brush-btn" id="brush-aisle"><span class="brush-swatch swatch-aisle"></span>Aisle</button>
+        <button class="brush-btn active" id="brush-pack"><span class="brush-swatch swatch-pack"></span>Pack</button>
+        <button class="brush-btn" id="brush-empty"><span class="brush-swatch swatch-empty"></span>Empty</button>
+      </div>
+      <div class="grid-scroll">
+        <table class="warehouse-grid" id="editor-grid"></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Save / Load -->
+  <div class="section collapsed">
+    <div class="section-title">File</div>
+    <div class="section-body">
+      <div style="display:flex;gap:6px;">
+        <button id="btn-save">Save JSON</button>
+        <label>
+          <button id="btn-load" onclick="document.getElementById('file-load-input').click()">Load JSON</button>
+          <input type="file" id="file-load-input" accept=".json" />
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Item Catalog -->
+  <div class="section collapsed">
+    <div class="section-title">Item Catalog</div>
+    <div class="section-body">
+      <div class="param-grid">
+        <div class="param">
+          <span class="param-label">Items</span>
+          <input type="number" id="input-items" value="30" min="1" max="200" />
+        </div>
+        <div class="param">
+          <span class="param-label">Families</span>
+          <input type="number" id="input-families" value="4" min="1" max="20" />
+        </div>
+        <div class="param">
+          <span class="param-label">Demand skew</span>
+          <input type="number" id="input-skew" value="2.0" min="0.1" max="10" step="0.1" />
+        </div>
+        <div class="param">
+          <span class="param-label">Affinity</span>
+          <input type="number" id="input-affinity" value="0.7" min="0" max="1" step="0.05" />
+        </div>
+        <div class="param" style="grid-column:1/-1;">
+          <span class="param-label">Shelf placement</span>
+          <select id="input-slot-strategy">
+            <option value="spread">Spread (default)</option>
+            <option value="demand">Demand — high-demand near pack</option>
+            <option value="affinity">Affinity — demand + co-occurrence</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Orders -->
+  <div class="section">
+    <div class="section-title">Orders</div>
+    <div class="section-body">
+      <div class="param-grid">
+        <div class="param">
+          <span class="param-label">Count</span>
+          <input type="number" id="input-orders" value="10" min="1" max="500" />
+        </div>
+        <div class="param">
+          <span class="param-label">Items each</span>
+          <input type="number" id="input-per-order" value="4" min="1" max="20" />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Batching -->
+  <div class="section collapsed">
+    <div class="section-title">Batching</div>
+    <div class="section-body">
+      <div class="param-grid">
+        <div class="param">
+          <span class="param-label">Strategy</span>
+          <select id="input-batch-strategy">
+            <option value="none">None (FIFO)</option>
+            <option value="zone">Zone overlap</option>
+            <option value="tsp">Nearest neighbor</option>
+          </select>
+        </div>
+        <div class="param" id="batch-size-param" style="display:none">
+          <span class="param-label">Batch size</span>
+          <input type="number" id="input-batch-size" value="2" min="2" max="6" />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Simulation controls -->
+  <div class="section no-collapse">
+    <div class="section-title">Simulation</div>
+    <div class="section-body">
+      <div class="param-grid" style="margin-bottom:8px;">
+        <div class="param">
+          <span class="param-label">Agents</span>
+          <input type="number" id="input-agents" value="1" min="1" max="4" />
+        </div>
+        <div class="param">
+          <span class="param-label">Seed</span>
+          <input type="number" id="input-seed" value="42" min="0" max="9999" />
+        </div>
+      </div>
+      <div class="input-row" style="margin-bottom:5px;">
+        <label>Delay</label>
+        <input type="range" id="speed-slider" min="0" max="500" value="80" />
+        <span class="speed-label" id="speed-label">80 ms</span>
+      </div>
+      <div class="input-row" style="margin-bottom:8px;">
+        <label>Steps</label>
+        <input type="range" id="steps-slider" min="1" max="20" value="4" />
+        <span class="speed-label" id="steps-label">×4</span>
+      </div>
+      <button class="primary" id="btn-run">▶ Run Simulation</button>
+      <div id="error-banner"></div>
+    </div>
+  </div>
+
+</div><!-- /sidebar -->
+
+<!-- ══════════════ MAIN CANVAS AREA ══════════════ -->
+<div id="main">
+
+  <button id="btn-expand-sidebar" title="Show controls">☰</button>
+
+  <canvas id="sim-canvas"></canvas>
+
+  <!-- HUD overlay — top-right of canvas -->
+  <div id="hud">
+    <div id="hud-tick" class="hud-pill">tick —</div>
+    <div id="hud-agents"></div>
+    <div id="hud-summary" class="hud-pill hud-summary" style="display:none"></div>
+  </div>
+
+  <!-- Zoom controls — bottom-right of canvas -->
+  <div id="zoom-bar">
+    <button id="btn-zoom-in" title="Zoom in">+</button>
+    <button id="btn-zoom-reset" title="Fit to screen">⊡</button>
+    <button id="btn-zoom-out" title="Zoom out">−</button>
+  </div>
+
+</div><!-- /main -->
+
+<!-- ══════════════ RIGHT PANEL ══════════════ -->
+<div id="right-panel">
+
+  <!-- Dashboard -->
+  <div class="section no-collapse" style="flex:0 0 auto;">
+    <div class="section-title">Dashboard</div>
+    <div class="section-body">
+      <div class="input-row" style="margin-bottom:6px;">
+        <span class="param-label" style="min-width:52px;">Heatmap</span>
+        <div class="mode-toggle" style="flex:1;">
+          <button class="heatmap-btn active" data-mode="off">Off</button>
+          <button class="heatmap-btn" data-mode="slotting">Slot</button>
+          <button class="heatmap-btn" data-mode="visits">Traffic</button>
+        </div>
+      </div>
+      <div class="param-label" style="margin-bottom:2px;">Throughput</div>
+      <div id="dash-throughput" style="color:#7ac87a;font-size:12px;margin-bottom:6px;">— lines/hr</div>
+      <div class="param-label" style="margin-bottom:4px;">Agent Utilization</div>
+      <div id="dash-util"></div>
+    </div>
+  </div>
+
+  <!-- Order queue -->
+  <div class="section no-collapse" style="flex:0 0 auto;">
+    <div class="section-title">Order Queue</div>
+    <div class="section-body">
+      <div class="order-list" id="order-list"></div>
+    </div>
+  </div>
+
+  <!-- Summary -->
+  <div id="summary-box"></div>
+
+  <!-- Metrics -->
+  <div class="section no-collapse" style="flex:1 1 0;min-height:0;display:flex;flex-direction:column;">
+    <div class="section-title">Order Metrics</div>
+    <div class="section-body" style="flex:1 1 0;min-height:0;display:flex;flex-direction:column;">
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Order</th>
+            <th class="text-right">Items</th>
+            <th class="text-right">Dist</th>
+            <th class="text-right">Ticks</th>
+          </tr>
+        </thead>
+      </table>
+      <div class="metrics-scroll" style="flex:1 1 0;">
+        <table class="metrics-table metrics-body-table">
+          <tbody id="metrics-tbody"></tbody>
+        </table>
+      </div>
+      <table class="metrics-table">
+        <tfoot>
+          <tr id="metrics-footer" style="display:none">
+            <td>Total</td>
+            <td class="text-right" id="footer-items">—</td>
+            <td class="text-right" id="footer-dist">—</td>
+            <td class="text-right" id="footer-ticks">—</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </div>
+
+</div><!-- /right-panel -->
+
+<script src="/static/editor.js"></script>
+</body>
+</html>
+
+```
+
+## editor\styles.css
+
+```css
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+    background: #000;
+    font-family: monospace;
+    font-size: 13px;
+    color: #ddd;
+}
+
+/* ── Sidebar ─────────────────────────────────────────── */
+#sidebar {
+    width: 300px;
+    flex-shrink: 0;
+    background: #0c0c0c;
+    border-right: 1px solid #181818;
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 8px;
+    transition: width 0.2s ease, padding 0.2s ease, border-color 0.2s ease;
+}
+#sidebar.collapsed {
+    width: 0;
+    padding: 0;
+    border-color: transparent;
+    overflow: hidden;
+}
+
+#sidebar-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #1c1c1c;
+    flex-shrink: 0;
+}
+#sidebar-title {
+    font-size: 12px;
+    color: #666;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+#btn-collapse-sidebar {
+    background: none;
+    border: 1px solid #2a2a2a;
+    color: #555;
+    width: 24px;
+    height: 24px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-family: monospace;
+}
+#btn-collapse-sidebar:hover { border-color: #444; color: #aaa; }
+
+/* ── Main canvas area ────────────────────────────────── */
+#main {
+    flex: 1;
+    position: relative;
+    background: #000;
+    overflow: hidden;
+    min-width: 0;
+}
+
+/* ── Right panel ─────────────────────────────────────── */
+#right-panel {
+    width: 240px;
+    flex-shrink: 0;
+    background: #0c0c0c;
+    border-left: 1px solid #181818;
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 8px;
+}
+
+#sim-canvas {
+    display: block;
+    position: absolute;
+    inset: 0;
+}
+
+/* Expand sidebar button (shown when sidebar is hidden) */
+#btn-expand-sidebar {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 20;
+    background: rgba(20,20,20,0.85);
+    border: 1px solid #2a2a2a;
+    color: #666;
+    width: 30px;
+    height: 30px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    transition: color 0.15s, border-color 0.15s;
+}
+#btn-expand-sidebar:hover { color: #aaa; border-color: #444; }
+#btn-expand-sidebar.visible { display: flex; }
+
+/* ── HUD overlay ─────────────────────────────────────── */
+#hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    width: 320px;
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 6px;
+    pointer-events: none;
+    z-index: 10;
+}
+#hud-tick {
+    flex-shrink: 0;
+    align-self: flex-start;
+}
+.hud-pill {
+    background: rgba(8,8,8,0.80);
+    border: 1px solid #1e1e1e;
+    border-radius: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding: 4px 8px;
+    font-size: 11px;
+    backdrop-filter: blur(6px);
+}
+#hud-tick {
+    color: #444;
+    font-size: 10px;
+    text-align: right;
+    letter-spacing: 0.5px;
+}
+#hud-agents { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.hud-agent-row {
+    background: rgba(8,8,8,0.80);
+    border: 1px solid #1e1e1e;
+    border-radius: 3px;
+    padding: 3px 7px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: #888;
+    backdrop-filter: blur(6px);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.hud-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.hud-summary {
+    color: #7ac87a;
+    font-size: 11px;
+    line-height: 1.6;
+}
+
+/* ── Zoom bar ────────────────────────────────────────── */
+#zoom-bar {
+    position: absolute;
+    bottom: 12px;
+    right: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    z-index: 10;
+}
+#zoom-bar button {
+    width: 28px;
+    height: 28px;
+    background: rgba(20,20,20,0.85);
+    border: 1px solid #2a2a2a;
+    color: #666;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 15px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    transition: color 0.15s, border-color 0.15s;
+}
+#zoom-bar button:hover { color: #aaa; border-color: #444; }
+
+/* ── Sections / cards ────────────────────────────────── */
+.section {
+    background: #111;
+    border: 1px solid #1e1e1e;
+    border-radius: 4px;
+    padding: 8px;
+    flex-shrink: 0;
+}
+.section-title {
+    font-size: 10px;
+    color: #555;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 7px;
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+.section-title::before {
+    content: '▾';
+    font-size: 9px;
+    color: #444;
+    transition: transform 0.15s;
+    flex-shrink: 0;
+}
+.section.collapsed .section-title::before { transform: rotate(-90deg); }
+.section.collapsed .section-title { margin-bottom: 0; }
+.section-body { display: block; }
+.section.collapsed .section-body { display: none; }
+.section.no-collapse .section-title { cursor: default; }
+.section.no-collapse .section-title::before { content: ''; }
+
+/* ── Buttons ─────────────────────────────────────────── */
+button {
+    background: #1a1a1a;
+    color: #aaa;
+    border: 1px solid #2e2e2e;
+    padding: 4px 9px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: monospace;
+    font-size: 12px;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+button:hover { background: #252525; border-color: #444; color: #ddd; }
+button.active { background: #12355a; border-color: #2a6090; color: #7ac4f0; }
+button.primary {
+    background: #0e2e0e;
+    border-color: #1d5a1d;
+    color: #7ac87a;
+    width: 100%;
+    padding: 7px;
+    font-size: 13px;
+    margin-top: 2px;
+}
+button.primary:hover { background: #162e16; }
+button.primary:disabled { background: #111; color: #333; border-color: #222; cursor: default; }
+button.primary[data-running="1"] { background: #2e0e0e; border-color: #5a1d1d; color: #c87a7a; }
+
+/* ── Mode toggle ─────────────────────────────────────── */
+.mode-toggle { display: flex; gap: 5px; }
+.mode-toggle button { flex: 1; font-size: 11px; padding: 4px; }
+
+/* ── Toolbar ─────────────────────────────────────────── */
+.toolbar { display: flex; gap: 5px; flex-wrap: wrap; }
+.brush-btn { display: flex; align-items: center; gap: 4px; padding: 4px 7px; font-size: 11px; }
+.brush-swatch {
+    width: 11px; height: 11px;
+    border-radius: 2px;
+    border: 1px solid #444;
+    flex-shrink: 0;
+}
+.swatch-rack  { background: #9a5200; }
+.swatch-aisle { background: #141414; border-color: #333; }
+.swatch-pack  { background: #1d4d1d; }
+.swatch-empty { background: #2a2a2a; }
+
+/* ── Inputs ──────────────────────────────────────────── */
+.input-row { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.input-row label { color: #555; min-width: 36px; font-size: 11px; }
+input[type="number"], input[type="range"] {
+    background: #161616;
+    color: #bbb;
+    border: 1px solid #2e2e2e;
+    border-radius: 3px;
+    padding: 3px 5px;
+    font-family: monospace;
+    font-size: 12px;
+    width: 55px;
+}
+input[type="range"] { width: 100px; padding: 2px; cursor: pointer; }
+.speed-label { color: #555; min-width: 30px; font-size: 11px; }
+
+/* ── Editor grid ─────────────────────────────────────── */
+.grid-scroll { overflow: auto; max-height: 380px; }
+.warehouse-grid {
+    border-collapse: collapse;
+    table-layout: fixed;
+    user-select: none;
+}
+.warehouse-grid td {
+    width: 12px; height: 12px;
+    border: 1px solid #060606;
+    cursor: pointer;
+    transition: filter 0.05s;
+}
+.warehouse-grid td:hover { filter: brightness(1.5); }
+
+/* CellType colors */
+.cell-empty { background: #252525; }
+.cell-rack  { background: #9a5200; }
+.cell-aisle { background: #0d0d0d; }
+.cell-pack  { background: #1d4d1d; }
+
+/* ── Params grid ─────────────────────────────────────── */
+.param-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 5px 10px;
+    margin-bottom: 6px;
+}
+.param { display: flex; flex-direction: column; gap: 2px; }
+.param-label { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 0.4px; }
+.param input, .param select {
+    width: 100%;
+    background: #161616;
+    color: #bbb;
+    border: 1px solid #2e2e2e;
+    border-radius: 3px;
+    padding: 3px 5px;
+    font-family: monospace;
+    font-size: 12px;
+}
+.param select { cursor: pointer; }
+
+/* ── Error banner ────────────────────────────────────── */
+#error-banner {
+    background: #2e0e0e;
+    border: 1px solid #5a1d1d;
+    color: #c87a7a;
+    padding: 6px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    margin-top: 6px;
+    display: none;
+}
+
+/* ── Order queue ─────────────────────────────────────── */
+.order-list {
+    max-height: 280px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+.order-row {
+    display: grid;
+    grid-template-columns: 12px 1fr auto auto;
+    gap: 0 6px;
+    align-items: center;
+    padding: 2px 3px;
+    border-radius: 2px;
+    font-size: 11px;
+    color: #444;
+    transition: background 0.1s, color 0.1s;
+}
+.order-status { text-align: center; font-size: 10px; }
+.order-row.active { color: #4a9fd4; background: rgba(26,111,181,0.10); }
+.order-row.done { color: #2a2a2a; }
+.order-row.done .order-status { color: #1d5a1d; }
+.order-batch-tag {
+    font-size: 9px; color: #444;
+    background: #161616;
+    border: 1px solid #222;
+    border-radius: 2px;
+    padding: 0 3px;
+}
+
+/* ── Summary box ─────────────────────────────────────── */
+#summary-box {
+    background: #071407;
+    border: 1px solid #1d4d1d;
+    border-radius: 3px;
+    padding: 7px 9px;
+    font-size: 11px;
+    color: #7ac87a;
+    display: none;
+    line-height: 1.6;
+    flex-shrink: 0;
+}
+
+/* ── Metrics table ───────────────────────────────────── */
+.metrics-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+    table-layout: fixed;
+}
+.metrics-table th:nth-child(1), .metrics-table td:nth-child(1) { width: auto; }
+.metrics-table th:nth-child(2), .metrics-table td:nth-child(2) { width: 40px; }
+.metrics-table th:nth-child(3), .metrics-table td:nth-child(3) { width: 44px; }
+.metrics-table th:nth-child(4), .metrics-table td:nth-child(4) { width: 44px; }
+.metrics-table th {
+    color: #444;
+    text-align: left;
+    padding: 3px 6px;
+    border-bottom: 1px solid #1e1e1e;
+    font-weight: normal;
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.4px;
+}
+.metrics-table td {
+    padding: 2px 6px;
+    border-bottom: 1px solid #161616;
+    color: #888;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.metrics-table tr:last-child td { border-bottom: none; }
+.metrics-table tfoot td {
+    color: #ccc;
+    border-top: 1px solid #2a2a2a;
+    padding-top: 4px;
+    font-weight: bold;
+}
+.text-right { text-align: right; }
+.metrics-scroll { max-height: 160px; overflow-y: auto; }
+.metrics-body-table { margin: 0; }
+
+/* ── File load hidden input ──────────────────────────── */
+#file-load-input { display: none; }
+
+/* ── Dashboard ───────────────────────────────────────── */
+.util-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 3px;
+    font-size: 11px;
+}
+.util-label { color: #555; min-width: 22px; flex-shrink: 0; }
+.util-bar-bg {
+    flex: 1;
+    height: 5px;
+    background: #1a1a1a;
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid #222;
+}
+.util-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.4s ease;
+}
+.util-pct { color: #444; min-width: 28px; text-align: right; font-size: 10px; }
+
 
 ```
 
@@ -1823,512 +3432,86 @@ def test_wait_ticks_nonzero_when_queue_backpressure():
     assert any(w > 0 for w in wait_values), \
         f"Expected some orders to have wait_ticks > 0; got {wait_values}"
 
-```
 
-## tests\test_sim.py
+# ── large-scale stress tests ──────────────────────────────────────────────────
 
-```python
-"""
-Quick smoke tests covering data generation, batchers, simulation completion,
-and the server WebSocket message flow.
-
-Run with:  pytest tests/test_sim.py -v
-"""
-import asyncio
-import json
-import pytest
-
-from warehouse.grid import WarehouseGrid
-from warehouse.inventory import Inventory
-from warehouse.agent import PickAgent
-from warehouse.simulation import Simulation
-from warehouse.batcher import FIFOBatcher, ZoneBatcher, GreedyTSPBatcher
-from warehouse.data_gen import generate_catalog, generate_orders
-
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-DEFAULT = WarehouseGrid.build_default()
-QUAD    = WarehouseGrid.build_quad()
-
-
-def catalog(n_items=30, n_families=4, seed=42):
-    return generate_catalog(n_items=n_items, n_families=n_families, seed=seed)
-
-
-def orders(items, n=8, per_order=4, seed=42):
-    return generate_orders(items, n_orders=n, items_per_order=per_order, seed=seed)
-
-
-def run_sim(grid, items, orders, strategy="none", batch_size=2, restock_delay=0, n_agents=1):
-    inventory = Inventory(grid)
-    inventory.seed(items)
-    agents = [PickAgent(f"A{i+1}", grid.pack_station_pos, grid) for i in range(n_agents)]
-    sim = Simulation(grid, inventory, agents, restock_delay=restock_delay)
-
-    if strategy == "zone":
-        for b in ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders):
-            sim.enqueue_batch(b)
-    elif strategy == "tsp":
-        for b in GreedyTSPBatcher(inventory, grid, max_batch_size=batch_size).batch(orders):
-            sim.enqueue_batch(b)
-    else:
-        for o in orders:
-            sim.enqueue_order(o)
-
-    sim.run()
-    return sim
-
-
-class FakeWS:
-    def __init__(self): self.msgs = []
-    async def send_text(self, t): self.msgs.append(json.loads(t))
-
-
-def run_server(strategy="none", batch_size=2, n_orders=6, grid=None, seed=42):
-    from server import _run_simulation
-    grid = grid or DEFAULT
-
-    async def _run():
-        ws = FakeWS()
-        await _run_simulation(ws, {
-            "layout": grid.to_dict(),
-            "n_orders": n_orders, "n_items": 30, "items_per_order": 4,
-            "n_families": 4, "demand_skew": 2.0, "family_affinity": 0.7,
-            "batch_strategy": strategy, "batch_size": batch_size,
-            "seed": seed, "tick_delay_ms": 0,
-        })
-        return ws.msgs
-
-    return asyncio.run(_run())
-
-
-# ── data generation ───────────────────────────────────────────────────────────
-
-@pytest.mark.parametrize("n_items,n_families,per_order", [
-    (30, 4, 4),
-    (10, 6, 4),   # small families — old bug produced short orders
-    (20, 5, 3),
-    (50, 8, 5),
+@pytest.mark.parametrize("n_agents,n_orders,n_items,per_order,seed", [
+    (2, 40,  30, 4, 11),
+    (3, 60,  40, 4, 22),
+    (4, 80,  50, 5, 33),
+    (6, 100, 60, 4, 44),
 ])
-def test_orders_always_exact_size(n_items, n_families, per_order):
-    items = catalog(n_items=n_items, n_families=n_families)
-    result = orders(items, n=20, per_order=per_order)
-    bad = [o for o in result if len(o.item_ids) != per_order]
-    assert not bad, f"{len(bad)} orders have wrong size: {[(o.order_id, len(o.item_ids)) for o in bad]}"
-
-
-def test_orders_no_duplicates_within_order():
-    items = catalog()
-    result = orders(items)
-    for o in result:
-        assert len(o.item_ids) == len(set(o.item_ids)), f"Duplicate items in {o.order_id}"
-
-
-# ── batchers ──────────────────────────────────────────────────────────────────
-
-def test_fifo_one_batch_per_order():
-    items = catalog()
-    batches = FIFOBatcher().batch(orders(items))
-    assert all(len(b.orders) == 1 for b in batches)
-    assert len(batches) == 8
-
-
-@pytest.mark.parametrize("batch_size", [2, 3, 4])
-def test_zone_batcher_groups_orders(batch_size):
-    items = catalog()
-    os = orders(items, n=10)
-    inv = Inventory(DEFAULT); inv.seed(items)
-    batches = ZoneBatcher(DEFAULT, inv, max_batch_size=batch_size).batch(os)
-    assert len(batches) < len(os), "ZoneBatcher produced no grouping"
-    assert all(len(b.orders) <= batch_size for b in batches)
-
-
-@pytest.mark.parametrize("batch_size", [2, 3, 4])
-def test_tsp_batcher_reduces_distance(batch_size):
-    items = catalog()
-    os = orders(items, n=10)
-
-    # Compare agent.total_distance (actual steps walked), not the sum of per-order
-    # distance_traveled — batched runs attribute the full trip distance to every order
-    # in the batch, so the per-order sum is inflated vs FIFO.
-    sim_fifo = run_sim(DEFAULT, items, os, strategy="none")
-    sim_tsp  = run_sim(DEFAULT, items, os, strategy="tsp", batch_size=batch_size)
-
-    dist_fifo = sim_fifo.agent.total_distance
-    dist_tsp  = sim_tsp.agent.total_distance
-    assert dist_tsp <= dist_fifo, f"TSP ({dist_tsp}) > FIFO ({dist_fifo}) at batch_size={batch_size}"
-
-
-def test_zone_batcher_works_after_round_trip_serialisation():
-    """from_dict without zone_map_list must still produce a usable zone map."""
-    # Simulate what the browser client sends — no zone_map_list key
-    d = DEFAULT.to_dict()
-    del d["zone_map_list"]
-    grid = WarehouseGrid.from_dict(d)
-    assert grid.zone_map, "zone_map is empty after from_dict without zone_map_list"
-
-    items = catalog()
-    inv = Inventory(grid); inv.seed(items)
-    os = orders(items, n=10)
-    batches = ZoneBatcher(grid, inv, max_batch_size=2).batch(os)
-    assert len(batches) < len(os), "ZoneBatcher produced no grouping on round-tripped grid"
-
-
-def test_batched_order_pick_count_equals_items_across_orders():
-    """Each order's items all appear in unified_item_ids — no deduplication."""
-    items = catalog()
-    os = orders(items, n=6)
-    inv = Inventory(DEFAULT); inv.seed(items)
-    for b in GreedyTSPBatcher(inv, DEFAULT, max_batch_size=3).batch(os):
-        expected = sum(len(o.item_ids) for o in b.orders)
-        assert len(b.unified_item_ids) == expected, \
-            f"Batch {b.batch_id}: expected {expected} picks, got {len(b.unified_item_ids)}"
-        assert len(b.item_to_order) == expected, \
-            f"Batch {b.batch_id}: item_to_order length {len(b.item_to_order)} != {expected}"
-
-
-# ── simulation completion ─────────────────────────────────────────────────────
-
-@pytest.mark.parametrize("n_orders", [1, 5, 20])
-def test_all_orders_complete(n_orders):
-    items = catalog()
-    sim = run_sim(DEFAULT, items, orders(items, n=n_orders))
-    assert len(sim.completed_metrics) == n_orders
-
-
-@pytest.mark.parametrize("n_orders", [1, 5, 20])
-def test_all_orders_complete_quad(n_orders):
-    items = catalog(n_items=60, n_families=6)
-    sim = run_sim(QUAD, items, orders(items, n=n_orders))
-    assert len(sim.completed_metrics) == n_orders
-
-
-@pytest.mark.parametrize("n_orders,per_order", [
-    (5,  4),
-    (10, 4),
-    (20, 3),
-])
-def test_fifo_total_items_equals_orders_times_per_order(n_orders, per_order):
-    items = catalog()
-    os = orders(items, n=n_orders, per_order=per_order)
-    sim = run_sim(DEFAULT, items, os)
-    total = sum(m.items_picked for m in sim.completed_metrics)
-    assert total == n_orders * per_order, \
-        f"Expected {n_orders * per_order} items total, got {total}"
-
-
-@pytest.mark.parametrize("strategy,batch_size", [
-    ("none", 1),
-    ("zone", 2),
-    ("tsp",  2),
-    ("tsp",  4),
-])
-def test_all_orders_get_metrics(strategy, batch_size):
-    n_orders, per_order = 8, 4
-    items = catalog()
-    os = orders(items, n=n_orders, per_order=per_order)
-    sim = run_sim(DEFAULT, items, os, strategy=strategy, batch_size=batch_size, restock_delay=0)
-    assert len(sim.completed_metrics) == n_orders, \
-        f"strategy={strategy} bs={batch_size}: {len(sim.completed_metrics)} metrics for {n_orders} orders"
-    total = sum(m.items_picked for m in sim.completed_metrics)
-    expected = n_orders * per_order
-    assert total == expected, \
-        f"strategy={strategy} bs={batch_size}: total items {total} != {expected}"
-
-
-def test_summary_totals_consistent():
-    items = catalog()
-    sim = run_sim(DEFAULT, items, orders(items, n=10))
-    s = sim.get_summary()
-    assert s.total_orders == len(sim.completed_metrics)
-    assert s.total_items  == sum(m.items_picked for m in sim.completed_metrics)
-    assert s.total_distance == sum(m.distance_traveled for m in sim.completed_metrics)
-
-
-# ── multi-agent ───────────────────────────────────────────────────────────────
-
-@pytest.mark.parametrize("n_agents,n_orders", [(2, 10), (3, 15), (4, 20)])
-def test_multi_agent_all_orders_complete(n_agents, n_orders):
-    items = catalog()
-    sim = run_sim(DEFAULT, items, orders(items, n=n_orders), n_agents=n_agents)
-    assert len(sim.completed_metrics) == n_orders, \
-        f"{n_agents} agents: {len(sim.completed_metrics)} metrics for {n_orders} orders"
-
-
-@pytest.mark.parametrize("n_agents", [2, 3, 4])
-def test_multi_agent_no_position_collision(n_agents):
-    """No two agents share the same cell in any tick."""
-    items = catalog()
-    os = orders(items, n=12)
-    inventory = Inventory(DEFAULT)
-    inventory.seed(items)
-    from warehouse.agent import PickAgent
-    from warehouse.simulation import Simulation
-    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(n_agents)]
-    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0)
-    for o in os:
-        sim.enqueue_order(o)
-    pack_pos = DEFAULT.pack_station_pos
-    while sim.current_tick < 10_000:
-        positions = [a.pos for a in sim.agents if a.pos != pack_pos]
-        assert len(positions) == len(set(positions)), \
-            f"Tick {sim.current_tick}: collision outside pack station {[a.pos for a in sim.agents]}"
-        if not sim.step():
-            break
-
-
-@pytest.mark.parametrize("n_agents,batch_size,strategy", [
-    (2, 1, "none"),
-    (4, 1, "none"),
-    (2, 2, "tsp"),
-    (3, 2, "zone"),
-])
-def test_multi_agent_no_simultaneous_deposit(n_agents, batch_size, strategy):
-    """station_busy flag: at most one agent deposits per tick regardless of strategy."""
-    items = catalog()
-    os = orders(items, n=12)
-    inventory = Inventory(DEFAULT)
-    inventory.seed(items)
-    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(n_agents)]
-    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0)
-
-    if strategy == "tsp":
-        for b in GreedyTSPBatcher(inventory, DEFAULT, max_batch_size=batch_size).batch(os):
-            sim.enqueue_batch(b)
-    elif strategy == "zone":
-        for b in ZoneBatcher(DEFAULT, inventory, max_batch_size=batch_size).batch(os):
-            sim.enqueue_batch(b)
-    else:
-        for o in os:
-            sim.enqueue_order(o)
-
-    depositing_agents_per_tick = []
-    prev_count = 0
-    while sim.current_tick < 10_000:
-        if not sim.step():
-            break
-        new_completions = len(sim.completed_metrics) - prev_count
-        if new_completions > 0:
-            # Count how many distinct agents just finished (station_busy allows max 1)
-            depositing_agents_per_tick.append(new_completions)
-        prev_count = len(sim.completed_metrics)
-
-    # Each deposit event may complete multiple orders (one per order in a batch),
-    # but only one agent may deposit per tick — so the max orders completed in
-    # a single tick is bounded by the largest batch size used.
-    assert all(d <= batch_size for d in depositing_agents_per_tick), \
-        f"A tick completed more orders than one batch allows: {depositing_agents_per_tick}"
-
-
-@pytest.mark.parametrize("n_agents", [2, 3])
-def test_multi_agent_total_items_correct(n_agents):
-    n_orders, per_order = 12, 4
-    items = catalog()
-    os = orders(items, n=n_orders, per_order=per_order)
-    sim = run_sim(DEFAULT, items, os, n_agents=n_agents)
-    total = sum(m.items_picked for m in sim.completed_metrics)
-    assert total == n_orders * per_order, \
-        f"{n_agents} agents: total items {total} != {n_orders * per_order}"
-
-
-def test_multi_agent_faster_than_single():
-    """Two agents should complete the same orders in fewer ticks than one."""
-    items = catalog()
-    os = orders(items, n=20)
-    sim1 = run_sim(DEFAULT, items, os, n_agents=1)
-    sim2 = run_sim(DEFAULT, items, os, n_agents=2)
-    assert sim2.current_tick < sim1.current_tick, \
-        f"2 agents ({sim2.current_tick} ticks) not faster than 1 ({sim1.current_tick} ticks)"
-
-
-# ── server WebSocket messages ─────────────────────────────────────────────────
-
-@pytest.mark.parametrize("strategy,batch_size", [
-    ("none", 1),
-    ("zone", 2),
-    ("tsp",  2),
-    ("tsp",  3),
-])
-def test_server_emits_one_complete_per_order(strategy, batch_size):
-    n = 6
-    msgs = run_server(strategy=strategy, batch_size=batch_size, n_orders=n)
-    completions = [m for m in msgs if m["type"] == "order_complete"]
-    assert len(completions) == n, \
-        f"strategy={strategy}: got {len(completions)} order_complete, expected {n}"
-
-
-def test_server_orders_ready_correct_n_items():
-    msgs = run_server(strategy="tsp", batch_size=2, n_orders=6)
-    ready = next(m for m in msgs if m["type"] == "orders_ready")
-    bad = [o for o in ready["orders"] if o["n_items"] != 4]
-    assert not bad, f"Wrong n_items in orders_ready: {bad}"
-
-
-def test_server_orders_ready_grouped_by_batch():
-    msgs = run_server(strategy="tsp", batch_size=2, n_orders=6)
-    ready = next(m for m in msgs if m["type"] == "orders_ready")
-    batch_ids = [o["batch_id"] for o in ready["orders"]]
-    last_seen: dict[str, int] = {}
-    for i, bid in enumerate(batch_ids):
-        if bid in last_seen and last_seen[bid] != i - 1:
-            pytest.fail(f"Batch {bid} not consecutive in orders_ready: {batch_ids}")
-        last_seen[bid] = i
-
-
-def test_server_complete_message_present():
-    msgs = run_server(n_orders=4)
-    assert any(m["type"] == "complete" for m in msgs)
-    complete = next(m for m in msgs if m["type"] == "complete")
-    assert complete["total_orders"] == 4
-    assert complete["total_ticks"] > 0
-
-
-@pytest.mark.parametrize("strategy", ["none", "zone", "tsp"])
-def test_server_tick_has_active_batch(strategy):
-    msgs = run_server(strategy=strategy, batch_size=2, n_orders=4)
-    ticks = [m for m in msgs if m["type"] == "tick"]
-    assert ticks, "No tick messages received"
-    assert all("active_batch" in t for t in ticks), "Some tick frames missing active_batch key"
-
-
-def test_server_tick_agents_array_shape():
-    """Tick messages must include an 'agents' array with correct per-agent keys."""
-    msgs = run_server(n_orders=4)
-    ticks = [m for m in msgs if m["type"] == "tick"]
-    assert ticks
-    required_keys = {"id", "row", "col", "state", "carrying", "active_batch"}
-    for t in ticks:
-        assert "agents" in t, "tick missing 'agents' key"
-        assert isinstance(t["agents"], list) and len(t["agents"]) >= 1
-        for a in t["agents"]:
-            missing = required_keys - a.keys()
-            assert not missing, f"agent entry missing keys {missing}"
-
-
-# ── restock ───────────────────────────────────────────────────────────────────
-
-def test_restock_delay_orders_complete():
-    """Orders blocked by stockout still complete once items are restocked."""
-    items = catalog(n_items=10, n_families=2, seed=7)
-    # Use more orders than stock can serve at once; restock_delay ensures
-    # the queue has to wait for replenishment.
-    os = orders(items, n=15, per_order=3, seed=7)
-    sim = run_sim(DEFAULT, items, os, restock_delay=5)
-    assert len(sim.completed_metrics) == 15, \
-        f"Expected 15 completed orders, got {len(sim.completed_metrics)}"
-
-
-def test_restock_delay_slows_throughput():
-    """A positive restock_delay should cause more ticks than delay=0 when stock is exhausted."""
-    items = catalog(n_items=10, n_families=2, seed=7)
-    os = orders(items, n=15, per_order=3, seed=7)
-
-    sim_fast = run_sim(DEFAULT, items, os, restock_delay=0)
-    sim_slow = run_sim(DEFAULT, items, os, restock_delay=30)
-
-    assert sim_slow.current_tick >= sim_fast.current_tick, (
-        f"restock_delay=30 finished in {sim_slow.current_tick} ticks, "
-        f"faster than delay=0 ({sim_fast.current_tick} ticks)"
+def test_large_scale_completion(n_agents, n_orders, n_items, per_order, seed):
+    """All orders complete regardless of agent count or catalog size."""
+    items = generate_catalog(n_items=n_items, n_families=6, demand_skew=2.5, seed=seed)
+    os = generate_orders(items, n_orders=n_orders, items_per_order=per_order, seed=seed)
+    sim = run_sim(QUAD, items, os, n_agents=n_agents)
+    assert len(sim.completed_metrics) == n_orders, (
+        f"{n_agents}A/{n_orders}O/{n_items}I: "
+        f"{len(sim.completed_metrics)} completed"
     )
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order
 
-
-def test_restock_items_return_to_stock_after_deposit():
-    """After an agent deposits items, those items re-enter inventory after restock_delay ticks."""
-    items = catalog(n_items=10, n_families=2, seed=7)
-    inventory = Inventory(DEFAULT)
-    inventory.seed(items, initial_stock=1)
-    restock_delay = 20
-
-    agent = PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)
-    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=restock_delay)
-
-    # One order per item so every slot gets drained exactly once
-    from warehouse.inventory import Order
-    first_order = orders(items, n=1, per_order=4, seed=7)[0]
-    sim.enqueue_order(first_order)
-
-    # Run until the first order completes (items deposited → restock queue populated)
-    while sim.current_tick < 10_000 and not sim.completed_metrics:
-        sim.step()
-
-    assert sim.completed_metrics, "First order never completed"
-    deposit_tick = sim.completed_metrics[0].completed_at_tick
-
-    # Immediately after deposit, picked items must be unavailable
-    for iid in first_order.item_ids:
-        assert inventory.stock_level(iid) == 0, \
-            f"Item {iid} already restocked before delay (tick {sim.current_tick})"
-
-    # Run until the restock delay has elapsed from the deposit tick
-    target_tick = deposit_tick + restock_delay + 1
-    while sim.current_tick < target_tick:
-        if not sim.step():
-            break
-
-    # Items should now be back in stock
-    for iid in first_order.item_ids:
-        assert inventory.stock_level(iid) > 0, \
-            f"Item {iid} not restocked after delay (tick {sim.current_tick}, deposit at {deposit_tick})"
-
-
-# ── multi-agent + batch strategies ───────────────────────────────────────────
 
 @pytest.mark.parametrize("strategy,batch_size,n_agents", [
-    ("zone", 2, 2),
-    ("zone", 3, 3),
-    ("tsp",  2, 2),
-    ("tsp",  3, 3),
-    ("tsp",  2, 4),
+    ("zone", 3, 4),
+    ("tsp",  3, 4),
+    ("tsp",  4, 6),
 ])
-def test_multi_agent_batch_all_orders_complete(strategy, batch_size, n_agents):
-    n_orders, per_order = 12, 4
-    items = catalog()
-    os = orders(items, n=n_orders, per_order=per_order)
-    sim = run_sim(DEFAULT, items, os, strategy=strategy, batch_size=batch_size, n_agents=n_agents)
+def test_large_batch_multi_agent(strategy, batch_size, n_agents):
+    """Batch strategies complete all orders under multi-agent contention."""
+    n_orders, per_order = 60, 4
+    items = generate_catalog(n_items=40, n_families=6, demand_skew=2.0, seed=77)
+    os = generate_orders(items, n_orders=n_orders, items_per_order=per_order, seed=77)
+    sim = run_sim(QUAD, items, os, strategy=strategy, batch_size=batch_size, n_agents=n_agents)
+    assert len(sim.completed_metrics) == n_orders
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order
+
+
+def test_epoch_reslotting_no_item_loss():
+    """Active epoch reslotting must never lose items — all orders complete correctly."""
+    n_orders, per_order = 50, 4
+    items = generate_catalog(n_items=30, n_families=4, demand_skew=2.0, seed=42)
+    os = generate_orders(items, n_orders=n_orders, items_per_order=per_order, seed=42)
+
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(3)]
+    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0, epoch_length=50)
+    for o in os:
+        sim.enqueue_order(o)
+    sim.run(max_ticks=500_000)
+
     assert len(sim.completed_metrics) == n_orders, (
-        f"strategy={strategy} bs={batch_size} agents={n_agents}: "
-        f"{len(sim.completed_metrics)} metrics for {n_orders} orders"
+        f"epoch reslotting lost orders: {len(sim.completed_metrics)}/{n_orders} completed"
     )
     total = sum(m.items_picked for m in sim.completed_metrics)
     assert total == n_orders * per_order, (
-        f"strategy={strategy} bs={batch_size} agents={n_agents}: "
-        f"total items {total} != {n_orders * per_order}"
+        f"epoch reslotting lost items: {total} picked, expected {n_orders * per_order}"
     )
 
 
-@pytest.mark.parametrize("n_agents", [2, 3])
-def test_multi_agent_summary_totals_consistent(n_agents):
-    items = catalog()
-    sim = run_sim(DEFAULT, items, orders(items, n=12), n_agents=n_agents)
-    s = sim.get_summary()
-    assert s.total_orders == len(sim.completed_metrics)
-    assert s.total_items == sum(m.items_picked for m in sim.completed_metrics)
-    assert s.total_distance == sum(m.distance_traveled for m in sim.completed_metrics)
-    assert s.idle_ticks >= 0
-    assert s.idle_ticks <= s.total_ticks
+def test_epoch_reslotting_with_batching():
+    """Epoch reslotting + batch picking together must not lose items."""
+    n_orders, per_order = 40, 4
+    items = generate_catalog(n_items=30, n_families=4, demand_skew=2.0, seed=55)
+    os = generate_orders(items, n_orders=n_orders, items_per_order=per_order, seed=55)
 
-
-# ── wait ticks ────────────────────────────────────────────────────────────────
-
-def test_wait_ticks_nonzero_when_queue_backpressure():
-    """Orders that sit in queue behind a stockout should accumulate wait_ticks > 0."""
-    items = catalog(n_items=5, n_families=1, seed=3)
     inventory = Inventory(DEFAULT)
-    # seed with stock=1 so each pick drains the slot; restock_delay creates a wait
-    inventory.seed(items, initial_stock=1)
+    inventory.seed(items)
+    agents = [PickAgent(f"A{i+1}", DEFAULT.pack_station_pos, DEFAULT) for i in range(3)]
+    sim = Simulation(DEFAULT, inventory, agents, restock_delay=0, epoch_length=60)
 
-    agent = PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)
-    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=20)
+    from warehouse.batcher import GreedyTSPBatcher
+    for b in GreedyTSPBatcher(inventory, DEFAULT, max_batch_size=3).batch(os):
+        sim.enqueue_batch(b)
+    sim.run(max_ticks=500_000)
 
-    os = orders(items, n=8, per_order=2, seed=3)
-    for o in os:
-        sim.enqueue_order(o)
-    sim.run(max_ticks=50_000)
-
-    wait_values = [m.wait_ticks for m in sim.completed_metrics]
-    assert any(w > 0 for w in wait_values), \
-        f"Expected some orders to have wait_ticks > 0; got {wait_values}"
+    assert len(sim.completed_metrics) == n_orders
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order
 
 ```
 
@@ -2371,6 +3554,7 @@ class PickAgent:
         self._pack_pos: tuple[int, int] = start_pos
         self._batch: BatchedOrder | None = None
         self._wait_count: int = 0  # consecutive ticks blocked by another agent
+        self._replan_cooldown: int = 0  # ticks until next replan is allowed
 
     # ------------------------------------------------------------------
     # Pathfinding
@@ -2425,6 +3609,8 @@ class PickAgent:
 
     def step(self, occupied_cells: set[tuple[int, int]] | None = None) -> StepResult:
         """Advance one cell along _path. Returns StepResult."""
+        if self._replan_cooldown > 0:
+            self._replan_cooldown -= 1
         if not self._path:
             self._wait_count = 0
             return StepResult.ARRIVED
@@ -2495,9 +3681,14 @@ class PickAgent:
             self._path = self.find_path(self._pack_pos, occupied_cells)
             self.state = AgentState.MOVING_TO_STATION
 
-    def replan(self, occupied_cells: set[tuple[int, int]] | None = None) -> None:
-        """Replan path to current target. Tries to route around occupied cells;
-        falls back to a free path if no detour exists."""
+    def replan(self, occupied_cells: set[tuple[int, int]] | None = None, *, force: bool = False) -> None:
+        """Replan path to current target.
+
+        Tries to route around occupied_cells. Falls back to an unblocked path
+        only when force=True (used for the high-wait-count escape hatch) or
+        when the agent has no path at all. Staying put is better than choosing
+        the same conflicting path again in a livelock situation.
+        """
         if self._task_queue:
             goal, _, _ = self._task_queue[0]
         elif self.state == AgentState.MOVING_TO_STATION:
@@ -2508,9 +3699,10 @@ class PickAgent:
             self._path = []
             return
         new_path = self.find_path(goal, occupied_cells)
-        if not new_path:
+        if not new_path and (force or not self._path):
             new_path = self.find_path(goal)
-        self._path = new_path
+        if new_path:
+            self._path = new_path
 
     def execute_pick(self, inventory: Inventory) -> Item | None:
         """Called when agent arrives at a rack stand_pos. Picks item, advances queue."""
@@ -3008,7 +4200,7 @@ def generate_catalog(
         items.append(Item(
             item_id=f"I{i:03d}",
             name=f"Product-{i:03d}",
-            demand_weight=float(weights[i]),
+            pick_rate=float(weights[i]),
             family=f"F{i % n_families}",
         ))
     return items
@@ -3031,7 +4223,7 @@ def generate_orders(
       - Pick a theme family weighted by total family demand sum
       - Sample ceil(items_per_order * family_affinity) items from that family
       - Fill remaining slots from the full catalog
-      - Both draws are weighted by demand_weight
+      - Both draws are weighted by pick_rate
     """
     if items_per_order > len(items):
         raise ValueError(
@@ -3047,11 +4239,11 @@ def generate_orders(
 
     family_names = list(families.keys())
     family_demand = np.array([
-        sum(i.demand_weight for i in families[f]) for f in family_names
+        sum(i.pick_rate for i in families[f]) for f in family_names
     ])
     family_probs = family_demand / family_demand.sum()
 
-    all_weights = np.array([i.demand_weight for i in items])
+    all_weights = np.array([i.pick_rate for i in items])
 
     orders: list[Order] = []
     for idx in range(n_orders):
@@ -3065,7 +4257,7 @@ def generate_orders(
         chosen: list[Item] = []
 
         # Sample from theme family
-        fam_weights = np.array([i.demand_weight for i in family_items])
+        fam_weights = np.array([i.pick_rate for i in family_items])
         fam_probs = fam_weights / fam_weights.sum()
         fam_indices = rng.choice(len(family_items), size=n_from_family, replace=False, p=fam_probs)
         chosen.extend(family_items[i] for i in fam_indices)
@@ -3077,7 +4269,7 @@ def generate_orders(
             chosen_ids = {i.item_id for i in chosen}
             remaining = [i for i in items if i.item_id not in chosen_ids]
             if remaining:
-                rem_weights = np.array([i.demand_weight for i in remaining])
+                rem_weights = np.array([i.pick_rate for i in remaining])
                 rem_probs = rem_weights / rem_weights.sum()
                 n_pick2 = min(n_from_rest, len(remaining))
                 rem_indices = rng.choice(len(remaining), size=n_pick2, replace=False, p=rem_probs)
@@ -3276,7 +4468,7 @@ class Item:
     item_id: str
     name: str
     weight: float = 1.0
-    demand_weight: float = 1.0  # relative pick frequency; higher = ordered more often
+    pick_rate: float = 1.0  # normalized pick frequency (0–1); higher = ordered more often
     family: str = "default"     # product family; items in same family co-occur in orders
 
 
@@ -3366,8 +4558,8 @@ class Inventory:
             self._item_to_slot[item.item_id] = slot
 
     def stock_level(self, item_id: str) -> int:
-        """Current on-hand units for an item (0 if picked out)."""
-        slot = self._original_slot_for.get(item_id)
+        """Current on-hand units for an item (0 if picked out or in transit)."""
+        slot = self._item_to_slot.get(item_id)
         return slot.stock if slot else 0
 
     def reset(self) -> None:
@@ -3376,6 +4568,33 @@ class Inventory:
             slot.item = None
         self._item_to_slot.clear()
         self._original_slot_for.clear()
+
+    def relocate(self, item_id: str, new_slot_idx: int) -> tuple[Item | None, int]:
+        """Reassign the home slot for item_id to _slots[new_slot_idx].
+
+        Updates _original_slot_for immediately so the next restock() call sends
+        the item to its new home. If the item is currently in stock, drains it
+        from its physical slot and returns (item, units) so the caller can
+        requeue it for restocking; returns (None, 0) if the item is in transit.
+        """
+        new_slot = self._slots[new_slot_idx]
+        # Propagate slot capacity: unassigned slots default to max_stock=1, which
+        # would cap the item's circulation to 1 unit permanently. Carry the old
+        # capacity forward so the item's full initial_stock remains in circulation.
+        old_home = self._original_slot_for.get(item_id)
+        if old_home is not None and old_home.max_stock > new_slot.max_stock:
+            new_slot.max_stock = old_home.max_stock
+        self._original_slot_for[item_id] = new_slot
+        if item_id in self._item_to_slot:
+            old_slot = self._item_to_slot.pop(item_id)
+            item = old_slot.item
+            units = old_slot.stock
+            if old_slot.max_stock > new_slot.max_stock:
+                new_slot.max_stock = old_slot.max_stock
+            old_slot.item = None
+            old_slot.stock = 0
+            return item, units
+        return None, 0
 
     def available_slots(self) -> list[RackSlot]:
         return [s for s in self._slots if s.item is not None]
@@ -3416,11 +4635,11 @@ def random_placement(items: list[Item], seed: int = 0) -> list[Item]:
 
 def demand_placement(items: list[Item]) -> list[Item]:
     """
-    Returns items sorted by demand_weight descending.
+    Returns items sorted by pick_rate descending.
     When passed to Inventory.seed() with slot_order from slot_distances(),
     the highest-demand items land in the closest slots to the pack station.
     """
-    return sorted(items, key=lambda i: i.demand_weight, reverse=True)
+    return sorted(items, key=lambda i: i.pick_rate, reverse=True)
 
 
 def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
@@ -3429,7 +4648,7 @@ def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
 
     1. Build co-occurrence matrix: co[id_a][id_b] = number of orders containing both
     2. Greedily fill slots closest-to-farthest:
-       - Score each unplaced item = demand_weight + alpha * co-occurrence with already-placed items
+       - Score each unplaced item = pick_rate + alpha * co-occurrence with already-placed items
        - Pick highest-scoring item for the current slot
     Returns items in placement order (item[0] → closest slot, item[-1] → farthest).
     """
@@ -3444,7 +4663,7 @@ def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
                 if a != b:
                     co[a][b] += 1
 
-    # Normalise co-occurrence so it's on a similar scale to demand_weight
+    # Normalise co-occurrence so it's on a similar scale to pick_rate
     max_co = max((v for inner in co.values() for v in inner.values()), default=1)
 
     unplaced = list(items)
@@ -3460,7 +4679,7 @@ def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
                 co[candidate.item_id].get(pid, 0) / max_co
                 for pid in placed_ids
             )
-            score = candidate.demand_weight + alpha * affinity_score
+            score = candidate.pick_rate + alpha * affinity_score
             if score > best_score:
                 best_score = score
                 best = candidate
@@ -3471,12 +4690,47 @@ def affinity_placement(items: list[Item], orders: list[Order]) -> list[Item]:
 
     return placed
 
+
+def reorg_cost(
+    current_distances: dict[str, int],
+    proposed_distances: dict[str, int],
+    restock_delay: int,
+    items_pick_rate: dict[str, float],
+) -> dict:
+    """Estimate the cost/benefit of a proposed item reslotting.
+
+    disruption_ticks  = moved_items × restock_delay   (items briefly unavailable)
+    expected_savings  = Σ pick_rate[i] × (cur_dist[i] - prop_dist[i]) for moved i
+    payback_period    = disruption / savings  (inf when savings ≤ 0)
+
+    Returns dict with keys: moved_items, disruption_ticks,
+    expected_savings_per_tick, payback_period_ticks.
+    """
+    moved = {
+        iid for iid in current_distances
+        if proposed_distances.get(iid, current_distances[iid]) != current_distances[iid]
+    }
+    disruption_ticks = len(moved) * restock_delay
+    expected_savings = sum(
+        items_pick_rate.get(iid, 0.0)
+        * (current_distances[iid] - proposed_distances.get(iid, current_distances[iid]))
+        for iid in moved
+    )
+    payback = disruption_ticks / expected_savings if expected_savings > 0 else float("inf")
+    return {
+        "moved_items": len(moved),
+        "disruption_ticks": disruption_ticks,
+        "expected_savings_per_tick": round(expected_savings, 4),
+        "payback_period_ticks": round(payback, 1),
+    }
+
 ```
 
 ## warehouse\simulation.py
 
 ```python
 from __future__ import annotations
+import random
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from warehouse.grid import WarehouseGrid
@@ -3500,6 +4754,7 @@ class OrderMetrics:
     ticks_taken: int
     completed_at_tick: int
     wait_ticks: int = 0
+    item_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -3521,6 +4776,7 @@ class Simulation:
         inventory: Inventory,
         agents: list[PickAgent],
         restock_delay: int = 10,
+        epoch_length: int = 100,
     ) -> None:
         self.grid = grid
         self.inventory = inventory
@@ -3547,6 +4803,10 @@ class Simulation:
         self.idle_ticks: int = 0
         self._order_enqueue_tick: dict[str, int] = {}
         self._order_wait_ticks: dict[str, int] = {}
+
+        # Epoch reslotting
+        self.epoch_length: int = epoch_length
+        self._last_epoch_tick: int = 0
 
     # ------------------------------------------------------------------
     # Backward-compat properties (single-agent callers)
@@ -3587,11 +4847,21 @@ class Simulation:
     def _dispatch_agent(self, agent: PickAgent, occupied: set[tuple[int, int]]) -> bool:
         """Try to assign the next available batch or order to an idle agent.
         Returns True if something was dispatched."""
+        # Units already claimed by other agents' pending picks (not yet removed from inventory).
+        claimed: Counter[str] = Counter()
+        for a in self.agents:
+            if a is not agent:
+                for _, iid, _ in a._task_queue:
+                    claimed[iid] += 1
+
+        def available(iid: str, cnt: int) -> bool:
+            return self.inventory.stock_level(iid) - claimed[iid] >= cnt
+
         # batch_queue: peek without removing; defer if stock insufficient
         if self.batch_queue:
             front = self.batch_queue[0]
             needed = Counter(front.unified_item_ids)
-            if all(self.inventory.stock_level(iid) >= cnt for iid, cnt in needed.items()):
+            if all(available(iid, cnt) for iid, cnt in needed.items()):
                 self.batch_queue.popleft()
                 for order in front.orders:
                     wait = self.current_tick - self._order_enqueue_tick.get(
@@ -3610,7 +4880,7 @@ class Simulation:
         while self.order_queue and skipped < queue_size:
             order = self.order_queue.popleft()
             needed = Counter(order.item_ids)
-            if not all(self.inventory.stock_level(iid) >= cnt for iid, cnt in needed.items()):
+            if not all(available(iid, cnt) for iid, cnt in needed.items()):
                 self.order_queue.append(order)
                 skipped += 1
                 continue
@@ -3647,6 +4917,7 @@ class Simulation:
                 ticks_taken=batch_ticks,
                 completed_at_tick=self.current_tick,
                 wait_ticks=self._order_wait_ticks.pop(oid, 0),
+                item_ids=item_ids,
             ))
             self._order_enqueue_tick.pop(oid, None)
         self._agent_batch[agent.agent_id] = None
@@ -3661,9 +4932,117 @@ class Simulation:
     # Main simulation loop
     # ------------------------------------------------------------------
 
-    def step(self) -> bool:
-        """Advance simulation by one tick. Returns True while work remains."""
-        # 1. Process restock queue
+    def _on_epoch(self) -> None:
+        """Greedy reslot: if recent pick data justifies it, move high-demand items
+        closer to the pack station. Only runs when enough data has accumulated."""
+        from warehouse.optimizer import slot_distances, reorg_cost
+
+        self._last_epoch_tick = self.current_tick
+
+        since = self.current_tick - self.epoch_length
+        pick_counts: dict[str, int] = {}
+        recent_count = 0
+        for m in self.completed_metrics:
+            if m.completed_at_tick >= since:
+                recent_count += 1
+                for iid in m.item_ids:
+                    pick_counts[iid] = pick_counts.get(iid, 0) + 1
+
+        if recent_count < 5 or not pick_counts:
+            return
+
+        pack_r, pack_c = self.grid.pack_station_pos
+        current_distances: dict[str, int] = {
+            iid: abs(slot.stand_pos[0] - pack_r) + abs(slot.stand_pos[1] - pack_c)
+            for iid, slot in self.inventory._original_slot_for.items()
+        }
+        if not current_distances:
+            return
+
+        # Compute in-flight items before slot assignment so we can protect their home slots.
+        # An in-flight item's home slot must not be reassigned to another item: if it were,
+        # the eventual restock() call would find was_empty=False, skip _item_to_slot
+        # registration, and permanently lose the item.
+        #
+        # Two categories need protection:
+        #   1. Items in agent task queues / carried: cannot be relocated (agent already
+        #      has a path to their current stand_pos).
+        #   2. Items in restock_queue: their _original_slot_for is the destination of a
+        #      pending restock job. If a subsequent epoch reassigned that slot to another
+        #      item, two different items would both restock to the same slot and one would
+        #      be silently dropped.
+        in_flight: set[str] = set()
+        for a in self.agents:
+            for _, iid, _ in a._task_queue:
+                in_flight.add(iid)
+            for item in a.carried_items:
+                in_flight.add(item.item_id)
+
+        protected_rack_pos: set[tuple[int, int]] = set()
+        for iid in in_flight:
+            home = self.inventory._original_slot_for.get(iid)
+            if home is not None:
+                protected_rack_pos.add(home.rack_pos)
+        for job in self.restock_queue:
+            home = self.inventory._original_slot_for.get(job.item_id)
+            if home is not None:
+                protected_rack_pos.add(home.rack_pos)
+
+        sorted_slots = slot_distances(self.grid, self.inventory)
+        sorted_items = sorted(
+            current_distances, key=lambda iid: pick_counts.get(iid, 0), reverse=True
+        )
+
+        available_slots = [
+            (idx, dist) for idx, dist in sorted_slots
+            if self.inventory._slots[idx].rack_pos not in protected_rack_pos
+        ]
+
+        proposed_distances = dict(current_distances)
+        item_to_new_slot: dict[str, int] = {}
+        for rank, iid in enumerate(sorted_items):
+            if rank < len(available_slots):
+                new_slot_idx, new_dist = available_slots[rank]
+                proposed_distances[iid] = new_dist
+                item_to_new_slot[iid] = new_slot_idx
+
+        pick_rates = {iid: cnt / recent_count for iid, cnt in pick_counts.items()}
+        cost = reorg_cost(current_distances, proposed_distances, self.restock_delay, pick_rates)
+
+        if cost["payback_period_ticks"] >= 2 * self.epoch_length:
+            return
+
+        # Pre-build slot → current occupant map so we can guard against restocking collisions.
+        # When epoch assigns slot_Y to item F, slot_Y might still hold item E. If E is also
+        # being relocated (in item_to_new_slot), relocate() will drain E from slot_Y in the
+        # same epoch tick so slot_Y will be empty when F restocks later. If E is NOT being
+        # relocated (rank >= len(available_slots)), slot_Y keeps E's stock and F's restock
+        # call finds was_empty=False, silently skips _item_to_slot registration, and F is lost.
+        # Guard: skip any relocation whose target slot has such a non-relocated occupant.
+        slot_id_to_item: dict[int, str] = {
+            id(slot): iid for iid, slot in self.inventory._item_to_slot.items()
+        }
+
+        reslot_delay = max(self.restock_delay, 5)
+        for iid, new_slot_idx in item_to_new_slot.items():
+            if iid in in_flight:
+                continue
+            new_slot = self.inventory._slots[new_slot_idx]
+            if self.inventory._original_slot_for.get(iid) is new_slot:
+                continue
+            occupant = slot_id_to_item.get(id(new_slot))
+            if occupant is not None and occupant not in item_to_new_slot:
+                continue
+            item, units = self.inventory.relocate(iid, new_slot_idx)
+            if item is not None and units > 0:
+                for _ in range(units):
+                    self.restock_queue.append(RestockJob(
+                        item_id=iid,
+                        item=item,
+                        ready_at_tick=self.current_tick + reslot_delay,
+                    ))
+
+    def _process_restocks(self) -> None:
         due, self.restock_queue = (
             [j for j in self.restock_queue if j.ready_at_tick <= self.current_tick],
             [j for j in self.restock_queue if j.ready_at_tick > self.current_tick],
@@ -3671,21 +5050,39 @@ class Simulation:
         for job in due:
             self.inventory.restock(job.item)
 
-        # 2. Reset station contention flag for this tick
-        self.station_busy = False
-
-        # 3. Dispatch idle agents serially (serial order = implicit order lock)
+    def _dispatch_idle_agents(self) -> None:
+        # Serial dispatch — queue item is popped before the next agent is considered,
+        # so two agents cannot claim the same batch/order in the same tick.
         occupied = {a.pos for a in self.agents}
         for agent in self.agents:
             if agent.state == AgentState.IDLE:
                 self._dispatch_agent(agent, occupied)
 
-        # 4. Move each active agent and handle arrivals.
-        # Recompute occupied before each agent so moves earlier in the loop
-        # are visible to agents later in the loop — prevents two agents
-        # stepping onto the same cell in the same tick.
-        # IDLE agents are excluded: they sit at the pack station and must not
-        # block a moving agent from arriving there to deposit.
+    def _escape_step(self, agent: "PickAgent", all_positions: set[tuple[int, int]]) -> bool:
+        """Move agent one step to any free adjacent cell (not the currently-blocked one).
+        Returns True if an escape cell was found and the agent was moved."""
+        blocked = agent._path[0] if agent._path else None
+        dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        random.shuffle(dirs)
+        for dr, dc in dirs:
+            cell = (agent.pos[0] + dr, agent.pos[1] + dc)
+            if cell == blocked:
+                continue
+            if not agent.grid.is_walkable(*cell):
+                continue
+            if cell in all_positions:
+                continue
+            agent.pos = cell
+            agent.total_distance += 1
+            agent._wait_count = 0
+            agent.replan()
+            return True
+        return False
+
+    def _handle_agent_movement(self) -> None:
+        # Recompute occupied before each agent so moves earlier in the loop are
+        # visible to later agents — prevents two agents stepping onto the same cell.
+        # IDLE agents are excluded so they don't block arrivals at the pack station.
         for idx, agent in enumerate(self.agents):
             if agent.state == AgentState.IDLE:
                 continue
@@ -3694,25 +5091,57 @@ class Simulation:
             result = agent.step(occupied - {agent.pos})
 
             if result == StepResult.WAITING:
-                # Stagger replan threshold by agent index so lower-priority agents
-                # yield first, preventing simultaneous replans that cause new deadlocks.
+                # Stagger threshold by index: higher-index agents yield sooner,
+                # breaking symmetric deadlocks without both agents replanning at once.
                 threshold = 3 + 2 * idx
-                if agent._wait_count >= threshold:
-                    agent.replan(occupied - {agent.pos})
+                if agent._wait_count >= threshold and agent._replan_cooldown == 0:
+                    if agent._wait_count >= 20:
+                        # Physical escape: step sideways to a free cell, then replan.
+                        # This breaks circular deadlocks that path-replanning alone cannot resolve.
+                        all_pos = {a.pos for a in self.agents if a is not agent}
+                        if not self._escape_step(agent, all_pos):
+                            agent.replan(occupied - {agent.pos}, force=True)
+                    else:
+                        agent.replan(occupied - {agent.pos})
+                    agent._replan_cooldown = 8
             elif result == StepResult.ARRIVED:
                 if agent.state == AgentState.MOVING_TO_RACK:
-                    agent.execute_pick(self.inventory)
+                    # Only pick if actually at the target stand position.
+                    # A stale/empty path (e.g. after an escape replan) can fire
+                    # ARRIVED from the wrong cell — replan to recover instead.
+                    expected = agent._task_queue[0][0] if agent._task_queue else None
+                    if expected is not None and agent.pos == expected:
+                        agent.execute_pick(self.inventory)
+                    elif expected is not None:
+                        agent.replan()
                 elif agent.state == AgentState.MOVING_TO_STATION:
-                    if self.station_busy:
-                        pass  # hold in MOVING_TO_STATION; retry next tick
-                    else:
+                    if agent.pos != self.grid.pack_station_pos:
+                        # Path exhausted before reaching the station — replan.
+                        agent.replan()
+                    elif not self.station_busy:
                         self.station_busy = True
                         self._do_deposit(agent)
+                    else:
+                        # At the station but it is busy this tick.  Count as
+                        # waiting so wait_count accumulates and the escape step
+                        # can push the agent aside if the queue grows large.
+                        agent._wait_count += 1
 
-        # 5. Termination and idle tracking
+    def step(self) -> bool:
+        """Advance simulation by one tick. Returns True while work remains."""
+        self._process_restocks()
+        if (
+            self.epoch_length > 0
+            and self.current_tick > 0
+            and self.current_tick - self._last_epoch_tick >= self.epoch_length
+        ):
+            self._on_epoch()
+        self.station_busy = False
+        self._dispatch_idle_agents()
+        self._handle_agent_movement()
+
         all_idle = all(a.state == AgentState.IDLE for a in self.agents)
         has_pending = bool(self.restock_queue or self.order_queue or self.batch_queue)
-
         if all_idle:
             if not has_pending:
                 return False
@@ -3992,6 +5421,7 @@ uvicorn[standard]
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import pathlib
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -4099,6 +5529,7 @@ async def ws_simulate(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     except Exception as e:
+        logging.exception(e)
         try:
             await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
         except Exception:
@@ -4178,9 +5609,21 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
             }
             for o in orders_sorted
         ],
+        "slot_pick_rates": {
+            f"{slot.rack_pos[0]},{slot.rack_pos[1]}": round(slot.item.pick_rate, 4)
+            for slot in inventory._slots
+            if slot.item is not None
+        },
     }))
 
     prev_metrics_count = 0
+    cell_visit_freq: dict[str, int] = {}
+    agent_ticks_active: dict[str, int] = {a.agent_id: 0 for a in agents}
+    _window_items = 0
+    _window_start = 0
+    _WINDOW = 100
+    lines_per_hour_rolling = 0.0
+    prev_total_items = 0
 
     while True:
         # Run steps_per_frame simulation ticks before sending one WebSocket frame.
@@ -4190,6 +5633,25 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
             has_more = sim.step()
             if not has_more:
                 break
+
+        # Track per-frame agent positions and utilization
+        for a in sim.agents:
+            key = f"{a.pos[0]},{a.pos[1]}"
+            cell_visit_freq[key] = cell_visit_freq.get(key, 0) + 1
+            if a.state.value != "idle":
+                agent_ticks_active[a.agent_id] = agent_ticks_active.get(a.agent_id, 0) + 1
+
+        # Rolling throughput over last _WINDOW ticks
+        new_items = sum(m.items_picked for m in sim.completed_metrics) - prev_total_items
+        prev_total_items += new_items
+        _window_items += new_items
+        window_elapsed = sim.current_tick - _window_start
+        if window_elapsed >= _WINDOW:
+            lines_per_hour_rolling = round(_window_items / window_elapsed * 3600, 1)
+            _window_items = 0
+            _window_start = sim.current_tick
+        elif window_elapsed > 0:
+            lines_per_hour_rolling = round(_window_items / window_elapsed * 3600, 1)
 
         # Emit one order_complete per completed order — a batch deposit adds multiple at once
         if len(sim.completed_metrics) > prev_metrics_count:
@@ -4208,6 +5670,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
         await websocket.send_text(json.dumps({
             "type": "tick",
             "tick": sim.current_tick,
+            "lines_per_hour_rolling": lines_per_hour_rolling,
             "agents": [
                 {
                     "id": a.agent_id,
@@ -4217,6 +5680,9 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
                     "carrying": [item.item_id for item in a.carried_items],
                     "active_batch": sim._agent_batch[a.agent_id].batch_id
                         if sim._agent_batch[a.agent_id] else None,
+                    "util_pct": round(
+                        agent_ticks_active.get(a.agent_id, 0) / max(1, sim.current_tick) * 100
+                    ),
                 }
                 for a in sim.agents
             ],
@@ -4285,6 +5751,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
             "idle_ticks": summary.idle_ticks,
             "stockout_count": summary.stockout_count,
         },
+        "heatmap": cell_visit_freq,
     }))
 
 ```

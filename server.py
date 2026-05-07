@@ -189,9 +189,21 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
             }
             for o in orders_sorted
         ],
+        "slot_pick_rates": {
+            f"{slot.rack_pos[0]},{slot.rack_pos[1]}": round(slot.item.pick_rate, 4)
+            for slot in inventory._slots
+            if slot.item is not None
+        },
     }))
 
     prev_metrics_count = 0
+    cell_visit_freq: dict[str, int] = {}
+    agent_ticks_active: dict[str, int] = {a.agent_id: 0 for a in agents}
+    _window_items = 0
+    _window_start = 0
+    _WINDOW = 100
+    lines_per_hour_rolling = 0.0
+    prev_total_items = 0
 
     while True:
         # Run steps_per_frame simulation ticks before sending one WebSocket frame.
@@ -199,8 +211,27 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
         has_more = True
         for _ in range(steps_per_frame):
             has_more = sim.step()
+            # Track utilization and heatmap inside the inner loop so speed multiplier
+            # doesn't artificially cap the counters.
+            for a in sim.agents:
+                key = f"{a.pos[0]},{a.pos[1]}"
+                cell_visit_freq[key] = cell_visit_freq.get(key, 0) + 1
+                if a.state.value != "idle":
+                    agent_ticks_active[a.agent_id] = agent_ticks_active.get(a.agent_id, 0) + 1
             if not has_more:
                 break
+
+        # Rolling throughput over last _WINDOW ticks
+        new_items = sum(m.items_picked for m in sim.completed_metrics) - prev_total_items
+        prev_total_items += new_items
+        _window_items += new_items
+        window_elapsed = sim.current_tick - _window_start
+        if window_elapsed >= _WINDOW:
+            lines_per_hour_rolling = round(_window_items / window_elapsed * 3600, 1)
+            _window_items = 0
+            _window_start = sim.current_tick
+        elif window_elapsed > 0:
+            lines_per_hour_rolling = round(_window_items / window_elapsed * 3600, 1)
 
         # Emit one order_complete per completed order — a batch deposit adds multiple at once
         if len(sim.completed_metrics) > prev_metrics_count:
@@ -219,6 +250,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
         await websocket.send_text(json.dumps({
             "type": "tick",
             "tick": sim.current_tick,
+            "lines_per_hour_rolling": lines_per_hour_rolling,
             "agents": [
                 {
                     "id": a.agent_id,
@@ -228,6 +260,9 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
                     "carrying": [item.item_id for item in a.carried_items],
                     "active_batch": sim._agent_batch[a.agent_id].batch_id
                         if sim._agent_batch[a.agent_id] else None,
+                    "util_pct": round(
+                        agent_ticks_active.get(a.agent_id, 0) / max(1, sim.current_tick) * 100
+                    ),
                 }
                 for a in sim.agents
             ],
@@ -296,4 +331,5 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
             "idle_ticks": summary.idle_ticks,
             "stockout_count": summary.stockout_count,
         },
+        "heatmap": cell_visit_freq,
     }))
