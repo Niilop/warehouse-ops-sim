@@ -158,43 +158,67 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     else:
         inventory.seed(items)
 
+    order_arrival_rate = float(config.get("order_arrival_rate", 0.0))
+
     n_agents = max(1, int(config.get("n_agents", 1)))
     agents = [PickAgent(agent_id=f"A{i+1}", start_pos=grid.pack_station_pos, grid=grid) for i in range(n_agents)]
-    sim = Simulation(grid=grid, inventory=inventory, agents=agents, restock_delay=0)
 
-    if batch_strategy == "zone":
-        batches = ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders)
-        for batch in batches:
-            sim.enqueue_batch(batch)
-        order_batch = {o.order_id: b.batch_id for b in batches for o in b.orders}
-    elif batch_strategy == "tsp":
-        batches = GreedyTSPBatcher(inventory, grid, max_batch_size=batch_size).batch(orders)
-        for batch in batches:
-            sim.enqueue_batch(batch)
-        order_batch = {o.order_id: b.batch_id for b in batches for o in b.orders}
+    slot_pick_rates = {
+        f"{slot.rack_pos[0]},{slot.rack_pos[1]}": round(slot.item.pick_rate, 4)
+        for slot in inventory._slots
+        if slot.item is not None
+    }
+
+    if order_arrival_rate > 0:
+        # Streaming mode: orders arrive during the run via Poisson process.
+        def _make_order() -> object:
+            return generate_orders(
+                items, n_orders=1, items_per_order=items_per_order,
+                family_affinity=family_affinity, seed=None,
+            )[0]
+
+        sim = Simulation(
+            grid=grid, inventory=inventory, agents=agents, restock_delay=0,
+            order_arrival_rate=order_arrival_rate, order_generator=_make_order,
+        )
+        await websocket.send_text(json.dumps({
+            "type": "orders_ready",
+            "orders": [],
+            "streaming": True,
+            "slot_pick_rates": slot_pick_rates,
+        }))
     else:
-        for order in orders:
-            sim.enqueue_order(order)
-        order_batch = {o.order_id: o.order_id for o in orders}
+        # Batch mode: all orders generated and enqueued upfront.
+        sim = Simulation(grid=grid, inventory=inventory, agents=agents, restock_delay=0)
 
-    # Sort by batch_id so batched orders appear grouped in the UI
-    orders_sorted = sorted(orders, key=lambda o: order_batch[o.order_id])
-    await websocket.send_text(json.dumps({
-        "type": "orders_ready",
-        "orders": [
-            {
-                "order_id": o.order_id,
-                "n_items": len(o.item_ids),
-                "batch_id": order_batch[o.order_id],
-            }
-            for o in orders_sorted
-        ],
-        "slot_pick_rates": {
-            f"{slot.rack_pos[0]},{slot.rack_pos[1]}": round(slot.item.pick_rate, 4)
-            for slot in inventory._slots
-            if slot.item is not None
-        },
-    }))
+        if batch_strategy == "zone":
+            batches = ZoneBatcher(grid, inventory, max_batch_size=batch_size).batch(orders)
+            for batch in batches:
+                sim.enqueue_batch(batch)
+            order_batch = {o.order_id: b.batch_id for b in batches for o in b.orders}
+        elif batch_strategy == "tsp":
+            batches = GreedyTSPBatcher(inventory, grid, max_batch_size=batch_size).batch(orders)
+            for batch in batches:
+                sim.enqueue_batch(batch)
+            order_batch = {o.order_id: b.batch_id for b in batches for o in b.orders}
+        else:
+            for order in orders:
+                sim.enqueue_order(order)
+            order_batch = {o.order_id: o.order_id for o in orders}
+
+        orders_sorted = sorted(orders, key=lambda o: order_batch[o.order_id])
+        await websocket.send_text(json.dumps({
+            "type": "orders_ready",
+            "orders": [
+                {
+                    "order_id": o.order_id,
+                    "n_items": len(o.item_ids),
+                    "batch_id": order_batch[o.order_id],
+                }
+                for o in orders_sorted
+            ],
+            "slot_pick_rates": slot_pick_rates,
+        }))
 
     prev_metrics_count = 0
     cell_visit_freq: dict[str, int] = {}
@@ -276,6 +300,10 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
             "active_order": sim._active_order.order_id if sim._active_order else None,
             "active_batch": sim._active_batch.batch_id if sim._active_batch else None,
         }))
+
+        # In streaming mode step() never self-terminates; stop when n_orders complete.
+        if order_arrival_rate > 0 and len(sim.completed_metrics) >= n_orders:
+            has_more = False
 
         if not has_more:
             break

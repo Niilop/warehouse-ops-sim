@@ -1,13 +1,27 @@
 from __future__ import annotations
 import heapq
+import math
 import random
 from collections import Counter
 from dataclasses import dataclass, field
+from typing import Callable
 from warehouse.grid import WarehouseGrid
 from warehouse.inventory import Inventory, Item, Order
 from warehouse.agent import PickAgent, AgentState, StepResult
 from warehouse.batcher import BatchedOrder
 from warehouse.task import Task, TaskType
+
+
+def _poisson_draw(lam: float, rng: random.Random) -> int:
+    """Exact Poisson draw via Knuth's algorithm. Returns 0 for lam <= 0."""
+    if lam <= 0:
+        return 0
+    L = math.exp(-lam)
+    k, p = 0, 1.0
+    while p > L:
+        k += 1
+        p *= rng.random()
+    return k - 1
 
 
 @dataclass
@@ -48,6 +62,11 @@ class Simulation:
         agents: list[PickAgent],
         restock_delay: int = 10,
         epoch_length: int = 100,
+        order_arrival_rate: float = 0.0,
+        order_generator: Callable[[], Order] | None = None,
+        day_length: int = 480,
+        day_multipliers: list[float] | None = None,
+        arrival_seed: int | None = None,
     ) -> None:
         self.grid = grid
         self.inventory = inventory
@@ -77,6 +96,13 @@ class Simulation:
         # Epoch reslotting
         self.epoch_length: int = epoch_length
         self._last_epoch_tick: int = 0
+
+        # Streaming / Poisson arrivals (order_arrival_rate=0 means batch-upfront mode)
+        self.order_arrival_rate: float = order_arrival_rate
+        self.order_generator: Callable[[], Order] | None = order_generator
+        self.day_length: int = day_length
+        self.day_multipliers: list[float] = day_multipliers or [1.0] * day_length
+        self._arrival_rng: random.Random = random.Random(arrival_seed)
 
     # ------------------------------------------------------------------
     # Backward-compat properties (single-agent callers)
@@ -309,6 +335,13 @@ class Simulation:
                         ready_at_tick=self.current_tick + reslot_delay,
                     ))
 
+    def _process_arrivals(self) -> None:
+        if self.order_arrival_rate <= 0 or self.order_generator is None:
+            return
+        rate = self.order_arrival_rate * self.day_multipliers[self.current_tick % self.day_length]
+        for _ in range(_poisson_draw(rate, self._arrival_rng)):
+            self.enqueue_order(self.order_generator())
+
     def _process_restocks(self) -> None:
         due, self.restock_queue = (
             [j for j in self.restock_queue if j.ready_at_tick <= self.current_tick],
@@ -395,8 +428,11 @@ class Simulation:
                         agent._wait_count += 1
 
     def step(self) -> bool:
-        """Advance simulation by one tick. Returns True while work remains."""
+        """Advance simulation by one tick. Returns True while work remains.
+        In streaming mode (order_arrival_rate > 0) never self-terminates — caller
+        is responsible for capping by tick count or completed order count."""
         self._process_restocks()
+        self._process_arrivals()
         if (
             self.epoch_length > 0
             and self.current_tick > 0
@@ -410,7 +446,7 @@ class Simulation:
         all_idle = all(a.state == AgentState.IDLE for a in self.agents)
         has_pending = bool(self.restock_queue or self.task_queue)
         if all_idle:
-            if not has_pending:
+            if not has_pending and self.order_arrival_rate <= 0:
                 return False
             self.idle_ticks += 1
 

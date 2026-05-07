@@ -228,7 +228,14 @@ class SimulationViewer {
   }
 
   _updateHUD(frame) {
-    document.getElementById("hud-tick").textContent = `tick ${frame.tick}`;
+    const tickEl = document.getElementById("hud-tick");
+    if (this._streaming) {
+      const day     = Math.floor(frame.tick / this._dayLength) + 1;
+      const dayTick = frame.tick % this._dayLength;
+      tickEl.textContent = `Day ${day} · ${dayTick}`;
+    } else {
+      tickEl.textContent = `tick ${frame.tick}`;
+    }
 
     const container = document.getElementById("hud-agents");
     const agents = this.agents;
@@ -269,6 +276,8 @@ class SimulationClient {
     this.ws            = null;
     this.orderRows     = new Map();
     this._activeBatchKey = "";
+    this._streaming    = false;
+    this._dayLength    = 480;
   }
 
   sendSpeedUpdate(ms) {
@@ -288,6 +297,8 @@ class SimulationClient {
   }
 
   connect(config) {
+    this._streaming = false;
+    this._dayLength = config.day_length || 480;
     this.errorBanner.style.display = "none";
     this.summaryBox.style.display  = "none";
     document.getElementById("hud-summary").style.display = "none";
@@ -332,31 +343,41 @@ class SimulationClient {
     }
   }
 
+  _makeOrderRow(orderId, batchId, statusChar = "·", nItems = null) {
+    const row    = document.createElement("div");
+    row.className = "order-row";
+    const status = document.createElement("span");
+    status.className = "order-status";
+    status.textContent = statusChar;
+    const id = document.createElement("span");
+    id.textContent = orderId;
+    const items = document.createElement("span");
+    items.style.color = "#333";
+    items.textContent = nItems != null ? nItems + "×" : "";
+    const batch = document.createElement("span");
+    batch.className = "order-batch-tag";
+    if (batchId && batchId !== orderId) batch.textContent = batchId;
+    row.append(status, id, items, batch);
+    return row;
+  }
+
   _onOrdersReady(frame) {
     this.orderList.innerHTML = "";
     this.orderRows.clear();
     this._activeBatchKey = "";
+    this._streaming = !!frame.streaming;
+
+    if (this._streaming) {
+      const ph = document.createElement("div");
+      ph.id = "order-list-placeholder";
+      ph.style.cssText = "color:#555;font-size:11px;padding:4px 2px;";
+      ph.textContent = "Waiting for orders…";
+      this.orderList.appendChild(ph);
+      return;
+    }
 
     for (const o of frame.orders) {
-      const row    = document.createElement("div");
-      row.className = "order-row";
-
-      const status = document.createElement("span");
-      status.className = "order-status";
-      status.textContent = "·";
-
-      const id = document.createElement("span");
-      id.textContent = o.order_id;
-
-      const items = document.createElement("span");
-      items.style.color = "#333";
-      items.textContent = o.n_items + "×";
-
-      const batch = document.createElement("span");
-      batch.className = "order-batch-tag";
-      if (o.batch_id && o.batch_id !== o.order_id) batch.textContent = o.batch_id;
-
-      row.append(status, id, items, batch);
+      const row = this._makeOrderRow(o.order_id, o.batch_id, "·", o.n_items);
       this.orderList.appendChild(row);
       this.orderRows.set(o.order_id, { el: row, batchId: o.batch_id });
     }
@@ -367,6 +388,20 @@ class SimulationClient {
     const key = [...activeBatches].sort().join(",");
     if (key === this._activeBatchKey) return;
     this._activeBatchKey = key;
+
+    // Streaming: insert a live row the first time a batch appears.
+    if (this._streaming) {
+      const ph = document.getElementById("order-list-placeholder");
+      for (const batchId of activeBatches) {
+        if (!this.orderRows.has(batchId)) {
+          if (ph) ph.remove();
+          const row = this._makeOrderRow(batchId, batchId, "●");
+          row.classList.add("active");
+          this.orderList.appendChild(row);
+          this.orderRows.set(batchId, { el: row, batchId });
+        }
+      }
+    }
 
     for (const [, info] of this.orderRows) {
       const inActive = activeBatches.has(info.batchId) && !info.el.classList.contains("done");
@@ -392,6 +427,16 @@ class SimulationClient {
     info.el.classList.remove("active");
     info.el.classList.add("done");
     info.el.querySelector(".order-status").textContent = "✓";
+    if (this._streaming) this._pruneStreamingRows();
+  }
+
+  _pruneStreamingRows(max = 25) {
+    const done = [...this.orderRows.entries()].filter(([, i]) => i.el.classList.contains("done"));
+    for (let k = 0; k < done.length - max; k++) {
+      const [id, info] = done[k];
+      info.el.remove();
+      this.orderRows.delete(id);
+    }
   }
 
   _appendMetricsRow(frame) {
@@ -678,21 +723,24 @@ document.addEventListener("DOMContentLoaded", () => {
       dashboard,
     );
 
+    const dayLength = 480;
     client.connect({
-      layout:          dict,
-      n_orders:        parseInt(document.getElementById("input-orders").value),
-      n_items:         parseInt(document.getElementById("input-items").value),
-      items_per_order: parseInt(document.getElementById("input-per-order").value),
-      n_families:      parseInt(document.getElementById("input-families").value),
-      demand_skew:     parseFloat(document.getElementById("input-skew").value),
-      family_affinity: parseFloat(document.getElementById("input-affinity").value),
-      slot_strategy:   document.getElementById("input-slot-strategy").value,
-      batch_strategy:  document.getElementById("input-batch-strategy").value,
-      batch_size:      parseInt(document.getElementById("input-batch-size").value),
-      n_agents:        parseInt(document.getElementById("input-agents").value),
-      seed:            parseInt(document.getElementById("input-seed").value),
-      tick_delay_ms:   parseInt(document.getElementById("speed-slider").value),
-      steps_per_frame: parseInt(document.getElementById("steps-slider").value),
+      layout:             dict,
+      n_orders:           parseInt(document.getElementById("input-orders").value),
+      n_items:            parseInt(document.getElementById("input-items").value),
+      items_per_order:    parseInt(document.getElementById("input-per-order").value),
+      n_families:         parseInt(document.getElementById("input-families").value),
+      demand_skew:        parseFloat(document.getElementById("input-skew").value),
+      family_affinity:    parseFloat(document.getElementById("input-affinity").value),
+      slot_strategy:      document.getElementById("input-slot-strategy").value,
+      batch_strategy:     document.getElementById("input-batch-strategy").value,
+      batch_size:         parseInt(document.getElementById("input-batch-size").value),
+      n_agents:           parseInt(document.getElementById("input-agents").value),
+      seed:               parseInt(document.getElementById("input-seed").value),
+      tick_delay_ms:      parseInt(document.getElementById("speed-slider").value),
+      steps_per_frame:    parseInt(document.getElementById("steps-slider").value),
+      order_arrival_rate: parseFloat(document.getElementById("input-arrival-rate").value),
+      day_length:         dayLength,
     });
   });
 });

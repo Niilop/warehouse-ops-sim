@@ -55,7 +55,8 @@ class FakeWS:
     async def send_text(self, t): self.msgs.append(json.loads(t))
 
 
-def run_server(strategy="none", batch_size=2, n_orders=6, grid=None, seed=42):
+def run_server(strategy="none", batch_size=2, n_orders=6, grid=None, seed=42,
+               order_arrival_rate=0.0):
     from server import _run_simulation
     grid = grid or DEFAULT
 
@@ -67,6 +68,7 @@ def run_server(strategy="none", batch_size=2, n_orders=6, grid=None, seed=42):
             "n_families": 4, "demand_skew": 2.0, "family_affinity": 0.7,
             "batch_strategy": strategy, "batch_size": batch_size,
             "seed": seed, "tick_delay_ms": 0,
+            "order_arrival_rate": order_arrival_rate,
         })
         return ws.msgs
 
@@ -376,6 +378,25 @@ def test_server_tick_agents_array_shape():
             assert not missing, f"agent entry missing keys {missing}"
 
 
+# ── server streaming mode ────────────────────────────────────────────────────
+
+def test_server_streaming_orders_ready_is_empty():
+    """In streaming mode orders_ready has orders=[] and streaming=True."""
+    msgs = run_server(n_orders=5, order_arrival_rate=0.1)
+    ready = next(m for m in msgs if m["type"] == "orders_ready")
+    assert ready.get("streaming") is True, "orders_ready missing streaming=True"
+    assert ready["orders"] == [], f"Expected empty orders list, got {ready['orders']}"
+
+
+def test_server_streaming_emits_n_completions():
+    """Streaming mode still emits exactly n_orders order_complete messages."""
+    n = 5
+    msgs = run_server(n_orders=n, order_arrival_rate=0.1)
+    completions = [m for m in msgs if m["type"] == "order_complete"]
+    assert len(completions) == n, \
+        f"streaming: got {len(completions)} order_complete, expected {n}"
+
+
 # ── restock ───────────────────────────────────────────────────────────────────
 
 def test_restock_delay_orders_complete():
@@ -589,6 +610,52 @@ def test_epoch_reslotting_no_item_loss():
     assert total == n_orders * per_order, (
         f"epoch reslotting lost items: {total} picked, expected {n_orders * per_order}"
     )
+
+
+def test_poisson_arrivals_complete_n_orders():
+    """Streaming mode: orders arrive mid-sim and all complete within max_ticks."""
+    items = catalog()
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    agents = [PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)]
+
+    call_count = {"n": 0}
+    generated_orders = orders(items, n=20, seed=99)
+
+    def generator():
+        o = generated_orders[call_count["n"] % len(generated_orders)]
+        call_count["n"] += 1
+        return o
+
+    sim = Simulation(
+        DEFAULT, inventory, agents, restock_delay=0,
+        order_arrival_rate=0.05, order_generator=generator,
+        arrival_seed=7,
+    )
+    sim.run(max_ticks=50_000)
+    assert len(sim.completed_metrics) > 0, "No orders completed in streaming mode"
+    assert call_count["n"] > 0, "order_generator was never called"
+
+
+def test_batch_mode_unaffected_by_arrival_params():
+    """order_arrival_rate=0 keeps exact batch-mode behavior; generator is never called."""
+    items = catalog()
+    sim_batch = run_sim(DEFAULT, items, orders(items, n=10))
+
+    called = {"n": 0}
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    agents = [PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)]
+    sim_stream = Simulation(
+        DEFAULT, inventory, agents, restock_delay=0,
+        order_arrival_rate=0.0, order_generator=lambda: called.__setitem__("n", called["n"] + 1),
+    )
+    for o in orders(items, n=10):
+        sim_stream.enqueue_order(o)
+    sim_stream.run()
+
+    assert called["n"] == 0, "Generator called despite order_arrival_rate=0"
+    assert len(sim_stream.completed_metrics) == len(sim_batch.completed_metrics)
 
 
 def test_epoch_reslotting_with_batching():
