@@ -501,6 +501,36 @@ def test_wait_ticks_nonzero_when_queue_backpressure():
         f"Expected some orders to have wait_ticks > 0; got {wait_values}"
 
 
+# ── task queue ───────────────────────────────────────────────────────────────
+
+def test_task_priority_ordering():
+    """Higher-priority (lower TaskType value) tasks are popped first."""
+    import heapq
+    from warehouse.task import Task, TaskType
+
+    q: list[Task] = []
+    for priority in [TaskType.RESLOT, TaskType.ORDER_PICK, TaskType.REPLENISHMENT_URGENT]:
+        heapq.heappush(q, Task(priority=priority, created_at=0, task_id=str(priority), payload={}))
+
+    popped = [heapq.heappop(q).priority for _ in range(3)]
+    assert popped == [TaskType.REPLENISHMENT_URGENT, TaskType.ORDER_PICK, TaskType.RESLOT]
+
+
+def test_enqueue_order_creates_order_pick_task():
+    """enqueue_order pushes an ORDER_PICK task wrapping the order as a BatchedOrder."""
+    from warehouse.task import TaskType
+    items = catalog()
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items)
+    sim = Simulation(DEFAULT, inventory, [PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)])
+    os = orders(items, n=3)
+    for o in os:
+        sim.enqueue_order(o)
+    assert len(sim.task_queue) == 3
+    assert all(t.priority == TaskType.ORDER_PICK for t in sim.task_queue)
+    assert all(len(t.payload["batch"].orders) == 1 for t in sim.task_queue)
+
+
 # ── large-scale stress tests ──────────────────────────────────────────────────
 
 @pytest.mark.parametrize("n_agents,n_orders,n_items,per_order,seed", [

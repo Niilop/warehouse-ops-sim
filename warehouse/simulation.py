@@ -1,11 +1,13 @@
 from __future__ import annotations
+import heapq
 import random
-from collections import Counter, deque
+from collections import Counter
 from dataclasses import dataclass, field
 from warehouse.grid import WarehouseGrid
 from warehouse.inventory import Inventory, Item, Order
 from warehouse.agent import PickAgent, AgentState, StepResult
 from warehouse.batcher import BatchedOrder
+from warehouse.task import Task, TaskType
 
 
 @dataclass
@@ -50,8 +52,7 @@ class Simulation:
         self.grid = grid
         self.inventory = inventory
         self.agents = agents
-        self.order_queue: deque[Order] = deque()
-        self.batch_queue: deque[BatchedOrder] = deque()
+        self.task_queue: list[Task] = []   # heapq; pop gives highest-priority task
         self.completed_metrics: list[OrderMetrics] = []
         self.current_tick: int = 0
 
@@ -101,22 +102,38 @@ class Simulation:
     # ------------------------------------------------------------------
 
     def enqueue_order(self, order: Order) -> None:
-        self.order_queue.append(order)
         self._order_enqueue_tick[order.order_id] = self.current_tick
+        batch = BatchedOrder(
+            batch_id=order.order_id,
+            orders=[order],
+            unified_item_ids=list(order.item_ids),
+            item_to_order=[order.order_id for _ in order.item_ids],
+        )
+        heapq.heappush(self.task_queue, Task(
+            priority=TaskType.ORDER_PICK,
+            created_at=self.current_tick,
+            task_id=order.order_id,
+            payload={"batch": batch},
+        ))
 
     def enqueue_batch(self, batch: BatchedOrder) -> None:
-        self.batch_queue.append(batch)
         for order in batch.orders:
             self._order_enqueue_tick[order.order_id] = self.current_tick
+        heapq.heappush(self.task_queue, Task(
+            priority=TaskType.ORDER_PICK,
+            created_at=self.current_tick,
+            task_id=batch.batch_id,
+            payload={"batch": batch},
+        ))
 
     # ------------------------------------------------------------------
     # Per-agent dispatch and deposit helpers
     # ------------------------------------------------------------------
 
     def _dispatch_agent(self, agent: PickAgent, occupied: set[tuple[int, int]]) -> bool:
-        """Try to assign the next available batch or order to an idle agent.
+        """Pop the highest-priority available task and assign it to the idle agent.
+        Tasks whose stock is insufficient are deferred back onto the heap.
         Returns True if something was dispatched."""
-        # Units already claimed by other agents' pending picks (not yet removed from inventory).
         claimed: Counter[str] = Counter()
         for a in self.agents:
             if a is not agent:
@@ -126,50 +143,31 @@ class Simulation:
         def available(iid: str, cnt: int) -> bool:
             return self.inventory.stock_level(iid) - claimed[iid] >= cnt
 
-        # batch_queue: peek without removing; defer if stock insufficient
-        if self.batch_queue:
-            front = self.batch_queue[0]
-            needed = Counter(front.unified_item_ids)
-            if all(available(iid, cnt) for iid, cnt in needed.items()):
-                self.batch_queue.popleft()
-                for order in front.orders:
-                    wait = self.current_tick - self._order_enqueue_tick.get(
-                        order.order_id, self.current_tick
-                    )
-                    self._order_wait_ticks[order.order_id] = wait
-                self._agent_batch[agent.agent_id] = front
-                self._agent_start_tick[agent.agent_id] = self.current_tick
-                self._agent_start_dist[agent.agent_id] = agent.total_distance
-                agent.assign_batch(front, self.inventory, self.grid.pack_station_pos, occupied)
-                return True
+        deferred: list[Task] = []
+        dispatched = False
 
-        # order_queue: try each once; defer unavailable ones to the back
-        queue_size = len(self.order_queue)
-        skipped = 0
-        while self.order_queue and skipped < queue_size:
-            order = self.order_queue.popleft()
-            needed = Counter(order.item_ids)
+        while self.task_queue and not dispatched:
+            task = heapq.heappop(self.task_queue)
+            batch: BatchedOrder = task.payload["batch"]
+            needed = Counter(batch.unified_item_ids)
             if not all(available(iid, cnt) for iid, cnt in needed.items()):
-                self.order_queue.append(order)
-                skipped += 1
+                deferred.append(task)
                 continue
-            wait = self.current_tick - self._order_enqueue_tick.get(
-                order.order_id, self.current_tick
-            )
-            self._order_wait_ticks[order.order_id] = wait
-            batch = BatchedOrder(
-                batch_id=order.order_id,
-                orders=[order],
-                unified_item_ids=list(order.item_ids),
-                item_to_order=[order.order_id for _ in order.item_ids],
-            )
+            for order in batch.orders:
+                wait = self.current_tick - self._order_enqueue_tick.get(
+                    order.order_id, self.current_tick
+                )
+                self._order_wait_ticks[order.order_id] = wait
             self._agent_batch[agent.agent_id] = batch
             self._agent_start_tick[agent.agent_id] = self.current_tick
             self._agent_start_dist[agent.agent_id] = agent.total_distance
             agent.assign_batch(batch, self.inventory, self.grid.pack_station_pos, occupied)
-            return True
+            dispatched = True
 
-        return False
+        for task in deferred:
+            heapq.heappush(self.task_queue, task)
+
+        return dispatched
 
     def _do_deposit(self, agent: PickAgent) -> None:
         """Execute deposit for an agent that has arrived at the pack station."""
@@ -410,7 +408,7 @@ class Simulation:
         self._handle_agent_movement()
 
         all_idle = all(a.state == AgentState.IDLE for a in self.agents)
-        has_pending = bool(self.restock_queue or self.order_queue or self.batch_queue)
+        has_pending = bool(self.restock_queue or self.task_queue)
         if all_idle:
             if not has_pending:
                 return False
