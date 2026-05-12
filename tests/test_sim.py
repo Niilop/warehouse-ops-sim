@@ -742,31 +742,35 @@ def test_urgent_restock_bypasses_truck():
 
 def test_waiting_tasks_populated_on_stockout():
     """Tasks for items with aggregate stock == 0 go to _waiting_tasks, not the heap."""
-    items = catalog(n_items=5, n_families=1, seed=3)
+    # 2 items, per_order=2 → every order needs both items. After the first order
+    # deposits them, stock_level==0 for all items, so every subsequent order
+    # must park in _waiting_tasks.
+    items = catalog(n_items=2, n_families=1, seed=3)
     inventory = Inventory(DEFAULT)
     inventory.seed(items, initial_stock=1)
     agent = PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)
-    # restock_delay=0 so items return instantly — but we'll inspect mid-run
-    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=100)
+    # Long restock_delay so depleted items stay at zero for many ticks.
+    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=500)
 
-    os = orders(items, n=6, per_order=2, seed=3)
+    os = orders(items, n=4, per_order=2, seed=3)
     for o in os:
         sim.enqueue_order(o)
 
-    # Run until the first order completes (some items are now depleted)
+    # Run until first order completes, then a few more ticks so the next dispatch fires.
     for _ in range(10_000):
-        if sim.completed_metrics:
-            break
         sim.step()
+        if sim.completed_metrics:
+            # Give dispatch loop a few ticks to attempt Order 2 and detect stockout.
+            for _ in range(5):
+                sim.step()
+            break
 
     assert sim.completed_metrics, "No orders completed — test precondition failed"
-    # After some picks, stocked-out orders should have moved to waiting queue
-    # (not spinning on the heap continuously)
-    # We can verify this indirectly: stockout_count should have incremented OR
-    # waiting tasks exist at some point during the run (hard to catch after run).
-    # Since restock_delay=100, items won't be restocked for a while, so waiting_tasks
-    # should be non-empty right after the first deposit.
-    assert sim.stockout_count >= 0  # field exists
+    # All remaining orders need both items which are stocked out → must be in _waiting_tasks.
+    assert sim.stockout_count > 0, "stockout_count never incremented"
+    assert len(sim._waiting_tasks) > 0, (
+        "No tasks in _waiting_tasks despite all items depleted and restock_delay=500"
+    )
 
 
 def test_waiting_tasks_unblock_after_restock():
@@ -805,6 +809,30 @@ def test_stockout_count_increments():
     sim.run(max_ticks=100_000)
 
     assert sim.stockout_count > 0, "stockout_count never incremented despite low initial stock"
+
+
+def test_dock_restock_unblocks_waiting_tasks():
+    """Physical dock restock (execute_restock path) unblocks waiting tasks and all orders complete."""
+    grid = _grid_with_dock()
+    items = catalog(n_items=10, n_families=2, seed=5)
+    inventory = Inventory(grid)
+    # Low stock so items exhaust quickly and orders land in _waiting_tasks.
+    inventory.seed(items, initial_stock=1)
+    agents = [PickAgent(f"A{i+1}", grid.pack_station_pos, grid) for i in range(2)]
+    sim = Simulation(grid, inventory, agents, restock_delay=0)
+
+    os = orders(items, n=10, per_order=2, seed=5)
+    for o in os:
+        sim.enqueue_order(o)
+    sim.run(max_ticks=200_000)
+
+    assert len(sim.completed_metrics) == 10, (
+        f"Only {len(sim.completed_metrics)}/10 orders completed via dock restock; "
+        f"{len(sim._waiting_tasks)} tasks still waiting"
+    )
+    assert len(sim._waiting_tasks) == 0, (
+        f"{len(sim._waiting_tasks)} tasks stuck in waiting queue after dock restocks"
+    )
 
 
 def test_epoch_reslotting_no_item_loss():

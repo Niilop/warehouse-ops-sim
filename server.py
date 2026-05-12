@@ -134,6 +134,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
     target_dos = max(1, int(config.get("target_dos", 5)))
     reorder_trigger_days = max(1, int(config.get("reorder_trigger_days", 2)))
     target_fill_pct = max(0.1, min(1.0, float(config.get("target_fill_pct", 0.8))))
+    restock_delay = max(0, int(config.get("restock_delay", 0)))
     truck_interval_ticks = max(0, int(config.get("truck_interval_ticks", 0)))
     order_arrival_rate = float(config.get("order_arrival_rate", 0.0))
     orders_per_day: int | None = config.get("orders_per_day", None)
@@ -200,7 +201,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
             )[0]
 
         sim = Simulation(
-            grid=grid, inventory=inventory, agents=agents, restock_delay=0,
+            grid=grid, inventory=inventory, agents=agents, restock_delay=restock_delay,
             order_arrival_rate=order_arrival_rate, order_generator=_make_order,
         )
         sim.truck_interval_ticks = truck_interval_ticks
@@ -292,10 +293,16 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
                 }))
             prev_metrics_count = len(sim.completed_metrics)
 
+        waiting_order_ids = [
+            order.order_id
+            for task in sim._waiting_tasks
+            for order in task.payload["batch"].orders
+        ]
         await websocket.send_text(json.dumps({
             "type": "tick",
             "tick": sim.current_tick,
             "lines_per_hour_rolling": lines_per_hour_rolling,
+            "waiting_order_ids": waiting_order_ids,
             "agents": [
                 {
                     "id": a.agent_id,

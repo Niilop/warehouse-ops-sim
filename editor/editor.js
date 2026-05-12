@@ -328,6 +328,10 @@ class SimulationClient {
       const btn = document.getElementById("btn-run");
       btn.dataset.running = "0";
       btn.textContent = "▶ Run Simulation";
+      const bp = document.getElementById("btn-pause");
+      bp.style.display = "none";
+      bp.dataset.paused = "0";
+      bp.textContent = "⏸ Pause";
     };
   }
 
@@ -341,7 +345,7 @@ class SimulationClient {
         break;
       case "tick":
         this.viewer.applyTick(frame);
-        this._updateActiveOrders(frame.agents || []);
+        this._updateActiveOrders(frame.agents || [], frame.waiting_order_ids || []);
         if (this.dashboard) this.dashboard.onTick(frame);
         break;
       case "order_complete":
@@ -398,9 +402,10 @@ class SimulationClient {
     }
   }
 
-  _updateActiveOrders(agents) {
+  _updateActiveOrders(agents, waitingOrderIds = []) {
     const activeBatches = new Set(agents.map(a => a.active_batch).filter(Boolean));
-    const key = [...activeBatches].sort().join(",");
+    const waitingSet    = new Set(waitingOrderIds);
+    const key = [...activeBatches].sort().join(",") + "|" + [...waitingSet].sort().join(",");
     if (key === this._activeBatchKey) return;
     this._activeBatchKey = key;
 
@@ -418,9 +423,13 @@ class SimulationClient {
       }
     }
 
-    for (const [, info] of this.orderRows) {
-      const inActive = activeBatches.has(info.batchId) && !info.el.classList.contains("done");
+    for (const [orderId, info] of this.orderRows) {
+      if (info.el.classList.contains("done")) continue;
+      const inActive  = activeBatches.has(info.batchId);
+      const inWaiting = waitingSet.has(orderId);
+
       if (inActive) {
+        info.el.classList.remove("waiting");
         info.el.classList.add("active");
         info.el.querySelector(".order-status").textContent = "●";
         const list = info.el.parentElement;
@@ -429,8 +438,12 @@ class SimulationClient {
           if (info.el.offsetTop < list.scrollTop) list.scrollTop = info.el.offsetTop;
           else if (bot > list.scrollTop + list.clientHeight) list.scrollTop = bot - list.clientHeight;
         }
-      } else if (info.el.classList.contains("active")) {
+      } else if (inWaiting) {
         info.el.classList.remove("active");
+        info.el.classList.add("waiting");
+        info.el.querySelector(".order-status").textContent = "⏸";
+      } else {
+        info.el.classList.remove("active", "waiting");
         info.el.querySelector(".order-status").textContent = "·";
       }
     }
@@ -687,6 +700,23 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-zoom-out").addEventListener("click",   () => viewer.zoomBy(1 / 1.3));
   document.getElementById("btn-zoom-reset").addEventListener("click", () => viewer.resetZoom());
 
+  // ── Pause / Resume ───────────────────────────
+  const btnPause = document.getElementById("btn-pause");
+  btnPause.addEventListener("click", () => {
+    if (!client) return;
+    const paused = btnPause.dataset.paused === "1";
+    if (paused) {
+      const ms = parseInt(document.getElementById("speed-slider").value);
+      client.sendSpeedUpdate(ms);
+      btnPause.dataset.paused = "0";
+      btnPause.textContent = "⏸ Pause";
+    } else {
+      client.sendSpeedUpdate(999_999);
+      btnPause.dataset.paused = "1";
+      btnPause.textContent = "▶ Resume";
+    }
+  });
+
   // ── Run / Stop ───────────────────────────────
   document.getElementById("btn-run").addEventListener("click", async () => {
     const btn = document.getElementById("btn-run");
@@ -694,6 +724,9 @@ document.addEventListener("DOMContentLoaded", () => {
       if (client) client.stop();
       btn.dataset.running = "0";
       btn.textContent = "▶ Run Simulation";
+      btnPause.style.display = "none";
+      btnPause.dataset.paused = "0";
+      btnPause.textContent = "⏸ Pause";
       return;
     }
 
@@ -726,6 +759,9 @@ document.addEventListener("DOMContentLoaded", () => {
     viewer.build(dict, false);
     btn.dataset.running = "1";
     btn.textContent = "■ Stop";
+    btnPause.style.display = "inline-block";
+    btnPause.dataset.paused = "0";
+    btnPause.textContent = "⏸ Pause";
 
     if (client) client.disconnect();
     client = new SimulationClient(
@@ -755,6 +791,7 @@ document.addEventListener("DOMContentLoaded", () => {
       tick_delay_ms:      parseInt(document.getElementById("speed-slider").value),
       steps_per_frame:    parseInt(document.getElementById("steps-slider").value),
       order_arrival_rate: parseFloat(document.getElementById("input-arrival-rate").value),
+      restock_delay:      parseInt(document.getElementById("input-restock-delay").value),
       day_length:         dayLength,
     });
   });

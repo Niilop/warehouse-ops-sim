@@ -123,6 +123,10 @@
           <span class="param-label">Arrival rate <span style="color:#555;font-size:10px;">(orders/tick, 0 = batch)</span></span>
           <input type="number" id="input-arrival-rate" value="0" min="0" max="1" step="0.01" />
         </div>
+        <div class="param" style="grid-column:1/-1;">
+          <span class="param-label">Restock delay <span style="color:#555;font-size:10px;">(ticks, 0 = instant · try 50–200 to see stockouts)</span></span>
+          <input type="number" id="input-restock-delay" value="0" min="0" max="2000" step="10" />
+        </div>
       </div>
     </div>
   </div>
@@ -173,6 +177,7 @@
         <span class="speed-label" id="steps-label">×4</span>
       </div>
       <button class="primary" id="btn-run">▶ Run Simulation</button>
+      <button id="btn-pause" style="display:none;">⏸ Pause</button>
       <div id="error-banner"></div>
     </div>
   </div>

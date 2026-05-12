@@ -262,6 +262,13 @@ button.primary {
 button.primary:hover { background: #162e16; }
 button.primary:disabled { background: #111; color: #333; border-color: #222; cursor: default; }
 button.primary[data-running="1"] { background: #2e0e0e; border-color: #5a1d1d; color: #c87a7a; }
+#btn-pause {
+    width: 100%; padding: 5px; font-size: 12px; margin-top: 4px;
+    background: #1a1a0a; border: 1px solid #4a3a10; color: #c8a84a;
+    border-radius: 3px; cursor: pointer;
+}
+#btn-pause:hover { background: #252510; }
+#btn-pause[data-paused="1"] { background: #0e1a0e; border-color: #1d5a1d; color: #7ac87a; }
 
 /* ── Mode toggle ─────────────────────────────────────── */
 .mode-toggle { display: flex; gap: 5px; }
@@ -374,6 +381,8 @@ input[type="range"] { width: 100px; padding: 2px; cursor: pointer; }
 }
 .order-status { text-align: center; font-size: 10px; }
 .order-row.active { color: #4a9fd4; background: rgba(26,111,181,0.10); }
+.order-row.waiting { color: #c8892a; background: rgba(200,137,42,0.08); }
+.order-row.waiting .order-status { color: #c8892a; }
 .order-row.done { color: #2a2a2a; }
 .order-row.done .order-status { color: #1d5a1d; }
 .order-batch-tag {
