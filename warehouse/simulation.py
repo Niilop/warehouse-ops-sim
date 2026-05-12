@@ -48,10 +48,13 @@ class SimMetrics:
     total_items: int
     total_distance: int
     total_ticks: int
-    lines_per_hour: float   # items / total_ticks * 3600 (1 tick ≈ 1 second scale)
+    lines_per_hour: float       # total_items / (total_ticks / 3600); 1 tick = 1 second
+    lines_per_order: float      # total_items / total_orders
     idle_ticks: int
     wait_ticks_total: int
     stockout_count: int
+    avg_agent_utilization: float          # average active fraction across all agents
+    stockout_ticks_by_item: dict[str, int]  # item_id → ticks at zero aggregate stock
 
 
 class Simulation:
@@ -92,6 +95,8 @@ class Simulation:
         self.idle_ticks: int = 0
         self._order_enqueue_tick: dict[str, int] = {}
         self._order_wait_ticks: dict[str, int] = {}
+        self._agent_ticks_active: dict[str, int] = {a.agent_id: 0 for a in agents}
+        self._stockout_ticks: dict[str, int] = {}  # item_id → ticks at zero aggregate stock
 
         # Epoch reslotting
         self.epoch_length: int = epoch_length
@@ -552,6 +557,14 @@ class Simulation:
                 return False
             self.idle_ticks += 1
 
+        # Per-tick metrics
+        for a in self.agents:
+            if a.state != AgentState.IDLE:
+                self._agent_ticks_active[a.agent_id] = self._agent_ticks_active.get(a.agent_id, 0) + 1
+        for item_id, slots in self.inventory._original_slots_for.items():
+            if sum(s.stock for s in slots) == 0:
+                self._stockout_ticks[item_id] = self._stockout_ticks.get(item_id, 0) + 1
+
         self.current_tick += 1
         return True
 
@@ -560,16 +573,29 @@ class Simulation:
         total_items = sum(m.items_picked for m in metrics)
         total_dist = sum(m.distance_traveled for m in metrics)
         total_wait = sum(m.wait_ticks for m in metrics)
+        n_orders = len(metrics)
         lph = (total_items / self.current_tick * 3600) if self.current_tick > 0 else 0.0
+        lpo = (total_items / n_orders) if n_orders > 0 else 0.0
+        if self.agents and self.current_tick > 0:
+            util_values = [
+                self._agent_ticks_active.get(a.agent_id, 0) / self.current_tick
+                for a in self.agents
+            ]
+            avg_util = sum(util_values) / len(util_values)
+        else:
+            avg_util = 0.0
         return SimMetrics(
-            total_orders=len(metrics),
+            total_orders=n_orders,
             total_items=total_items,
             total_distance=total_dist,
             total_ticks=self.current_tick,
             lines_per_hour=round(lph, 2),
+            lines_per_order=round(lpo, 2),
             idle_ticks=self.idle_ticks,
             wait_ticks_total=total_wait,
             stockout_count=self.stockout_count,
+            avg_agent_utilization=round(avg_util, 4),
+            stockout_ticks_by_item=dict(self._stockout_ticks),
         )
 
     def run(self, max_ticks: int = 10_000) -> list[OrderMetrics]:

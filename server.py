@@ -246,7 +246,6 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
 
     prev_metrics_count = 0
     cell_visit_freq: dict[str, int] = {}
-    agent_ticks_active: dict[str, int] = {a.agent_id: 0 for a in agents}
     _window_items = 0
     _window_start = 0
     _WINDOW = 100
@@ -264,8 +263,6 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
             for a in sim.agents:
                 key = f"{a.pos[0]},{a.pos[1]}"
                 cell_visit_freq[key] = cell_visit_freq.get(key, 0) + 1
-                if a.state.value != "idle":
-                    agent_ticks_active[a.agent_id] = agent_ticks_active.get(a.agent_id, 0) + 1
             if not has_more:
                 break
 
@@ -309,7 +306,7 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
                     "active_batch": sim._agent_batch[a.agent_id].batch_id
                         if sim._agent_batch[a.agent_id] else None,
                     "util_pct": round(
-                        agent_ticks_active.get(a.agent_id, 0) / max(1, sim.current_tick) * 100
+                        sim._agent_ticks_active.get(a.agent_id, 0) / max(1, sim.current_tick) * 100
                     ),
                 }
                 for a in sim.agents
@@ -380,8 +377,11 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
             "total_distance": summary.total_distance,
             "avg_ticks_per_order": round(avg_ticks, 1),
             "lines_per_hour": summary.lines_per_hour,
+            "lines_per_order": summary.lines_per_order,
+            "avg_agent_utilization_pct": round(summary.avg_agent_utilization * 100, 1),
             "idle_ticks": summary.idle_ticks,
             "stockout_count": summary.stockout_count,
+            "stockout_ticks_by_item": summary.stockout_ticks_by_item,
         },
         "heatmap": cell_visit_freq,
     }))

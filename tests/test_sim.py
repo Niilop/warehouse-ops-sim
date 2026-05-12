@@ -895,3 +895,80 @@ def test_epoch_reslotting_with_batching():
     assert len(sim.completed_metrics) == n_orders
     total = sum(m.items_picked for m in sim.completed_metrics)
     assert total == n_orders * per_order
+
+
+# ── Phase 7e: enhanced metrics ───────────────────────────────────────────────
+
+def test_summary_lines_per_order():
+    """lines_per_order == total_items / total_orders."""
+    n_orders, per_order = 10, 4
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=n_orders, per_order=per_order))
+    s = sim.get_summary()
+    assert s.lines_per_order == per_order, (
+        f"Expected lpo={per_order}, got {s.lines_per_order}"
+    )
+
+
+def test_summary_avg_agent_utilization_in_range():
+    """avg_agent_utilization is in [0, 1]."""
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=10))
+    s = sim.get_summary()
+    assert 0.0 <= s.avg_agent_utilization <= 1.0, (
+        f"avg_agent_utilization out of range: {s.avg_agent_utilization}"
+    )
+
+
+def test_summary_avg_agent_utilization_positive():
+    """Agents must be active for some ticks during a non-trivial run."""
+    items = catalog()
+    sim = run_sim(DEFAULT, items, orders(items, n=10))
+    s = sim.get_summary()
+    assert s.avg_agent_utilization > 0.0, "avg_agent_utilization is zero — agents never moved"
+
+
+def test_stockout_ticks_by_item_increments():
+    """stockout_ticks_by_item records ticks at zero stock for items that run out."""
+    items = catalog(n_items=5, n_families=1, seed=3)
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items, initial_stock=1)
+    agent = PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)
+    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=20)
+
+    os = orders(items, n=8, per_order=2, seed=3)
+    for o in os:
+        sim.enqueue_order(o)
+    sim.run(max_ticks=100_000)
+
+    assert sim._stockout_ticks, "No stockout ticks recorded despite low initial stock"
+    assert all(v > 0 for v in sim._stockout_ticks.values())
+
+
+def test_stockout_ticks_by_item_in_summary():
+    """get_summary() returns stockout_ticks_by_item matching _stockout_ticks."""
+    items = catalog(n_items=5, n_families=1, seed=3)
+    inventory = Inventory(DEFAULT)
+    inventory.seed(items, initial_stock=1)
+    agent = PickAgent("A1", DEFAULT.pack_station_pos, DEFAULT)
+    sim = Simulation(DEFAULT, inventory, [agent], restock_delay=10)
+
+    os = orders(items, n=6, per_order=2, seed=3)
+    for o in os:
+        sim.enqueue_order(o)
+    sim.run(max_ticks=100_000)
+
+    s = sim.get_summary()
+    assert s.stockout_ticks_by_item == sim._stockout_ticks
+
+
+def test_server_complete_has_lpo_and_utilization():
+    """complete WebSocket message includes lines_per_order and avg_agent_utilization_pct."""
+    msgs = run_server(n_orders=6)
+    complete = next(m for m in msgs if m["type"] == "complete")
+    summary = complete["summary"]
+    assert "lines_per_order" in summary, "complete summary missing lines_per_order"
+    assert "avg_agent_utilization_pct" in summary, "complete summary missing avg_agent_utilization_pct"
+    assert "stockout_ticks_by_item" in summary, "complete summary missing stockout_ticks_by_item"
+    assert summary["lines_per_order"] == 4.0  # items_per_order=4 in run_server
+    assert 0.0 <= summary["avg_agent_utilization_pct"] <= 100.0
