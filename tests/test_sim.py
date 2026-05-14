@@ -621,10 +621,12 @@ def test_replenishment_urgent_preempts_order_pick():
 # ── large-scale stress tests ──────────────────────────────────────────────────
 
 @pytest.mark.parametrize("n_agents,n_orders,n_items,per_order,seed", [
-    (2, 40,  30, 4, 11),
-    (3, 60,  40, 4, 22),
-    (4, 80,  50, 5, 33),
-    (6, 100, 60, 4, 44),
+    (2,  40,  30, 4, 11),
+    (3,  60,  40, 4, 22),
+    (4,  80,  50, 5, 33),
+    (5, 100,  60, 4, 44),
+    (6, 120,  80, 4, 55),
+    (8, 150, 100, 5, 66),
 ])
 def test_large_scale_completion(n_agents, n_orders, n_items, per_order, seed):
     """All orders complete regardless of agent count or catalog size."""
@@ -643,16 +645,115 @@ def test_large_scale_completion(n_agents, n_orders, n_items, per_order, seed):
     ("zone", 3, 4),
     ("tsp",  3, 4),
     ("tsp",  4, 6),
+    ("tsp",  3, 5),
+    ("zone", 4, 8),
 ])
 def test_large_batch_multi_agent(strategy, batch_size, n_agents):
     """Batch strategies complete all orders under multi-agent contention."""
-    n_orders, per_order = 60, 4
-    items = generate_catalog(n_items=40, n_families=6, demand_skew=2.0, seed=77)
+    n_orders, per_order = 100, 4
+    items = generate_catalog(n_items=60, n_families=6, demand_skew=2.0, seed=77)
     os = generate_orders(items, n_orders=n_orders, items_per_order=per_order, seed=77)
     sim = run_sim(QUAD, items, os, strategy=strategy, batch_size=batch_size, n_agents=n_agents)
     assert len(sim.completed_metrics) == n_orders
     total = sum(m.items_picked for m in sim.completed_metrics)
     assert total == n_orders * per_order
+
+
+# ── dock + large-scale (the problematic combo) ────────────────────────────────
+
+def _quad_with_dock():
+    """Quad grid with a dock cell — exercises the full dock-replenishment path."""
+    return WarehouseGrid.build_quad(dock=True)
+
+
+def _run_dock_sim(
+    n_agents, n_orders, n_items, per_order, seed,
+    initial_stock=3, truck_interval=0, epoch_length=0,
+):
+    """Build and run a sim with a dock-equipped quad grid."""
+    grid = _quad_with_dock()
+    items = generate_catalog(n_items=n_items, n_families=6, demand_skew=2.0, seed=seed)
+    items = items[:len(Inventory(grid)._slots)]
+    os = generate_orders(items, n_orders=n_orders, items_per_order=per_order, seed=seed)
+
+    inventory = Inventory(grid)
+    inventory.seed(items, initial_stock=initial_stock)
+    agents = [PickAgent(f"A{i+1}", grid.pack_station_pos, grid) for i in range(n_agents)]
+    sim = Simulation(grid, inventory, agents, restock_delay=0, epoch_length=epoch_length)
+    sim.truck_interval_ticks = truck_interval
+    for o in os:
+        sim.enqueue_order(o)
+    sim.run(max_ticks=500_000)
+    return sim
+
+
+@pytest.mark.parametrize("n_agents,n_orders,n_items,per_order,seed", [
+    (5, 100, 50, 4, 101),
+    (6, 100, 60, 4, 102),
+    (8, 120, 80, 4, 103),
+])
+def test_dock_large_scale_all_complete(n_agents, n_orders, n_items, per_order, seed):
+    """With a dock, 5+ agents and 100+ orders all complete — no early exit, no starvation."""
+    sim = _run_dock_sim(n_agents, n_orders, n_items, per_order, seed)
+    assert len(sim.completed_metrics) == n_orders, (
+        f"{n_agents}A/{n_orders}O/{n_items}I(dock): "
+        f"{len(sim.completed_metrics)} completed, "
+        f"{len(sim._waiting_tasks)} still waiting"
+    )
+    assert len(sim._waiting_tasks) == 0, (
+        f"{len(sim._waiting_tasks)} tasks stuck in waiting queue"
+    )
+
+
+@pytest.mark.parametrize("n_agents,n_orders", [
+    (5, 100),
+    (6, 100),
+    (8, 120),
+])
+def test_dock_large_scale_no_items_lost(n_agents, n_orders):
+    """Total items picked matches expected count even with dock replenishment cycling."""
+    per_order, n_items, seed = 4, 60, 200 + n_agents
+    sim = _run_dock_sim(n_agents, n_orders, n_items, per_order, seed)
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * per_order, (
+        f"{n_agents}A: picked {total}, expected {n_orders * per_order}"
+    )
+
+
+@pytest.mark.parametrize("n_agents,n_orders,truck_interval", [
+    (5, 80, 200),
+    (6, 80, 300),
+])
+def test_dock_wave_replenishment_all_complete(n_agents, n_orders, truck_interval):
+    """Wave replenishment (truck_interval > 0) still completes all orders with 5+ agents."""
+    sim = _run_dock_sim(
+        n_agents, n_orders, n_items=50, per_order=4, seed=300 + n_agents,
+        initial_stock=2, truck_interval=truck_interval,
+    )
+    assert len(sim.completed_metrics) == n_orders, (
+        f"{n_agents}A truck={truck_interval}: "
+        f"{len(sim.completed_metrics)}/{n_orders} complete, "
+        f"{len(sim._waiting_tasks)} waiting"
+    )
+
+
+@pytest.mark.parametrize("n_agents,n_orders", [
+    (5, 100),
+    (6, 100),
+])
+def test_dock_epoch_reslot_no_item_loss(n_agents, n_orders):
+    """Epoch reslotting with dock replenishment and 5+ agents must not lose items or deadlock.
+    Specifically exercises the relocate() reorder_point copy bug."""
+    sim = _run_dock_sim(
+        n_agents, n_orders, n_items=50, per_order=4, seed=400 + n_agents,
+        initial_stock=3, epoch_length=100,
+    )
+    assert len(sim.completed_metrics) == n_orders, (
+        f"epoch+dock {n_agents}A: {len(sim.completed_metrics)}/{n_orders} complete, "
+        f"{len(sim._waiting_tasks)} stuck"
+    )
+    total = sum(m.items_picked for m in sim.completed_metrics)
+    assert total == n_orders * 4
 
 
 # ── Phase 7c: wave replenishment (truck_interval_ticks) ──────────────────────

@@ -172,9 +172,16 @@ class Simulation:
     # Per-agent dispatch and deposit helpers
     # ------------------------------------------------------------------
 
-    def _dispatch_agent(self, agent: PickAgent, occupied: set[tuple[int, int]]) -> bool:
+    def _dispatch_agent(
+        self,
+        agent: PickAgent,
+        occupied: set[tuple[int, int]],
+        allow_replenishment: bool = True,
+    ) -> bool:
         """Pop the highest-priority available task and assign it to the idle agent.
         Tasks whose stock is insufficient are deferred back onto the heap.
+        allow_replenishment=False defers replenishment tasks back without assigning,
+        so the agent looks for a pick task instead (used by the dock-throttle).
         Returns True if something was dispatched."""
         claimed: Counter[str] = Counter()
         for a in self.agents:
@@ -192,6 +199,9 @@ class Simulation:
             task = heapq.heappop(self.task_queue)
 
             if task.priority in (TaskType.REPLENISHMENT_URGENT, TaskType.REPLENISHMENT_SCHEDULED):
+                if not allow_replenishment:
+                    deferred.append(task)
+                    continue
                 if self.grid.dock_pos is None:
                     continue  # dock removed mid-run; discard stale task
                 p = task.payload
@@ -420,8 +430,9 @@ class Simulation:
                 for item, qty in self._pending_po:
                     homes = self.inventory._original_slots_for[item.item_id]
                     target = min(homes, key=lambda s: s.stock / max(1, s.fill_to))
+                    stocked_out = self.inventory.stock_level(item.item_id) == 0
                     heapq.heappush(self.task_queue, Task(
-                        priority=TaskType.REPLENISHMENT_SCHEDULED,
+                        priority=TaskType.REPLENISHMENT_URGENT if stocked_out else TaskType.REPLENISHMENT_SCHEDULED,
                         created_at=self.current_tick,
                         task_id=f"repl-{item.item_id}",
                         payload={"item": item, "qty": qty, "slot_stand_pos": target.stand_pos},
@@ -448,12 +459,31 @@ class Simulation:
                 self._pending_replenishment.add(item_id)
 
     def _dispatch_idle_agents(self) -> None:
+        # Re-evaluate waiting tasks before dispatch: contention may have cleared since
+        # the last restock event, or multiple restocks completed in the same tick.
+        self._unblock_waiting_tasks()
+
         # Serial dispatch — queue item is popped before the next agent is considered,
         # so two agents cannot claim the same batch/order in the same tick.
         occupied = {a.pos for a in self.agents}
+
+        # Throttle: cap concurrent dock trips to half the fleet (rounded up) so
+        # pick agents remain available when ORDER_PICK tasks exist.  When no pick
+        # tasks are in the queue at all (everything is in _waiting_tasks) the cap
+        # is lifted and every idle agent may do replenishment.
+        max_repl = max(1, (len(self.agents) + 1) // 2)
+        has_picks = any(t.priority == TaskType.ORDER_PICK for t in self.task_queue)
+
         for agent in self.agents:
-            if agent.state == AgentState.IDLE:
-                self._dispatch_agent(agent, occupied)
+            if agent.state != AgentState.IDLE:
+                continue
+            in_transit = sum(
+                1 for a in self.agents
+                if a.state in (AgentState.MOVING_TO_DOCK, AgentState.MOVING_FROM_DOCK)
+            )
+            # Allow replenishment when under the cap OR when no picks are available anyway.
+            allow_repl = (not has_picks) or (in_transit < max_repl)
+            self._dispatch_agent(agent, occupied, allow_replenishment=allow_repl)
 
     def _escape_step(self, agent: "PickAgent", all_positions: set[tuple[int, int]]) -> bool:
         """Move agent one step to any free adjacent cell (not the currently-blocked one).
@@ -549,9 +579,11 @@ class Simulation:
         self._handle_agent_movement()
 
         all_idle = all(a.state == AgentState.IDLE for a in self.agents)
-        # _waiting_tasks alone (no restock or PO in flight) means stuck on stockout with
-        # no replenishment coming — terminate rather than spin forever.
-        has_pending = bool(self.restock_queue or self.task_queue or self._pending_po)
+        # _waiting_tasks is included: if orders are blocked on stockout but a replenishment
+        # task is still outstanding (in-flight agent), has_pending stays True via task_queue
+        # or the agents themselves being non-IDLE.  Including it here prevents early exit
+        # when all agents finish replenishment in the same tick that _unblock fires.
+        has_pending = bool(self.restock_queue or self.task_queue or self._pending_po or self._waiting_tasks)
         if all_idle:
             if not has_pending and self.order_arrival_rate <= 0:
                 return False
