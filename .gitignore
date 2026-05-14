@@ -12,6 +12,7 @@ build/
 .mypy_cache/
 .ruff_cache/
 .contextwindow
+CLAUDE.md
 
 # Generated analysis output — regenerate with: python blog_analysis.py
 warehouse-layout-optimization.md

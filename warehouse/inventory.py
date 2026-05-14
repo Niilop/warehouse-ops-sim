@@ -267,10 +267,13 @@ class Inventory:
             return None, 0
 
         old_home = homes[0]
-        # Carry capacity forward so the item's full circulation is preserved.
-        if old_home.max_stock > new_slot.max_stock:
-            new_slot.max_stock = old_home.max_stock
-            new_slot.fill_to = old_home.fill_to
+        # Carry all capacity fields forward so replenishment continues correctly
+        # after a relocation.  new_slot starts with dataclass defaults (e.g.
+        # reorder_point=0) which would permanently suppress check_reorder_triggers.
+        new_slot.max_stock = max(new_slot.max_stock, old_home.max_stock)
+        new_slot.fill_to = max(new_slot.fill_to, old_home.fill_to)
+        new_slot.reorder_point = old_home.reorder_point
+        new_slot.order_qty = old_home.order_qty
         homes[0] = new_slot
 
         if old_home.stock > 0:
