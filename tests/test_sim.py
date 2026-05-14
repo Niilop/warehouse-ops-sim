@@ -663,9 +663,7 @@ def test_large_batch_multi_agent(strategy, batch_size, n_agents):
 
 def _quad_with_dock():
     """Quad grid with a dock cell — exercises the full dock-replenishment path."""
-    from warehouse.grid import CellType
-    g = WarehouseGrid.build_quad(dock=True)
-    return g
+    return WarehouseGrid.build_quad(dock=True)
 
 
 def _run_dock_sim(
