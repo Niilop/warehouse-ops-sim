@@ -64,6 +64,7 @@ class Simulation:
         inventory: Inventory,
         agents: list[PickAgent],
         restock_delay: int = 10,
+        repl_batch_size: int = 4,
         epoch_length: int = 100,
         order_arrival_rate: float = 0.0,
         order_generator: Callable[[], Order] | None = None,
@@ -88,6 +89,7 @@ class Simulation:
 
         # Restock queue
         self.restock_delay = restock_delay
+        self.repl_batch_size = repl_batch_size
         self.restock_queue: list[RestockJob] = []
         self.stockout_count: int = 0
 
@@ -204,11 +206,8 @@ class Simulation:
                     continue
                 if self.grid.dock_pos is None:
                     continue  # dock removed mid-run; discard stale task
-                p = task.payload
                 agent.assign_replenishment(
-                    item=p["item"],
-                    qty=p["qty"],
-                    slot_stand_pos=p["slot_stand_pos"],
+                    stops=task.payload["stops"],
                     dock_pos=self.grid.dock_pos,
                     task_id=task.task_id,
                 )
@@ -402,6 +401,22 @@ class Simulation:
                 still_waiting.append(task)
         self._waiting_tasks = still_waiting
 
+    def _push_repl_batches(
+        self,
+        stops: list[tuple[tuple[int, int], "Item", int, bool]],
+    ) -> None:
+        """Slice a list of (stand_pos, item, qty, urgent) stops into repl_batch_size
+        groups and push one Task per group onto the task heap."""
+        for i in range(0, len(stops), self.repl_batch_size):
+            chunk = stops[i : i + self.repl_batch_size]
+            has_urgent = any(s[3] for s in chunk)
+            heapq.heappush(self.task_queue, Task(
+                priority=TaskType.REPLENISHMENT_URGENT if has_urgent else TaskType.REPLENISHMENT_SCHEDULED,
+                created_at=self.current_tick,
+                task_id=f"repl-{self.current_tick}-{i}",
+                payload={"stops": [(s[0], s[1], s[2]) for s in chunk]},
+            ))
+
     def _process_arrivals(self) -> None:
         if self.order_arrival_rate <= 0 or self.order_generator is None:
             return
@@ -421,42 +436,40 @@ class Simulation:
 
         # With a dock, check whether any slot has dropped below its reorder point.
         if self.grid.dock_pos is not None:
-            # Drain accumulated PO on truck arrival.
+            # Drain accumulated PO on truck arrival — batch into multi-stop tasks.
             if (
                 self.truck_interval_ticks > 0
                 and self.current_tick > 0
                 and self.current_tick % self.truck_interval_ticks == 0
+                and self._pending_po
             ):
+                stops_raw: list[tuple[tuple[int, int], Item, int, bool]] = []
                 for item, qty in self._pending_po:
                     homes = self.inventory._original_slots_for[item.item_id]
                     target = min(homes, key=lambda s: s.stock / max(1, s.fill_to))
                     stocked_out = self.inventory.stock_level(item.item_id) == 0
-                    heapq.heappush(self.task_queue, Task(
-                        priority=TaskType.REPLENISHMENT_URGENT if stocked_out else TaskType.REPLENISHMENT_SCHEDULED,
-                        created_at=self.current_tick,
-                        task_id=f"repl-{item.item_id}",
-                        payload={"item": item, "qty": qty, "slot_stand_pos": target.stand_pos},
-                    ))
+                    stops_raw.append((target.stand_pos, item, qty, stocked_out))
+                stops_raw.sort(key=lambda s: (0 if s[3] else 1))  # urgent stops first
                 self._pending_po.clear()
+                self._push_repl_batches(stops_raw)
 
+            # Collect all reorder triggers for this tick, mark pending immediately
+            # so the same item cannot appear in two separate batches this tick.
+            immediate: list[tuple[tuple[int, int], Item, int, bool]] = []
             for item_id, item, order_qty, urgent in self.inventory.check_reorder_triggers(
                 self._pending_replenishment
             ):
+                self._pending_replenishment.add(item_id)
                 if urgent or self.truck_interval_ticks == 0:
-                    # Urgent restocks and immediate-mode always bypass the truck schedule.
-                    priority = TaskType.REPLENISHMENT_URGENT if urgent else TaskType.REPLENISHMENT_SCHEDULED
                     homes = self.inventory._original_slots_for[item_id]
                     target = min(homes, key=lambda s: s.stock / max(1, s.fill_to))
-                    heapq.heappush(self.task_queue, Task(
-                        priority=priority,
-                        created_at=self.current_tick,
-                        task_id=f"repl-{item_id}",
-                        payload={"item": item, "qty": order_qty, "slot_stand_pos": target.stand_pos},
-                    ))
+                    immediate.append((target.stand_pos, item, order_qty, urgent))
                 else:
-                    # Non-urgent: accumulate in the pending PO for next truck delivery.
                     self._pending_po.append((item, order_qty))
-                self._pending_replenishment.add(item_id)
+
+            if immediate:
+                immediate.sort(key=lambda s: (0 if s[3] else 1))  # urgent first
+                self._push_repl_batches(immediate)
 
     def _dispatch_idle_agents(self) -> None:
         # Re-evaluate waiting tasks before dispatch: contention may have cleared since
@@ -522,14 +535,12 @@ class Simulation:
                 # breaking symmetric deadlocks without both agents replanning at once.
                 threshold = 3 + 2 * idx
                 if agent._wait_count >= threshold and agent._replan_cooldown == 0:
-                    if agent._wait_count >= 20:
-                        # Physical escape: step sideways to a free cell, then replan.
-                        # This breaks circular deadlocks that path-replanning alone cannot resolve.
-                        all_pos = {a.pos for a in self.agents if a is not agent}
-                        if not self._escape_step(agent, all_pos):
-                            agent.replan(occupied - {agent.pos}, force=True)
-                    else:
-                        agent.replan(occupied - {agent.pos})
+                    # Always try a physical escape step first: moving sideways breaks
+                    # head-on livelocks where two agents find mirror-image detours that
+                    # also collide.  Fall back to path-replanning if no free cell exists.
+                    all_pos = {a.pos for a in self.agents if a is not agent}
+                    if not self._escape_step(agent, all_pos):
+                        agent.replan(occupied - {agent.pos}, force=(agent._wait_count >= 20))
                     agent._replan_cooldown = 8
             elif result == StepResult.ARRIVED:
                 if agent.state == AgentState.MOVING_TO_RACK:

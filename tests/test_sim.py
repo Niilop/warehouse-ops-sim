@@ -611,7 +611,7 @@ def test_replenishment_urgent_preempts_order_pick():
         priority=TaskType.REPLENISHMENT_URGENT,
         created_at=0,
         task_id="repl-test",
-        payload={"item": dummy_item, "qty": 1, "slot_stand_pos": slot.stand_pos},
+        payload={"stops": [(slot.stand_pos, dummy_item, 1)]},
     ))
 
     top = heapq.heappop(sim.task_queue)
