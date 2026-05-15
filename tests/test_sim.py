@@ -840,12 +840,12 @@ def test_urgent_restock_bypasses_truck():
 
 
 def test_po_stockout_before_truck_gets_urgent_priority():
-    """Items that drain to zero while sitting in _pending_po must be dispatched as
-    REPLENISHMENT_URGENT when the truck arrives, not REPLENISHMENT_SCHEDULED.
+    """Items that drain to zero while sitting in _pending_po must be promoted to
+    REPLENISHMENT_URGENT immediately — not left to wait until the next truck arrives.
 
-    The scenario is injected directly: one item is placed in _pending_po (as if a
-    non-urgent reorder fired earlier) and then drained to stock == 0. At truck
-    delivery _process_restocks must detect stock_level == 0 and use URGENT priority.
+    Items in _pending_po are also in _pending_replenishment, so check_reorder_triggers
+    skips them. The only promotion path is the per-tick scan in _process_restocks that
+    detects stock_level == 0 and dispatches urgent tasks immediately.
     """
     from warehouse.task import TaskType
 
@@ -868,26 +868,20 @@ def test_po_stockout_before_truck_gets_urgent_priority():
         slot.stock = 0
         slot.item = None
 
-    # Advance so that current_tick == truck_interval without firing the truck yet.
-    # current_tick starts at 0 and increments at end of each step(), so after
-    # truck_interval steps current_tick == truck_interval.
-    for _ in range(truck_interval):
-        sim.step()
-
-    # current_tick is now == truck_interval; call _process_restocks() directly so we
-    # can inspect the task queue before _dispatch_idle_agents() consumes the task.
+    # A single _process_restocks() call should detect stock == 0 and promote the item
+    # to urgent immediately — before any truck delivery tick.
     sim._process_restocks()
 
-    # _pending_po must be fully drained after the truck fires.
-    assert not sim._pending_po, "_pending_po not cleared on truck delivery"
+    # _pending_po must be emptied (item promoted, not left for the truck).
+    assert not sim._pending_po, "_pending_po not cleared on urgent promotion"
 
-    # The task for the stocked-out victim must carry URGENT priority.
+    # The task must carry URGENT priority.
     victim_tasks = [
         t for t in sim.task_queue
         if t.priority in (TaskType.REPLENISHMENT_URGENT, TaskType.REPLENISHMENT_SCHEDULED)
         and any(stop[1].item_id == victim.item_id for stop in t.payload["stops"])
     ]
-    assert victim_tasks, "No replenishment task found for victim item after truck delivery"
+    assert victim_tasks, "No replenishment task found for victim item after urgent promotion"
     assert all(t.priority == TaskType.REPLENISHMENT_URGENT for t in victim_tasks), (
         "Stocked-out item in _pending_po was dispatched as SCHEDULED instead of URGENT"
     )

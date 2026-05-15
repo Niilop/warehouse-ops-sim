@@ -501,6 +501,24 @@ class Simulation:
 
         # With a dock, check whether any slot has dropped below its reorder point.
         if self.grid.dock_pos is not None:
+            # Promote any _pending_po items that have stocked out since queuing.
+            # Items in _pending_po are also in _pending_replenishment, so
+            # check_reorder_triggers would skip them — this is the only path to
+            # urgent dispatch before the next scheduled truck arrives.
+            if self._pending_po:
+                still_pending: list[tuple[Item, int]] = []
+                urgent_po: list[tuple[tuple[int, int], Item, int, bool]] = []
+                for item, qty in self._pending_po:
+                    if self.inventory.stock_level(item.item_id) == 0:
+                        homes = self.inventory._original_slots_for[item.item_id]
+                        target = min(homes, key=lambda s: s.stock / max(1, s.fill_to))
+                        urgent_po.append((target.stand_pos, item, qty, True))
+                    else:
+                        still_pending.append((item, qty))
+                self._pending_po = still_pending
+                if urgent_po:
+                    self._push_repl_batches(urgent_po)
+
             # Drain accumulated PO on truck arrival — batch into multi-stop tasks.
             if (
                 self.truck_interval_ticks > 0
@@ -568,7 +586,7 @@ class Simulation:
         Returns True if an escape cell was found and the agent was moved."""
         blocked = agent._path[0] if agent._path else None
         dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-        random.shuffle(dirs)
+        self._arrival_rng.shuffle(dirs)
         for dr, dc in dirs:
             cell = (agent.pos[0] + dr, agent.pos[1] + dc)
             if cell == blocked:
