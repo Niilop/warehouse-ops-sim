@@ -779,16 +779,17 @@ def test_truck_interval_delays_non_urgent_restock():
     for _ in range(50):
         sim.step()
 
-    # Non-urgent POs should be sitting in _pending_po, not dispatched yet.
-    # (Urgent ones — aggregate stock == 0 — bypass and are fine either way.)
-    non_urgent_in_queue = sum(
-        1 for t in sim.task_queue
-        if hasattr(t, "priority") and str(t.priority).endswith("REPLENISHMENT_SCHEDULED")
+    # Non-urgent POs must be deferred to _pending_po, not dispatched as tasks yet.
+    # Any item with stock > 0 at reorder_point should be queued, not in task_queue.
+    from warehouse.task import TaskType
+    scheduled_in_queue = [
+        t for t in sim.task_queue
+        if t.priority == TaskType.REPLENISHMENT_SCHEDULED
+    ]
+    assert not scheduled_in_queue, (
+        "REPLENISHMENT_SCHEDULED task found in task_queue before truck boundary — "
+        "non-urgent items should be deferred to _pending_po"
     )
-    # The key assertion: pending PO list is populated (items have been deferred).
-    # We can't assert it's non-empty in every seed/run since urgency varies,
-    # but we *can* assert the sim doesn't crash and the truck boundary works.
-    assert sim.truck_interval_ticks == 100
 
 
 def test_truck_interval_all_orders_complete():

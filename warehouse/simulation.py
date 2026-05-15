@@ -393,11 +393,12 @@ class Simulation:
             current_assignment[iid] = [slot_obj_to_idx[id(s)] for s in slots]
 
         # SA optimizer: minimize Σ picks[i] × min_dist[slots[i]].
+        # Cap n_iter so the cooling schedule always converges even for large catalogs.
         new_assignment = sa_slotting(
             current_assignment,
             pick_counts,
             slot_dist_map,
-            n_iter=max(500, len(current_assignment) * 20),
+            n_iter=min(5000, max(500, len(current_assignment) * 20)),
             seed=self.current_tick,
         )
 
@@ -414,7 +415,9 @@ class Simulation:
             )
 
         pick_rates = {iid: cnt / recent_count for iid, cnt in pick_counts.items()}
-        cost = reorg_cost(current_distances, proposed_distances, self.restock_delay, pick_rates)
+        # Reslotting uses max(restock_delay, 5) so the disruption estimate must match.
+        reslot_delay = max(self.restock_delay, 5)
+        cost = reorg_cost(current_distances, proposed_distances, reslot_delay, pick_rates)
 
         if cost["payback_period_ticks"] >= 2 * self.epoch_length:
             return
@@ -432,8 +435,6 @@ class Simulation:
             for slot in slots
             if slot.stock > 0
         }
-
-        reslot_delay = max(self.restock_delay, 5)
         for iid, new_slot_idx in item_to_new_slot.items():
             if iid in in_flight:
                 continue
@@ -711,8 +712,8 @@ class Simulation:
         else:
             avg_util = 0.0
 
-        # M/M/c workforce sizing: find minimum agents needed to keep utilization ≤ 80%.
-        # ρ ≈ avg_util per agent → c* = ceil(c × avg_util / target_util), min 1.
+        # Utilization-scaling heuristic: minimum agents to keep per-agent utilization ≤ 80%.
+        # Derived from ρ = λ/(c·μ) → c* = ceil(c · ρ / ρ_target), where ρ ≈ avg_util.
         _TARGET_UTIL = 0.80
         n_agents = len(self.agents)
         if avg_util > 0 and n_agents > 0:
@@ -728,12 +729,12 @@ class Simulation:
             and self.grid.dock_pos is not None
         ):
             # Build per-item pick rate (picks/tick) — epoch history if available, else proxy.
+            # Use per-item observation window so recently-added items aren't underestimated.
             item_rates: dict[str, float] = {}
             if self._epoch_pick_history:
-                n_ep = max(len(v) for v in self._epoch_pick_history.values())
-                ep_ticks = n_ep * self.epoch_length
-                if ep_ticks > 0:
-                    for iid, hist in self._epoch_pick_history.items():
+                for iid, hist in self._epoch_pick_history.items():
+                    ep_ticks = len(hist) * self.epoch_length
+                    if ep_ticks > 0:
                         item_rates[iid] = sum(hist) / ep_ticks
             if not item_rates and self.current_tick > 0:
                 all_items: dict[str, Item] = {}
@@ -762,10 +763,12 @@ class Simulation:
             optimal_interval = (
                 max(1, int(min_drain)) if min_drain != float("inf") else self.truck_interval_ticks
             )
+            # "too_short" = truck arrives more than twice as often as needed (wasted trips).
+            _TOO_SHORT_FACTOR = 2
             any_stockouts = bool(self._stockout_ticks)
             if any_stockouts or self.truck_interval_ticks > optimal_interval:
                 truck_diag = "too_long"
-            elif self.truck_interval_ticks < optimal_interval // 2:
+            elif self.truck_interval_ticks * _TOO_SHORT_FACTOR < optimal_interval:
                 truck_diag = "too_short"
             else:
                 truck_diag = "ok"
