@@ -276,7 +276,7 @@ class Simulation:
     def _on_epoch(self) -> None:
         """Greedy reslot: if recent pick data justifies it, move high-demand items
         closer to the pack station. Only runs when enough data has accumulated."""
-        from warehouse.optimizer import slot_distances, reorg_cost
+        from warehouse.optimizer import slot_distances, reorg_cost, sa_slotting
 
         self._last_epoch_tick = self.current_tick
 
@@ -330,23 +330,41 @@ class Simulation:
             for s in self.inventory._original_slots_for.get(job.item_id, []):
                 protected_rack_pos.add(s.rack_pos)
 
-        sorted_slots = slot_distances(self.grid, self.inventory)
-        sorted_items = sorted(
-            current_distances, key=lambda iid: pick_counts.get(iid, 0), reverse=True
-        )
+        # Build slot-index and distance maps.
+        slot_obj_to_idx: dict[int, int] = {id(s): i for i, s in enumerate(self.inventory._slots)}
+        slot_dist_map: dict[int, int] = {
+            idx: dist for idx, dist in slot_distances(self.grid, self.inventory)
+        }
 
-        available_slots = [
-            (idx, dist) for idx, dist in sorted_slots
-            if self.inventory._slots[idx].rack_pos not in protected_rack_pos
-        ]
+        # Build current assignment for non-protected items only.
+        current_assignment: dict[str, list[int]] = {}
+        for iid, slots in self.inventory._original_slots_for.items():
+            if iid in in_flight:
+                continue
+            if any(s.rack_pos in protected_rack_pos for s in slots):
+                continue
+            current_assignment[iid] = [slot_obj_to_idx[id(s)] for s in slots]
+
+        # SA optimizer: minimize Σ picks[i] × min_dist[slots[i]].
+        new_assignment = sa_slotting(
+            current_assignment,
+            pick_counts,
+            slot_dist_map,
+            n_iter=max(500, len(current_assignment) * 20),
+            seed=self.current_tick,
+        )
 
         proposed_distances = dict(current_distances)
         item_to_new_slot: dict[str, int] = {}
-        for rank, iid in enumerate(sorted_items):
-            if rank < len(available_slots):
-                new_slot_idx, new_dist = available_slots[rank]
-                proposed_distances[iid] = new_dist
-                item_to_new_slot[iid] = new_slot_idx
+        for iid, new_idxs in new_assignment.items():
+            if new_idxs == current_assignment.get(iid):
+                continue
+            new_primary_idx = new_idxs[0]
+            item_to_new_slot[iid] = new_primary_idx
+            new_slot = self.inventory._slots[new_primary_idx]
+            proposed_distances[iid] = (
+                abs(new_slot.stand_pos[0] - pack_r) + abs(new_slot.stand_pos[1] - pack_c)
+            )
 
         pick_rates = {iid: cnt / recent_count for iid, cnt in pick_counts.items()}
         cost = reorg_cost(current_distances, proposed_distances, self.restock_delay, pick_rates)

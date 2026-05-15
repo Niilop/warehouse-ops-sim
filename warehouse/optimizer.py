@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 import random
 from collections import defaultdict
 from warehouse.grid import WarehouseGrid
@@ -117,3 +118,59 @@ def reorg_cost(
         "expected_savings_per_tick": round(expected_savings, 4),
         "payback_period_ticks": round(payback, 1),
     }
+
+
+def sa_slotting(
+    current_assignment: dict[str, list[int]],
+    pick_counts: dict[str, int],
+    slot_dist: dict[int, int],
+    n_iter: int = 2000,
+    t_start: float = 200.0,
+    t_final: float = 0.5,
+    seed: int | None = None,
+) -> dict[str, list[int]]:
+    """Simulated annealing slot optimizer.
+
+    Minimizes Σ picks[i] × min_dist[slots[i]] by swapping slot assignments
+    between pairs of items with equal facing counts (multi-facing safe).
+
+    current_assignment: item_id → list of slot indices (non-protected items only)
+    pick_counts: item_id → recent pick count (epoch window)
+    slot_dist: slot_idx → manhattan distance to pack station
+    Returns: optimized assignment (same keys, possibly different slot indices).
+    """
+    if len(current_assignment) < 2:
+        return dict(current_assignment)
+
+    rng = random.Random(seed)
+    assignment = {iid: list(idxs) for iid, idxs in current_assignment.items()}
+
+    # Only swap items with the same number of facings.
+    by_n: dict[int, list[str]] = defaultdict(list)
+    for iid, idxs in assignment.items():
+        by_n[len(idxs)].append(iid)
+    swappable = [lst for lst in by_n.values() if len(lst) >= 2]
+    if not swappable:
+        return dict(current_assignment)
+
+    def item_cost(iid: str) -> float:
+        picks = pick_counts.get(iid, 0)
+        return picks * min(slot_dist[idx] for idx in assignment[iid]) if picks else 0.0
+
+    cooling = (t_final / t_start) ** (1.0 / n_iter)
+    t = t_start
+
+    for _ in range(n_iter):
+        group = rng.choice(swappable)
+        a, b = rng.sample(group, 2)
+
+        e_a, e_b = item_cost(a), item_cost(b)
+        assignment[a], assignment[b] = assignment[b], assignment[a]
+        delta = (item_cost(a) + item_cost(b)) - (e_a + e_b)
+
+        if delta >= 0 and rng.random() >= math.exp(-delta / t):
+            assignment[a], assignment[b] = assignment[b], assignment[a]  # revert
+
+        t *= cooling
+
+    return assignment
