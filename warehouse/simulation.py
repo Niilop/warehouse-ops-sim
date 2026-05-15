@@ -55,6 +55,9 @@ class SimMetrics:
     stockout_count: int
     avg_agent_utilization: float          # average active fraction across all agents
     stockout_ticks_by_item: dict[str, int]  # item_id → ticks at zero aggregate stock
+    n_agents_recommended: int             # M/M/c estimate for 80% target utilization
+    optimal_truck_interval_ticks: int     # minimum safe truck interval from observed demand; 0 = n/a
+    truck_interval_diagnosis: str         # "ok", "too_long", "too_short", or "n/a"
 
 
 class Simulation:
@@ -100,9 +103,10 @@ class Simulation:
         self._agent_ticks_active: dict[str, int] = {a.agent_id: 0 for a in agents}
         self._stockout_ticks: dict[str, int] = {}  # item_id → ticks at zero aggregate stock
 
-        # Epoch reslotting
+        # Epoch reslotting and (s, S) demand learning
         self.epoch_length: int = epoch_length
         self._last_epoch_tick: int = 0
+        self._epoch_pick_history: dict[str, list[int]] = {}  # item_id → picks per epoch
 
         # Dock replenishment tracking — item_ids with an in-flight replenishment task
         self._pending_replenishment: set[str] = set()
@@ -273,9 +277,50 @@ class Simulation:
     # Main simulation loop
     # ------------------------------------------------------------------
 
+    def _update_reorder_params(self, pick_counts: dict[str, int]) -> None:
+        """Adapt per-item reorder_point and fill_to from observed demand statistics.
+
+        Only active in dock mode — reorder_point drives dock replenishment triggers;
+        in teleport mode it is unused and modifying fill_to would cap stock incorrectly.
+
+        Accumulates per-epoch pick counts, then applies the (s, S) policy once
+        at least 3 epochs have been recorded:
+          s = μ × L_epochs + z × σ × sqrt(L_epochs)   [reorder point]
+          S = s + μ                                     [order-up-to: s + one epoch demand]
+        where μ/σ are the epoch-level mean/std of picks and z = 1.65 (95% service level).
+        """
+        if self.grid.dock_pos is None:
+            return
+        z = 1.65
+        min_epochs = 3
+
+        for iid, slots in self.inventory._original_slots_for.items():
+            history = self._epoch_pick_history.setdefault(iid, [])
+            history.append(pick_counts.get(iid, 0))
+            if len(history) < min_epochs:
+                continue
+
+            n = len(history)
+            mu = sum(history) / n
+            var = sum((x - mu) ** 2 for x in history) / max(1, n - 1)
+            sigma = var ** 0.5
+
+            L_epochs = slots[0].lead_time / self.epoch_length
+            s = mu * L_epochs + z * sigma * (L_epochs ** 0.5)
+            S_target = s + mu
+
+            nf = len(slots)
+            for slot in slots:
+                # Clamp reorder_point below max_stock so fill_to stays ≤ max_stock.
+                slot.reorder_point = max(1, min(slot.max_stock - 1, round(s / nf)))
+                slot.fill_to = max(
+                    slot.reorder_point + 1,
+                    min(slot.max_stock, round(S_target / nf)),
+                )
+                slot.order_qty = max(1, slot.fill_to - slot.reorder_point)
+
     def _on_epoch(self) -> None:
-        """Greedy reslot: if recent pick data justifies it, move high-demand items
-        closer to the pack station. Only runs when enough data has accumulated."""
+        """SA reslot + (s,S) policy update. Only runs when enough data has accumulated."""
         from warehouse.optimizer import slot_distances, reorg_cost, sa_slotting
 
         self._last_epoch_tick = self.current_tick
@@ -291,6 +336,8 @@ class Simulation:
 
         if recent_count < 5 or not pick_counts:
             return
+
+        self._update_reorder_params(pick_counts)
 
         pack_r, pack_c = self.grid.pack_station_pos
         current_distances: dict[str, int] = {
@@ -645,6 +692,69 @@ class Simulation:
             avg_util = sum(util_values) / len(util_values)
         else:
             avg_util = 0.0
+
+        # M/M/c workforce sizing: find minimum agents needed to keep utilization ≤ 80%.
+        # ρ ≈ avg_util per agent → c* = ceil(c × avg_util / target_util), min 1.
+        _TARGET_UTIL = 0.80
+        n_agents = len(self.agents)
+        if avg_util > 0 and n_agents > 0:
+            n_recommended = max(1, math.ceil(n_agents * avg_util / _TARGET_UTIL))
+        else:
+            n_recommended = max(1, n_agents)
+
+        # Phase 8d: Optimal truck interval from observed item demand rates.
+        # Min drain time across items (buffer / rate) = safe interval upper bound.
+        if (
+            self.truck_interval_ticks > 0
+            and self.current_tick > 0
+            and self.grid.dock_pos is not None
+        ):
+            # Build per-item pick rate (picks/tick) — epoch history if available, else proxy.
+            item_rates: dict[str, float] = {}
+            if self._epoch_pick_history:
+                n_ep = max(len(v) for v in self._epoch_pick_history.values())
+                ep_ticks = n_ep * self.epoch_length
+                if ep_ticks > 0:
+                    for iid, hist in self._epoch_pick_history.items():
+                        item_rates[iid] = sum(hist) / ep_ticks
+            if not item_rates and self.current_tick > 0:
+                all_items: dict[str, Item] = {}
+                for iid, slots in self.inventory._original_slots_for.items():
+                    for s in slots:
+                        if s.item is not None:
+                            all_items[iid] = s.item
+                            break
+                total_pr = sum(it.pick_rate for it in all_items.values()) or 1.0
+                ppt = total_items / self.current_tick
+                for iid, it in all_items.items():
+                    item_rates[iid] = it.pick_rate / total_pr * ppt
+
+            min_drain = float("inf")
+            for iid, slots in self.inventory._original_slots_for.items():
+                rate = item_rates.get(iid, 0.0)
+                if rate <= 0:
+                    continue
+                agg_fill_to = sum(s.fill_to for s in slots)
+                agg_reorder = sum(s.reorder_point for s in slots)
+                buffer = max(1, agg_fill_to - agg_reorder)
+                drain = buffer / rate
+                if drain < min_drain:
+                    min_drain = drain
+
+            optimal_interval = (
+                max(1, int(min_drain)) if min_drain != float("inf") else self.truck_interval_ticks
+            )
+            any_stockouts = bool(self._stockout_ticks)
+            if any_stockouts or self.truck_interval_ticks > optimal_interval:
+                truck_diag = "too_long"
+            elif self.truck_interval_ticks < optimal_interval // 2:
+                truck_diag = "too_short"
+            else:
+                truck_diag = "ok"
+        else:
+            optimal_interval = 0
+            truck_diag = "n/a"
+
         return SimMetrics(
             total_orders=n_orders,
             total_items=total_items,
@@ -657,6 +767,9 @@ class Simulation:
             stockout_count=self.stockout_count,
             avg_agent_utilization=round(avg_util, 4),
             stockout_ticks_by_item=dict(self._stockout_ticks),
+            n_agents_recommended=n_recommended,
+            optimal_truck_interval_ticks=optimal_interval,
+            truck_interval_diagnosis=truck_diag,
         )
 
     def run(self, max_ticks: int = 10_000) -> list[OrderMetrics]:

@@ -392,6 +392,9 @@ async def _run_simulation(websocket: WebSocket, config: dict) -> None:
             "idle_ticks": summary.idle_ticks,
             "stockout_count": summary.stockout_count,
             "stockout_ticks_by_item": summary.stockout_ticks_by_item,
+            "n_agents_recommended": summary.n_agents_recommended,
+            "optimal_truck_interval_ticks": summary.optimal_truck_interval_ticks,
+            "truck_interval_diagnosis": summary.truck_interval_diagnosis,
         },
         "heatmap": cell_visit_freq,
     }))

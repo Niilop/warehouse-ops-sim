@@ -839,6 +839,60 @@ def test_urgent_restock_bypasses_truck():
     assert sim.completed_metrics, "No orders completed — urgent restock likely blocked by truck"
 
 
+def test_po_stockout_before_truck_gets_urgent_priority():
+    """Items that drain to zero while sitting in _pending_po must be dispatched as
+    REPLENISHMENT_URGENT when the truck arrives, not REPLENISHMENT_SCHEDULED.
+
+    The scenario is injected directly: one item is placed in _pending_po (as if a
+    non-urgent reorder fired earlier) and then drained to stock == 0. At truck
+    delivery _process_restocks must detect stock_level == 0 and use URGENT priority.
+    """
+    from warehouse.task import TaskType
+
+    grid = _grid_with_dock()
+    items = catalog(n_items=4, n_families=1, seed=7)
+    inventory = Inventory(grid)
+    inventory.seed(items, initial_stock=5)
+
+    truck_interval = 10
+    agents = [PickAgent("A1", grid.pack_station_pos, grid)]
+    sim = Simulation(grid, inventory, agents, restock_delay=0)
+    sim.truck_interval_ticks = truck_interval
+
+    # Inject: pretend a non-urgent reorder fired for items[0] and placed it in
+    # _pending_po, then subsequent picks drained it to zero.
+    victim = items[0]
+    sim._pending_replenishment.add(victim.item_id)
+    sim._pending_po.append((victim, 3))
+    for slot in inventory._original_slots_for[victim.item_id]:
+        slot.stock = 0
+        slot.item = None
+
+    # Advance so that current_tick == truck_interval without firing the truck yet.
+    # current_tick starts at 0 and increments at end of each step(), so after
+    # truck_interval steps current_tick == truck_interval.
+    for _ in range(truck_interval):
+        sim.step()
+
+    # current_tick is now == truck_interval; call _process_restocks() directly so we
+    # can inspect the task queue before _dispatch_idle_agents() consumes the task.
+    sim._process_restocks()
+
+    # _pending_po must be fully drained after the truck fires.
+    assert not sim._pending_po, "_pending_po not cleared on truck delivery"
+
+    # The task for the stocked-out victim must carry URGENT priority.
+    victim_tasks = [
+        t for t in sim.task_queue
+        if t.priority in (TaskType.REPLENISHMENT_URGENT, TaskType.REPLENISHMENT_SCHEDULED)
+        and any(stop[1].item_id == victim.item_id for stop in t.payload["stops"])
+    ]
+    assert victim_tasks, "No replenishment task found for victim item after truck delivery"
+    assert all(t.priority == TaskType.REPLENISHMENT_URGENT for t in victim_tasks), (
+        "Stocked-out item in _pending_po was dispatched as SCHEDULED instead of URGENT"
+    )
+
+
 # ── Phase 7d: waiting queue ───────────────────────────────────────────────────
 
 def test_waiting_tasks_populated_on_stockout():
@@ -1101,3 +1155,96 @@ def test_server_complete_has_lpo_and_utilization():
     assert "stockout_ticks_by_item" in summary, "complete summary missing stockout_ticks_by_item"
     assert summary["lines_per_order"] == 4.0  # items_per_order=4 in run_server
     assert 0.0 <= summary["avg_agent_utilization_pct"] <= 100.0
+
+
+def test_workforce_sizing_recommendation():
+    """n_agents_recommended scales with utilization: ceil(n × avg_util / 0.80)."""
+    items = catalog(n_items=20)
+    sim_1 = run_sim(DEFAULT, items, orders(items, n=20), n_agents=1)
+    sim_4 = run_sim(DEFAULT, items, orders(items, n=20), n_agents=4)
+
+    s1 = sim_1.get_summary()
+    s4 = sim_4.get_summary()
+
+    import math
+    _TARGET = 0.80
+    assert s1.n_agents_recommended >= 1
+    assert s4.n_agents_recommended >= 1
+    # Formula check: recommendation matches the formula for 1-agent run
+    expected_1 = max(1, math.ceil(1 * s1.avg_agent_utilization / _TARGET))
+    assert s1.n_agents_recommended == expected_1, (
+        f"1-agent recommendation mismatch: got {s1.n_agents_recommended}, expected {expected_1}"
+    )
+    # Highly utilised single agent should recommend adding more
+    if s1.avg_agent_utilization > _TARGET:
+        assert s1.n_agents_recommended > 1, (
+            "Highly utilised single agent should recommend > 1 agent"
+        )
+
+
+def test_server_complete_has_n_agents_recommended():
+    """complete WebSocket message includes n_agents_recommended."""
+    msgs = run_server(n_orders=6)
+    complete = next(m for m in msgs if m["type"] == "complete")
+    summary = complete["summary"]
+    assert "n_agents_recommended" in summary, "complete summary missing n_agents_recommended"
+    assert summary["n_agents_recommended"] >= 1
+
+
+# ── Phase 8d: Optimal truck interval ─────────────────────────────────────────
+
+
+def test_truck_interval_diagnosis_na_without_dock():
+    """Without a dock (teleport mode) the truck interval fields are n/a."""
+    items = catalog(n_items=10)
+    sim = run_sim(DEFAULT, items, orders(items, n=8))
+    s = sim.get_summary()
+    assert s.optimal_truck_interval_ticks == 0
+    assert s.truck_interval_diagnosis == "n/a"
+
+
+def test_truck_interval_diagnosis_na_immediate_dispatch():
+    """truck_interval_ticks == 0 (immediate dispatch) → diagnosis is n/a."""
+    grid = _grid_with_dock()
+    items = catalog(n_items=10, n_families=2, seed=1)
+    inventory = Inventory(grid)
+    inventory.seed(items, initial_stock=5)
+    agents = [PickAgent(f"A{i}", grid.pack_station_pos, grid) for i in range(2)]
+    sim = Simulation(grid, inventory, agents, restock_delay=0)
+    sim.truck_interval_ticks = 0  # immediate dispatch
+    sim.run(max_ticks=20_000)
+    s = sim.get_summary()
+    assert s.optimal_truck_interval_ticks == 0
+    assert s.truck_interval_diagnosis == "n/a"
+
+
+def test_truck_interval_optimal_positive_with_wave():
+    """With wave replenishment active, optimal_truck_interval_ticks should be > 0."""
+    grid = _grid_with_dock()
+    items = catalog(n_items=10, n_families=2, seed=2)
+    inventory = Inventory(grid)
+    inventory.seed(items, initial_stock=10)
+    agents = [PickAgent(f"A{i}", grid.pack_station_pos, grid) for i in range(3)]
+    sim = Simulation(grid, inventory, agents, restock_delay=0)
+    sim.truck_interval_ticks = 500
+    _ords = orders(items, n=30, seed=2)
+    for o in _ords:
+        sim.enqueue_order(o)
+    sim.run(max_ticks=200_000)
+    s = sim.get_summary()
+    assert s.optimal_truck_interval_ticks > 0, (
+        "Expected positive optimal interval with wave replenishment active"
+    )
+    assert s.truck_interval_diagnosis in ("ok", "too_long", "too_short")
+
+
+def test_server_complete_has_truck_interval_fields():
+    """complete WebSocket message includes optimal_truck_interval and diagnosis."""
+    msgs = run_server(n_orders=6)
+    complete = next(m for m in msgs if m["type"] == "complete")
+    summary = complete["summary"]
+    assert "optimal_truck_interval_ticks" in summary
+    assert "truck_interval_diagnosis" in summary
+    # Default server config has no dock → n/a
+    assert summary["truck_interval_diagnosis"] == "n/a"
+    assert summary["optimal_truck_interval_ticks"] == 0
