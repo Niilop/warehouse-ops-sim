@@ -55,6 +55,9 @@ class SimMetrics:
     stockout_count: int
     avg_agent_utilization: float          # average active fraction across all agents
     stockout_ticks_by_item: dict[str, int]  # item_id → ticks at zero aggregate stock
+    n_agents_recommended: int             # M/M/c estimate for 80% target utilization
+    optimal_truck_interval_ticks: int     # minimum safe truck interval from observed demand; 0 = n/a
+    truck_interval_diagnosis: str         # "ok", "too_long", "too_short", or "n/a"
 
 
 class Simulation:
@@ -64,6 +67,7 @@ class Simulation:
         inventory: Inventory,
         agents: list[PickAgent],
         restock_delay: int = 10,
+        repl_batch_size: int = 4,
         epoch_length: int = 100,
         order_arrival_rate: float = 0.0,
         order_generator: Callable[[], Order] | None = None,
@@ -88,6 +92,7 @@ class Simulation:
 
         # Restock queue
         self.restock_delay = restock_delay
+        self.repl_batch_size = repl_batch_size
         self.restock_queue: list[RestockJob] = []
         self.stockout_count: int = 0
 
@@ -98,9 +103,10 @@ class Simulation:
         self._agent_ticks_active: dict[str, int] = {a.agent_id: 0 for a in agents}
         self._stockout_ticks: dict[str, int] = {}  # item_id → ticks at zero aggregate stock
 
-        # Epoch reslotting
+        # Epoch reslotting and (s, S) demand learning
         self.epoch_length: int = epoch_length
         self._last_epoch_tick: int = 0
+        self._epoch_pick_history: dict[str, list[int]] = {}  # item_id → picks per epoch
 
         # Dock replenishment tracking — item_ids with an in-flight replenishment task
         self._pending_replenishment: set[str] = set()
@@ -204,11 +210,8 @@ class Simulation:
                     continue
                 if self.grid.dock_pos is None:
                     continue  # dock removed mid-run; discard stale task
-                p = task.payload
                 agent.assign_replenishment(
-                    item=p["item"],
-                    qty=p["qty"],
-                    slot_stand_pos=p["slot_stand_pos"],
+                    stops=task.payload["stops"],
                     dock_pos=self.grid.dock_pos,
                     task_id=task.task_id,
                 )
@@ -274,10 +277,51 @@ class Simulation:
     # Main simulation loop
     # ------------------------------------------------------------------
 
+    def _update_reorder_params(self, pick_counts: dict[str, int]) -> None:
+        """Adapt per-item reorder_point and fill_to from observed demand statistics.
+
+        Only active in dock mode — reorder_point drives dock replenishment triggers;
+        in teleport mode it is unused and modifying fill_to would cap stock incorrectly.
+
+        Accumulates per-epoch pick counts, then applies the (s, S) policy once
+        at least 3 epochs have been recorded:
+          s = μ × L_epochs + z × σ × sqrt(L_epochs)   [reorder point]
+          S = s + μ                                     [order-up-to: s + one epoch demand]
+        where μ/σ are the epoch-level mean/std of picks and z = 1.65 (95% service level).
+        """
+        if self.grid.dock_pos is None:
+            return
+        z = 1.65
+        min_epochs = 3
+
+        for iid, slots in self.inventory._original_slots_for.items():
+            history = self._epoch_pick_history.setdefault(iid, [])
+            history.append(pick_counts.get(iid, 0))
+            if len(history) < min_epochs:
+                continue
+
+            n = len(history)
+            mu = sum(history) / n
+            var = sum((x - mu) ** 2 for x in history) / max(1, n - 1)
+            sigma = var ** 0.5
+
+            L_epochs = slots[0].lead_time / self.epoch_length
+            s = mu * L_epochs + z * sigma * (L_epochs ** 0.5)
+            S_target = s + mu
+
+            nf = len(slots)
+            for slot in slots:
+                # Clamp reorder_point below max_stock so fill_to stays ≤ max_stock.
+                slot.reorder_point = max(1, min(slot.max_stock - 1, round(s / nf)))
+                slot.fill_to = max(
+                    slot.reorder_point + 1,
+                    min(slot.max_stock, round(S_target / nf)),
+                )
+                slot.order_qty = max(1, slot.fill_to - slot.reorder_point)
+
     def _on_epoch(self) -> None:
-        """Greedy reslot: if recent pick data justifies it, move high-demand items
-        closer to the pack station. Only runs when enough data has accumulated."""
-        from warehouse.optimizer import slot_distances, reorg_cost
+        """SA reslot + (s,S) policy update. Only runs when enough data has accumulated."""
+        from warehouse.optimizer import slot_distances, reorg_cost, sa_slotting
 
         self._last_epoch_tick = self.current_tick
 
@@ -292,6 +336,8 @@ class Simulation:
 
         if recent_count < 5 or not pick_counts:
             return
+
+        self._update_reorder_params(pick_counts)
 
         pack_r, pack_c = self.grid.pack_station_pos
         current_distances: dict[str, int] = {
@@ -331,26 +377,47 @@ class Simulation:
             for s in self.inventory._original_slots_for.get(job.item_id, []):
                 protected_rack_pos.add(s.rack_pos)
 
-        sorted_slots = slot_distances(self.grid, self.inventory)
-        sorted_items = sorted(
-            current_distances, key=lambda iid: pick_counts.get(iid, 0), reverse=True
-        )
+        # Build slot-index and distance maps.
+        slot_obj_to_idx: dict[int, int] = {id(s): i for i, s in enumerate(self.inventory._slots)}
+        slot_dist_map: dict[int, int] = {
+            idx: dist for idx, dist in slot_distances(self.grid, self.inventory)
+        }
 
-        available_slots = [
-            (idx, dist) for idx, dist in sorted_slots
-            if self.inventory._slots[idx].rack_pos not in protected_rack_pos
-        ]
+        # Build current assignment for non-protected items only.
+        current_assignment: dict[str, list[int]] = {}
+        for iid, slots in self.inventory._original_slots_for.items():
+            if iid in in_flight:
+                continue
+            if any(s.rack_pos in protected_rack_pos for s in slots):
+                continue
+            current_assignment[iid] = [slot_obj_to_idx[id(s)] for s in slots]
+
+        # SA optimizer: minimize Σ picks[i] × min_dist[slots[i]].
+        # Cap n_iter so the cooling schedule always converges even for large catalogs.
+        new_assignment = sa_slotting(
+            current_assignment,
+            pick_counts,
+            slot_dist_map,
+            n_iter=min(5000, max(500, len(current_assignment) * 20)),
+            seed=self.current_tick,
+        )
 
         proposed_distances = dict(current_distances)
         item_to_new_slot: dict[str, int] = {}
-        for rank, iid in enumerate(sorted_items):
-            if rank < len(available_slots):
-                new_slot_idx, new_dist = available_slots[rank]
-                proposed_distances[iid] = new_dist
-                item_to_new_slot[iid] = new_slot_idx
+        for iid, new_idxs in new_assignment.items():
+            if new_idxs == current_assignment.get(iid):
+                continue
+            new_primary_idx = new_idxs[0]
+            item_to_new_slot[iid] = new_primary_idx
+            new_slot = self.inventory._slots[new_primary_idx]
+            proposed_distances[iid] = (
+                abs(new_slot.stand_pos[0] - pack_r) + abs(new_slot.stand_pos[1] - pack_c)
+            )
 
         pick_rates = {iid: cnt / recent_count for iid, cnt in pick_counts.items()}
-        cost = reorg_cost(current_distances, proposed_distances, self.restock_delay, pick_rates)
+        # Reslotting uses max(restock_delay, 5) so the disruption estimate must match.
+        reslot_delay = max(self.restock_delay, 5)
+        cost = reorg_cost(current_distances, proposed_distances, reslot_delay, pick_rates)
 
         if cost["payback_period_ticks"] >= 2 * self.epoch_length:
             return
@@ -368,8 +435,6 @@ class Simulation:
             for slot in slots
             if slot.stock > 0
         }
-
-        reslot_delay = max(self.restock_delay, 5)
         for iid, new_slot_idx in item_to_new_slot.items():
             if iid in in_flight:
                 continue
@@ -402,6 +467,22 @@ class Simulation:
                 still_waiting.append(task)
         self._waiting_tasks = still_waiting
 
+    def _push_repl_batches(
+        self,
+        stops: list[tuple[tuple[int, int], "Item", int, bool]],
+    ) -> None:
+        """Slice a list of (stand_pos, item, qty, urgent) stops into repl_batch_size
+        groups and push one Task per group onto the task heap."""
+        for i in range(0, len(stops), self.repl_batch_size):
+            chunk = stops[i : i + self.repl_batch_size]
+            has_urgent = any(s[3] for s in chunk)
+            heapq.heappush(self.task_queue, Task(
+                priority=TaskType.REPLENISHMENT_URGENT if has_urgent else TaskType.REPLENISHMENT_SCHEDULED,
+                created_at=self.current_tick,
+                task_id=f"repl-{self.current_tick}-{i}",
+                payload={"stops": [(s[0], s[1], s[2]) for s in chunk]},
+            ))
+
     def _process_arrivals(self) -> None:
         if self.order_arrival_rate <= 0 or self.order_generator is None:
             return
@@ -421,42 +502,58 @@ class Simulation:
 
         # With a dock, check whether any slot has dropped below its reorder point.
         if self.grid.dock_pos is not None:
-            # Drain accumulated PO on truck arrival.
+            # Promote any _pending_po items that have stocked out since queuing.
+            # Items in _pending_po are also in _pending_replenishment, so
+            # check_reorder_triggers would skip them — this is the only path to
+            # urgent dispatch before the next scheduled truck arrives.
+            if self._pending_po:
+                still_pending: list[tuple[Item, int]] = []
+                urgent_po: list[tuple[tuple[int, int], Item, int, bool]] = []
+                for item, qty in self._pending_po:
+                    if self.inventory.stock_level(item.item_id) == 0:
+                        homes = self.inventory._original_slots_for[item.item_id]
+                        target = min(homes, key=lambda s: s.stock / max(1, s.fill_to))
+                        urgent_po.append((target.stand_pos, item, qty, True))
+                    else:
+                        still_pending.append((item, qty))
+                self._pending_po = still_pending
+                if urgent_po:
+                    self._push_repl_batches(urgent_po)
+
+            # Drain accumulated PO on truck arrival — batch into multi-stop tasks.
             if (
                 self.truck_interval_ticks > 0
                 and self.current_tick > 0
                 and self.current_tick % self.truck_interval_ticks == 0
+                and self._pending_po
             ):
+                stops_raw: list[tuple[tuple[int, int], Item, int, bool]] = []
                 for item, qty in self._pending_po:
                     homes = self.inventory._original_slots_for[item.item_id]
                     target = min(homes, key=lambda s: s.stock / max(1, s.fill_to))
                     stocked_out = self.inventory.stock_level(item.item_id) == 0
-                    heapq.heappush(self.task_queue, Task(
-                        priority=TaskType.REPLENISHMENT_URGENT if stocked_out else TaskType.REPLENISHMENT_SCHEDULED,
-                        created_at=self.current_tick,
-                        task_id=f"repl-{item.item_id}",
-                        payload={"item": item, "qty": qty, "slot_stand_pos": target.stand_pos},
-                    ))
+                    stops_raw.append((target.stand_pos, item, qty, stocked_out))
+                stops_raw.sort(key=lambda s: (0 if s[3] else 1))  # urgent stops first
                 self._pending_po.clear()
+                self._push_repl_batches(stops_raw)
 
+            # Collect all reorder triggers for this tick, mark pending immediately
+            # so the same item cannot appear in two separate batches this tick.
+            immediate: list[tuple[tuple[int, int], Item, int, bool]] = []
             for item_id, item, order_qty, urgent in self.inventory.check_reorder_triggers(
                 self._pending_replenishment
             ):
+                self._pending_replenishment.add(item_id)
                 if urgent or self.truck_interval_ticks == 0:
-                    # Urgent restocks and immediate-mode always bypass the truck schedule.
-                    priority = TaskType.REPLENISHMENT_URGENT if urgent else TaskType.REPLENISHMENT_SCHEDULED
                     homes = self.inventory._original_slots_for[item_id]
                     target = min(homes, key=lambda s: s.stock / max(1, s.fill_to))
-                    heapq.heappush(self.task_queue, Task(
-                        priority=priority,
-                        created_at=self.current_tick,
-                        task_id=f"repl-{item_id}",
-                        payload={"item": item, "qty": order_qty, "slot_stand_pos": target.stand_pos},
-                    ))
+                    immediate.append((target.stand_pos, item, order_qty, urgent))
                 else:
-                    # Non-urgent: accumulate in the pending PO for next truck delivery.
                     self._pending_po.append((item, order_qty))
-                self._pending_replenishment.add(item_id)
+
+            if immediate:
+                immediate.sort(key=lambda s: (0 if s[3] else 1))  # urgent first
+                self._push_repl_batches(immediate)
 
     def _dispatch_idle_agents(self) -> None:
         # Re-evaluate waiting tasks before dispatch: contention may have cleared since
@@ -490,7 +587,7 @@ class Simulation:
         Returns True if an escape cell was found and the agent was moved."""
         blocked = agent._path[0] if agent._path else None
         dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-        random.shuffle(dirs)
+        self._arrival_rng.shuffle(dirs)
         for dr, dc in dirs:
             cell = (agent.pos[0] + dr, agent.pos[1] + dc)
             if cell == blocked:
@@ -522,14 +619,12 @@ class Simulation:
                 # breaking symmetric deadlocks without both agents replanning at once.
                 threshold = 3 + 2 * idx
                 if agent._wait_count >= threshold and agent._replan_cooldown == 0:
-                    if agent._wait_count >= 20:
-                        # Physical escape: step sideways to a free cell, then replan.
-                        # This breaks circular deadlocks that path-replanning alone cannot resolve.
-                        all_pos = {a.pos for a in self.agents if a is not agent}
-                        if not self._escape_step(agent, all_pos):
-                            agent.replan(occupied - {agent.pos}, force=True)
-                    else:
-                        agent.replan(occupied - {agent.pos})
+                    # Always try a physical escape step first: moving sideways breaks
+                    # head-on livelocks where two agents find mirror-image detours that
+                    # also collide.  Fall back to path-replanning if no free cell exists.
+                    all_pos = {a.pos for a in self.agents if a is not agent}
+                    if not self._escape_step(agent, all_pos):
+                        agent.replan(occupied - {agent.pos}, force=(agent._wait_count >= 20))
                     agent._replan_cooldown = 8
             elif result == StepResult.ARRIVED:
                 if agent.state == AgentState.MOVING_TO_RACK:
@@ -616,6 +711,71 @@ class Simulation:
             avg_util = sum(util_values) / len(util_values)
         else:
             avg_util = 0.0
+
+        # Utilization-scaling heuristic: minimum agents to keep per-agent utilization ≤ 80%.
+        # Derived from ρ = λ/(c·μ) → c* = ceil(c · ρ / ρ_target), where ρ ≈ avg_util.
+        _TARGET_UTIL = 0.80
+        n_agents = len(self.agents)
+        if avg_util > 0 and n_agents > 0:
+            n_recommended = max(1, math.ceil(n_agents * avg_util / _TARGET_UTIL))
+        else:
+            n_recommended = max(1, n_agents)
+
+        # Phase 8d: Optimal truck interval from observed item demand rates.
+        # Min drain time across items (buffer / rate) = safe interval upper bound.
+        if (
+            self.truck_interval_ticks > 0
+            and self.current_tick > 0
+            and self.grid.dock_pos is not None
+        ):
+            # Build per-item pick rate (picks/tick) — epoch history if available, else proxy.
+            # Use per-item observation window so recently-added items aren't underestimated.
+            item_rates: dict[str, float] = {}
+            if self._epoch_pick_history:
+                for iid, hist in self._epoch_pick_history.items():
+                    ep_ticks = len(hist) * self.epoch_length
+                    if ep_ticks > 0:
+                        item_rates[iid] = sum(hist) / ep_ticks
+            if not item_rates and self.current_tick > 0:
+                all_items: dict[str, Item] = {}
+                for iid, slots in self.inventory._original_slots_for.items():
+                    for s in slots:
+                        if s.item is not None:
+                            all_items[iid] = s.item
+                            break
+                total_pr = sum(it.pick_rate for it in all_items.values()) or 1.0
+                ppt = total_items / self.current_tick
+                for iid, it in all_items.items():
+                    item_rates[iid] = it.pick_rate / total_pr * ppt
+
+            min_drain = float("inf")
+            for iid, slots in self.inventory._original_slots_for.items():
+                rate = item_rates.get(iid, 0.0)
+                if rate <= 0:
+                    continue
+                agg_fill_to = sum(s.fill_to for s in slots)
+                agg_reorder = sum(s.reorder_point for s in slots)
+                buffer = max(1, agg_fill_to - agg_reorder)
+                drain = buffer / rate
+                if drain < min_drain:
+                    min_drain = drain
+
+            optimal_interval = (
+                max(1, int(min_drain)) if min_drain != float("inf") else self.truck_interval_ticks
+            )
+            # "too_short" = truck arrives more than twice as often as needed (wasted trips).
+            _TOO_SHORT_FACTOR = 2
+            any_stockouts = bool(self._stockout_ticks)
+            if any_stockouts or self.truck_interval_ticks > optimal_interval:
+                truck_diag = "too_long"
+            elif self.truck_interval_ticks * _TOO_SHORT_FACTOR < optimal_interval:
+                truck_diag = "too_short"
+            else:
+                truck_diag = "ok"
+        else:
+            optimal_interval = 0
+            truck_diag = "n/a"
+
         return SimMetrics(
             total_orders=n_orders,
             total_items=total_items,
@@ -628,6 +788,9 @@ class Simulation:
             stockout_count=self.stockout_count,
             avg_agent_utilization=round(avg_util, 4),
             stockout_ticks_by_item=dict(self._stockout_ticks),
+            n_agents_recommended=n_recommended,
+            optimal_truck_interval_ticks=optimal_interval,
+            truck_interval_diagnosis=truck_diag,
         )
 
     def run(self, max_ticks: int = 10_000) -> list[OrderMetrics]:

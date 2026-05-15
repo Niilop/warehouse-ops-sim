@@ -38,12 +38,16 @@ class PickAgent:
         self._wait_count: int = 0
         self._replan_cooldown: int = 0
 
-        # Replenishment state (dock → slot journey)
-        self._repl_item: Item | None = None
-        self._repl_qty: int = 0
-        self._repl_slot_pos: tuple[int, int] | None = None
+        # Replenishment state (dock → multi-slot tour)
+        # Each stop: (stand_pos, item, qty). Agent works through the list in order.
+        self._repl_stops: list[tuple[tuple[int, int], Item, int]] = []
         self._repl_dock_pos: tuple[int, int] | None = None
         self._repl_task_id: str | None = None
+
+    @property
+    def _repl_slot_pos(self) -> tuple[int, int] | None:
+        """Current replenishment destination — first remaining stop's stand_pos."""
+        return self._repl_stops[0][0] if self._repl_stops else None
 
     # ------------------------------------------------------------------
     # Pathfinding
@@ -227,33 +231,35 @@ class PickAgent:
 
     def assign_replenishment(
         self,
-        item: Item,
-        qty: int,
-        slot_stand_pos: tuple[int, int],
+        stops: list[tuple[tuple[int, int], "Item", int]],
         dock_pos: tuple[int, int],
         task_id: str,
     ) -> None:
-        self._repl_item     = item
-        self._repl_qty      = qty
-        self._repl_slot_pos = slot_stand_pos
+        """Assign a multi-stop replenishment trip.
+
+        stops: list of (stand_pos, item, qty) in visit order.
+        Agent travels to dock first, then tours each stop depositing stock.
+        """
+        self._repl_stops    = list(stops)
         self._repl_dock_pos = dock_pos
         self._repl_task_id  = task_id
         self._path = self.find_path(dock_pos)
         self.state = AgentState.MOVING_TO_DOCK
 
     def execute_dock_pickup(self) -> None:
-        """Agent has arrived at the dock. Load stock instantly and head to the slot."""
+        """Agent has arrived at the dock. Load all stop stock and head to first slot."""
         self.state = AgentState.MOVING_FROM_DOCK
         self._path = self.find_path(self._repl_slot_pos)
 
     def execute_restock(self, inventory: Inventory) -> Item:
-        """Agent has arrived at the slot stand-pos. Deposit replenishment stock."""
-        item = self._repl_item
-        inventory.restock_bulk(item, self._repl_qty, target_stand_pos=self._repl_slot_pos)
-        self._repl_item     = None
-        self._repl_qty      = 0
-        self._repl_slot_pos = None
-        self._repl_dock_pos = None
-        self._repl_task_id  = None
-        self.state = AgentState.IDLE
-        return item  # type: ignore[return-value]
+        """Agent arrived at the current stop's stand-pos. Deposit stock, advance to next stop."""
+        stand_pos, item, qty = self._repl_stops.pop(0)
+        inventory.restock_bulk(item, qty, target_stand_pos=stand_pos)
+        if self._repl_stops:
+            self._path = self.find_path(self._repl_stops[0][0])
+            # state stays MOVING_FROM_DOCK; simulation will call _unblock between stops
+        else:
+            self._repl_dock_pos = None
+            self._repl_task_id  = None
+            self.state = AgentState.IDLE
+        return item
